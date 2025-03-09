@@ -6,6 +6,7 @@ import threading
 from std_srvs.srv import Trigger  # Standard service type for triggering actions
 
 class TkinterROS(Node):
+    counter = 0
     def __init__(self):
         super().__init__('tkinter_ros_node')
 
@@ -14,11 +15,14 @@ class TkinterROS(Node):
         self.timer = self.create_timer(1.0, self.publish_message)
         
          # Create a ROS service client to request homing
-        self.client = self.create_client(Trigger, 'homing_service')
+        self.client = self.create_client(Trigger, '/ar4_hardware_interface_node/homing')
 
         # Wait for service to be available
         while not self.client.wait_for_service(timeout_sec=1.0):
             self.get_logger().warn('Waiting for homing service to become available...')
+
+        # Set up ROS publisher
+        self.publisher = self.create_publisher(String, '/ar4_hardware_interface_node/homing_string', 10)
 
         # Set up Tkinter GUI
         self.root = tk.Tk()
@@ -35,11 +39,12 @@ class TkinterROS(Node):
         # Use after to periodically update Tkinter UI in the main thread
         self.root.after(100, self.tk_mainloop)
 
-    # def publish_message(self):
-    #     msg = String()
-    #     msg.data = "Hello from ROS 2!"
-    #     self.publisher.publish(msg)
-    #     self.get_logger().info(f'Publishing: "{msg.data}"')
+    def publish_message(self):
+        msg = String()
+        msg.data = (str(self.counter))
+        self.publisher.publish(msg)
+        self.counter += 1
+        self.get_logger().warn('publishing message' + msg.data)
 
     def on_button_click(self):
         """Called when the button is clicked - triggers homing service."""
