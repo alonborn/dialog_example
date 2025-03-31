@@ -4,6 +4,13 @@ from rclpy.node import Node
 from std_msgs.msg import String
 import threading
 from std_srvs.srv import Trigger  # Standard service type for triggering actions
+from pymoveit2 import MoveIt2
+from rclpy.callback_groups import ReentrantCallbackGroup
+from rclpy.executors import MultiThreadedExecutor
+from geometry_msgs.msg import PoseStamped
+from geometry_msgs.msg import Pose
+from geometry_msgs.msg import Pose, Point, Quaternion
+import debugpy
 
 class TkinterROS(Node):
     counter = 0
@@ -18,8 +25,8 @@ class TkinterROS(Node):
         self.client = self.create_client(Trigger, '/ar4_hardware_interface_node/homing')
 
         # Wait for service to be available
-        while not self.client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().warn('Waiting for homing service to become available...')
+        # while not self.client.wait_for_service(timeout_sec=1.0):
+        #     self.get_logger().warn('Waiting for homing service to become available...')
 
         # Set up Tkinter GUI
         self.root = tk.Tk()
@@ -51,6 +58,48 @@ class TkinterROS(Node):
         # Use after to periodically update Tkinter UI in the main thread
         self.root.after(100, self.tk_mainloop)
 
+        self.arm_joint_names = [
+            "joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"
+        ]
+        self.moveit2 = MoveIt2(
+            node=self,
+            joint_names=self.arm_joint_names,
+            base_link_name="base_link",
+            end_effector_name="link_6",
+            group_name="ar_manipulator",
+            callback_group=ReentrantCallbackGroup(),
+        )
+        self.moveit2.planner_id = "RRTConnectkConfigDefault"
+        self.moveit2.max_velocity = 1.0
+        self.moveit2.max_acceleration = 1.0
+        self.moveit2.planning_time = 5.0  # Timeout in seconds
+
+    def create_pose(self, position, rotation):
+        """
+        Creates a Pose message from position and rotation values.
+
+        Args:
+            position (tuple): (x, y, z) coordinates.
+            rotation (tuple): (x, y, z, w) quaternion values.
+
+        Returns:
+            Pose: A populated Pose message.
+        """
+        pose_msg = Pose()
+
+        # Set position
+        pose_msg.position.x = position[0]
+        pose_msg.position.y = position[1]
+        pose_msg.position.z = position[2]
+
+        # Set rotation
+        pose_msg.orientation.x = rotation[0]
+        pose_msg.orientation.y = rotation[1]
+        pose_msg.orientation.z = rotation[2]
+        pose_msg.orientation.w = rotation[3]
+
+        return pose_msg
+
     def publish_message(self):
         msg = String()
         msg.data = self.joints_entry.get()  # Send the value from the text field
@@ -61,6 +110,13 @@ class TkinterROS(Node):
         self.trigger_service("Homing in progress...", "Homing successful!", "Homing failed")
 
     def on_calibrate_button_click(self):
+
+        position = Pose()
+
+        pose = self.create_pose((0.2, -0.2, 0.206), (0.328, -0.207, 0.799, 0.459))
+        print(pose)
+
+        self.move_to(position)
         self.trigger_service("Calibration in progress...", "Calibration successful!", "Calibration failed")
 
     def on_validate_button_click(self):
@@ -96,10 +152,28 @@ class TkinterROS(Node):
         self.root.quit()
 
 
+    def move_to(self, msg: Pose):
+            pose_goal = PoseStamped()
+            pose_goal.header.frame_id = "base_link"
+            pose_goal.pose = msg
+
+            self.moveit2.move_to_pose(pose=pose_goal)
+            ret = self.moveit2.wait_until_executed()
+            if ret:
+             self.file_logger.info("Move successful")
+             
 def ros_spin(tkinter_ros):
     rclpy.spin(tkinter_ros)
 
 def main():
+
+
+    debugpy.listen(("localhost", 5678))  # Port for debugger to connect
+    print("Waiting for debugger to attach...")
+    debugpy.wait_for_client()  # Ensures the debugger connects before continuing
+
+
+
     rclpy.init()
 
     tkinter_ros = TkinterROS()
