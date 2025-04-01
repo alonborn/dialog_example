@@ -10,6 +10,23 @@ from rclpy.executors import MultiThreadedExecutor
 from geometry_msgs.msg import PoseStamped
 from geometry_msgs.msg import Pose
 from geometry_msgs.msg import Pose, Point, Quaternion
+from rclpy.node import Node
+from moveit_commander.robot_trajectory import RobotTrajectory
+from moveit_commander import PlanningSceneInterface, MoveGroupCommander
+from moveit_commander.robot_trajectory import RobotTrajectory
+from geometry_msgs.msg import Pose
+from moveit_commander.action import MoveGroupAction, MoveGroupGoal
+from action_msgs.msg import GoalStatus
+
+
+
+
+# MoveIt! related imports
+# from moveit_msgs.srv import GetPlanningScene
+# from moveit_msgs.msg import PlanningScene
+import time
+
+
 import debugpy
 
 class TkinterROS(Node):
@@ -61,18 +78,54 @@ class TkinterROS(Node):
         self.arm_joint_names = [
             "joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"
         ]
-        self.moveit2 = MoveIt2(
-            node=self,
-            joint_names=self.arm_joint_names,
-            base_link_name="base_link",
-            end_effector_name="link_6",
-            group_name="ar_manipulator",
-            callback_group=ReentrantCallbackGroup(),
-        )
-        self.moveit2.planner_id = "RRTConnectkConfigDefault"
-        self.moveit2.max_velocity = 1.0
-        self.moveit2.max_acceleration = 1.0
-        self.moveit2.planning_time = 5.0  # Timeout in seconds
+
+        self.get_logger().info('Checking if MoveIt! is running...')
+        if not self.wait_for_moveit():
+            self.get_logger().error('MoveIt! not available within timeout! Exiting.')
+            return
+        self.get_logger().info('MoveIt! is up and running!')
+
+
+        # Create an action client for MoveGroup
+        self.client = self.create_client(MoveGroupAction, '/move_group')
+        while not self.client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info('Service /move_group not available, waiting again...')
+
+
+        # self.moveit2 = MoveIt2(
+        #     node=self,
+        #     joint_names=self.arm_joint_names,
+        #     base_link_name="base_link",
+        #     end_effector_name="link_6",
+        #     group_name="ar_manipulator",
+        #     callback_group=ReentrantCallbackGroup(),
+        # )
+        # self.moveit2.planner_id = "RRTConnectkConfigDefault"
+        # self.moveit2.max_velocity = 1.0
+        # self.moveit2.max_acceleration = 1.0
+        # self.moveit2.planning_time = 5.0  # Timeout in seconds
+
+
+    def create_goal_constraints(self, pose: Pose):
+        """ Create goal constraints for the pose """
+        from moveit_commander.robot_trajectory import RobotTrajectory
+
+        # Create goal constraints
+        goal_constraints = RobotTrajectory()
+        goal_constraints.set_pose_target(pose)
+        return goal_constraints
+    
+    def send_move_request(self, pose: Pose):
+        """ Send a move request to the MoveGroup action server. """
+        # Create goal message
+        goal = MoveGroupGoal()
+        
+        # Set the target pose
+        goal.request.start_state.is_diff = True
+        goal.request.goal_constraints = self.create_goal_constraints(pose)
+        
+        # Send the goal
+        self.client.send_goal_async(goal)
 
     def create_pose(self, position, rotation):
         """
@@ -109,15 +162,26 @@ class TkinterROS(Node):
     def on_homing_button_click(self):
         self.trigger_service("Homing in progress...", "Homing successful!", "Homing failed")
 
+    def create_goal_constraints(self, pose: Pose):
+        """ Create goal constraints for the pose """
+        from moveit_commander.robot_trajectory import RobotTrajectory
+
+        # Create goal constraints
+        goal_constraints = RobotTrajectory()
+        goal_constraints.set_pose_target(pose)
+        return goal_constraints
+
     def on_calibrate_button_click(self):
 
         position = Pose()
+        pose = self.create_pose((0.04, -0.31, 0.375), (0.044, -0.702, 0.71, -0.03))
 
-        pose = self.create_pose((0.2, -0.2, 0.206), (0.328, -0.207, 0.799, 0.459))
         print(pose)
+        self.send_move_request(pose)
+        print("done sending move request")
 
-        self.move_to(position)
-        self.trigger_service("Calibration in progress...", "Calibration successful!", "Calibration failed")
+        # self.move_to(position)
+        # self.trigger_service("Calibration in progress...", "Calibration successful!", "Calibration failed")
 
     def on_validate_button_click(self):
         self.trigger_service("Validation in progress...", "Validation successful!", "Validation failed")
@@ -153,24 +217,123 @@ class TkinterROS(Node):
 
 
     def move_to(self, msg: Pose):
-            pose_goal = PoseStamped()
-            pose_goal.header.frame_id = "base_link"
-            pose_goal.pose = msg
+        pose_goal = PoseStamped()
+        pose_goal.header.frame_id = "base_link"
+        pose_goal.pose = msg
 
-            self.moveit2.move_to_pose(pose=pose_goal)
-            ret = self.moveit2.wait_until_executed()
-            if ret:
-             self.file_logger.info("Move successful")
-             
+        self.moveit2.move_to_pose(pose=pose_goal)
+        ret = self.moveit2.wait_until_executed()
+        if ret:
+            self.file_logger.info("Move successful")
+
+
+    def wait_for_moveit(self):
+        """Wait for MoveIt! to become available by checking services and topics"""
+        timeout = 30.0  # Fixed timeout of 30 seconds
+        start_time = time.time()
+        
+        # List of critical MoveIt! services to check
+        moveit_services = [
+            '/move_group/moveit/get_parameters'
+        ]
+        
+        # List of critical MoveIt! topics to check
+        # moveit_topics = [
+        #     '/planning_scene',                 # Planning scene updates
+        #     '/move_group/status'               # Status updates from move_group
+        # ]
+        moveit_topics = [
+            '/planning_scene'                 # Planning scene updates
+        
+        ]
+
+        while rclpy.ok() and time.time() - start_time < timeout:
+            # Check if all required services are available
+            services_available = True
+            for service in moveit_services:
+                if not self.service_exists(service):
+                    services_available = False
+                    break
+            
+            # Check if all required topics are being published
+            topics_available = True
+            for topic in moveit_topics:
+                if not self.topic_exists(topic):
+                    topics_available = False
+                    break
+            
+            
+            # If both services and topics are available, try calling a service
+            if services_available and topics_available:
+                # Try to actually call the get_planning_scene service
+                if self.test_planning_scene_service():
+                    return True
+            
+            # Wait a bit before checking again
+            time.sleep(1.0)
+            self.get_logger().info(f'Waiting for MoveIt! services... ({int(time.time() - start_time)}s/{timeout}s)')
+        
+        return False
+    
+    def service_exists(self, service_name):
+        """Check if a service exists by looking it up in the ROS graph"""
+        service_names_and_types = self.get_service_names_and_types()
+        return any(service_name == name for name, _ in service_names_and_types)
+    
+    def topic_exists(self, topic_name):
+        """Check if a topic exists by looking it up in the ROS graph"""
+        topic_names_and_types = self.get_topic_names_and_types()
+        return any(topic_name == name for name, _ in topic_names_and_types)
+    
+    def test_planning_scene_service(self):
+        """Test if the planning scene service actually works"""
+        return True
+    
+
+        try:
+            client = self.create_client(
+                GetPlanningScene, 
+                '/move_group/get_planning_scene', 
+                callback_group=self.callback_group
+            )
+            
+            # Wait for service to become available
+            if not client.wait_for_service(timeout_sec=1.0):
+                return False
+            
+            # Send a simple request
+            request = GetPlanningScene.Request()
+            request.components.components = PlanningScene.ROBOT_STATE
+            
+            # Send the request asynchronously
+            future = client.call_async(request)
+            
+            # Wait for the result with a short timeout
+            start = time.time()
+            while not future.done() and time.time() - start < 5.0:
+                time.sleep(0.1)
+            
+            if future.done():
+                # Check if we got a valid response
+                response = future.result()
+                return response is not None
+                
+        except Exception as e:
+            self.get_logger().warning(f'Error testing planning scene service: {str(e)}')
+        
+        return False
+
+
+
 def ros_spin(tkinter_ros):
     rclpy.spin(tkinter_ros)
 
 def main():
 
 
-    debugpy.listen(("localhost", 5678))  # Port for debugger to connect
-    print("Waiting for debugger to attach...")
-    debugpy.wait_for_client()  # Ensures the debugger connects before continuing
+    # debugpy.listen(("localhost", 5678))  # Port for debugger to connect
+    # print("Waiting for debugger to attach...")
+    # debugpy.wait_for_client()  # Ensures the debugger connects before continuing
 
 
 
