@@ -11,13 +11,9 @@ from geometry_msgs.msg import PoseStamped
 from geometry_msgs.msg import Pose
 from geometry_msgs.msg import Pose, Point, Quaternion
 from rclpy.node import Node
-from moveit_commander.robot_trajectory import RobotTrajectory
-from moveit_commander import PlanningSceneInterface, MoveGroupCommander
-from moveit_commander.robot_trajectory import RobotTrajectory
 from geometry_msgs.msg import Pose
-from moveit_commander.action import MoveGroupAction, MoveGroupGoal
 from action_msgs.msg import GoalStatus
-
+from my_robot_interfaces.srv import MoveToPose  # Import the custom service type
 
 
 
@@ -39,10 +35,10 @@ class TkinterROS(Node):
         self.timer = self.create_timer(1.0, self.publish_message)
 
         # Create a ROS service client to request homing
-        self.client = self.create_client(Trigger, '/ar4_hardware_interface_node/homing')
+        self.homing_client = self.create_client(Trigger, '/ar4_hardware_interface_node/homing')
 
-        # Wait for service to be available
-        # while not self.client.wait_for_service(timeout_sec=1.0):
+        #Wait for homing service to be available
+        # while not self.homing_client.wait_for_service(timeout_sec=1.0):
         #     self.get_logger().warn('Waiting for homing service to become available...')
 
         # Set up Tkinter GUI
@@ -79,18 +75,14 @@ class TkinterROS(Node):
             "joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"
         ]
 
-        self.get_logger().info('Checking if MoveIt! is running...')
-        if not self.wait_for_moveit():
-            self.get_logger().error('MoveIt! not available within timeout! Exiting.')
-            return
-        self.get_logger().info('MoveIt! is up and running!')
+        # self.get_logger().info('Checking if MoveIt! is running...')
+        # if not self.wait_for_moveit():
+        #     self.get_logger().error('MoveIt! not available within timeout! Exiting.')
+        #     return
+        # self.get_logger().info('MoveIt! is up and running!')
 
-
-        # Create an action client for MoveGroup
-        self.client = self.create_client(MoveGroupAction, '/move_group')
-        while not self.client.wait_for_service(timeout_sec=1.0):
-            self.get_logger().info('Service /move_group not available, waiting again...')
-
+        self.get_logger().info('reggistering ar_move_to_pose service')
+        self.move_client = self.create_client(MoveToPose,'ar_move_to_pose')
 
         # self.moveit2 = MoveIt2(
         #     node=self,
@@ -106,26 +98,47 @@ class TkinterROS(Node):
         # self.moveit2.planning_time = 5.0  # Timeout in seconds
 
 
-    def create_goal_constraints(self, pose: Pose):
-        """ Create goal constraints for the pose """
-        from moveit_commander.robot_trajectory import RobotTrajectory
+    def response_callback(self, future):
+        try:
+            response = future.result()
+            # Logging the status and message from the response
+            self.get_logger().info(f'Response Status: {response.status}')
+            self.get_logger().info(f'Response Message: {response.message}')
+        except Exception as e:
+            self.get_logger().error(f'Service call failed: {str(e)}')
 
-        # Create goal constraints
-        goal_constraints = RobotTrajectory()
-        goal_constraints.set_pose_target(pose)
-        return goal_constraints
+    def send_move_request(self, pose):
+        # Create a request
+        request = MoveToPose.Request()
+        request.pose = pose
+        
+        # Send the request
+        future = self.move_client.call_async(request)
+        
+        # Add a callback to be executed when the future is complete
+        future.add_done_callback(self.response_callback)
+
+
+    # def create_goal_constraints(self, pose: Pose):
+    #     """ Create goal constraints for the pose """
+    #     from moveit_commander.robot_trajectory import RobotTrajectory
+
+    #     # Create goal constraints
+    #     goal_constraints = RobotTrajectory()
+    #     goal_constraints.set_pose_target(pose)
+    #     return goal_constraints
     
-    def send_move_request(self, pose: Pose):
-        """ Send a move request to the MoveGroup action server. """
-        # Create goal message
-        goal = MoveGroupGoal()
+    # def send_move_request(self, pose: Pose):
+    #     """ Send a move request to the MoveGroup action server. """
+    #     # Create goal message
+    #     goal = MoveGroupGoal()
         
-        # Set the target pose
-        goal.request.start_state.is_diff = True
-        goal.request.goal_constraints = self.create_goal_constraints(pose)
+    #     # Set the target pose
+    #     goal.request.start_state.is_diff = True
+    #     goal.request.goal_constraints = self.create_goal_constraints(pose)
         
-        # Send the goal
-        self.client.send_goal_async(goal)
+    #     # Send the goal
+    #     self.client.send_goal_async(goal)
 
     def create_pose(self, position, rotation):
         """
@@ -160,16 +173,16 @@ class TkinterROS(Node):
         self.get_logger().warn('Publishing message: ' + msg.data)
 
     def on_homing_button_click(self):
-        self.trigger_service("Homing in progress...", "Homing successful!", "Homing failed")
+        self.trigger_homing_service("Homing in progress...", "Homing successful!", "Homing failed")
 
-    def create_goal_constraints(self, pose: Pose):
-        """ Create goal constraints for the pose """
-        from moveit_commander.robot_trajectory import RobotTrajectory
+    # def create_goal_constraints(self, pose: Pose):
+    #     """ Create goal constraints for the pose """
+    #     from moveit_commander.robot_trajectory import RobotTrajectory
 
-        # Create goal constraints
-        goal_constraints = RobotTrajectory()
-        goal_constraints.set_pose_target(pose)
-        return goal_constraints
+    #     # Create goal constraints
+    #     goal_constraints = RobotTrajectory()
+    #     goal_constraints.set_pose_target(pose)
+    #     return goal_constraints
 
     def on_calibrate_button_click(self):
 
@@ -178,8 +191,10 @@ class TkinterROS(Node):
 
         print(pose)
         self.send_move_request(pose)
-        print("done sending move request")
+      
 
+        #self.send_request(pose)
+        print("done sending move request")
         # self.move_to(position)
         # self.trigger_service("Calibration in progress...", "Calibration successful!", "Calibration failed")
 
@@ -189,10 +204,10 @@ class TkinterROS(Node):
     def on_init_button_click(self):
         self.initAR4()
 
-    def trigger_service(self, start_msg, success_msg, failure_msg):
+    def trigger_homing_service(self, start_msg, success_msg, failure_msg):
         self.label.config(text=start_msg)
         request = Trigger.Request()
-        future = self.client.call_async(request)
+        future = self.homing_client.call_async(request)
         future.add_done_callback(lambda f: self.handle_service_response(f, success_msg, failure_msg))
 
     def handle_service_response(self, future, success_msg, failure_msg):
