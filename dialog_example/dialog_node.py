@@ -91,7 +91,7 @@ class TkinterROS(Node):
         try:
             response = future.result()
             # Logging the status and message from the response
-            self.get_logger().info(f'Response Status: {response.status}')
+            self.get_logger().info(f'Response Status: {response.success}')
             self.get_logger().info(f'Response Message: {response.message}')
             self.arm_is_available = True
         except Exception as e:
@@ -159,7 +159,7 @@ class TkinterROS(Node):
 
         position = Pose()
         
-        pose = self.create_pose((0.04, -0.31, 0.375), (0.044, -0.702, 0.71, -0.03))
+        pose = self.create_pose((0.04, -0.31, 0.4), (0.044, -0.702, 0.71, -0.03))
         print(pose)
         print ("sending move request number 1111111") 
         self.send_move_request(pose)
