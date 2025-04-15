@@ -14,6 +14,11 @@ from rclpy.node import Node
 from geometry_msgs.msg import Pose
 from action_msgs.msg import GoalStatus
 from my_robot_interfaces.srv import MoveToPose  # Import the custom service type
+from tf2_ros import Buffer, TransformListener
+import easy_handeye2_msgs as ehm
+import easy_handeye2 as hec
+from easy_handeye2_msgs.srv import TakeSample
+import queue
 
 import time
 
@@ -29,9 +34,18 @@ class TkinterROS(Node):
     def __init__(self):
         super().__init__('tkinter_ros_node')
 
+
+        self.init_cal_poses()
+
         # Set up ROS publisher
         self.publisher = self.create_publisher(String, '/ar4_hardware_interface_node/homing_string', 10)
         self.timer = self.create_timer(1.0, self.publish_message)
+
+        #Timer: callback every 2.0 seconds
+        self.test_timer_callback_group = ReentrantCallbackGroup()
+        self.test_timer = self.create_timer(2.0, self.test_timer_callback,callback_group=self.test_timer_callback_group)
+
+
 
         # Create a ROS service client to request homing
         self.homing_client = self.create_client(Trigger, '/ar4_hardware_interface_node/homing')
@@ -67,6 +81,12 @@ class TkinterROS(Node):
         self.joints_entry.pack(pady=10)
         self.joints_entry.insert(0, "000001")
 
+        self.pos_text = tk.Text(self.root, height=3, font=("Arial", 16), wrap="word")
+        self.pos_text.pack(pady=10)
+        self.pos_text.configure(state='disabled')  # make it look like a label
+
+        self.update_position_label()
+
         # Use after to periodically update Tkinter UI in the main thread
         self.root.after(100, self.tk_mainloop)
 
@@ -74,10 +94,88 @@ class TkinterROS(Node):
             "joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"
         ]
 
-        self.get_logger().info('reggistering ar_move_to_pose service')
+        self.get_logger().info('registering ar_move_to_pose service')
         self.move_client = self.create_client(MoveToPose,'ar_move_to_pose')
+        # self.move_client.wait_for_service()
+        self.get_logger().info('ar_move_to_pose service registered')
+
+        self.take_sample_client = self.create_client(TakeSample, hec.TAKE_SAMPLE_TOPIC)
+        self.take_sample_client.wait_for_service()
+        self.get_logger().info('take_sample service registered')
         self.arm_is_available = True
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
     
+    def test_timer_callback(self):
+        self.get_logger().info('ROS loop is alive!')
+
+    def init_cal_poses(self):
+        self.cal_poses =    [[(0.03, -0.38, 0.39), (0.31, -0.56, 0.64, -0.43)],
+                            [(0.03, -0.39, 0.39), (0.26, -0.48, 0.70, -0.46)],
+                            [(0.03, -0.38, 0.39), (0.34, -0.43, 0.77, -0.34)],
+                            [(0.03, -0.38, 0.39), (0.36, -0.48, 0.73, -0.31)],
+                            [(0.03, -0.38, 0.39), (0.39, -0.47, 0.72, -0.33)],
+                            [(0.03, -0.38, 0.39), (0.31, -0.52, 0.66, -0.44)]]
+
+
+    def call_service_blocking(self, client, request, timeout_sec=5.0):
+        """
+        Sends an async service request using the given client, and blocks until the response is received.
+        The waiting is done in a background thread so it does not block the ROS 2 event loop.
+        """
+        self.call_is_done = False
+        
+        def _thread_func():
+            future = client.call_async(request)
+
+            def _on_response(fut):
+                try:
+                    self.call_is_done = True
+                except Exception as e:
+                    self.get_logger().error(f"Service call failed: {e}")    
+                    
+
+            future.add_done_callback(_on_response)
+
+        # Start background thread
+        threading.Thread(target=_thread_func, daemon=True).start()
+        
+        while not self.call_is_done:
+            self.spin_once()
+            time.sleep(0.01)
+            # Check if the future is done
+
+        if isinstance(result, Exception):
+            raise RuntimeError(f"Service call failed: {result}")
+
+        return result
+                        
+    def update_position_label(self):
+        pose = self.get_current_ee_pose()
+        if pose:
+            x = pose.position.x
+            y = pose.position.y
+            z = pose.position.z
+
+            ox = pose.orientation.x
+            oy = pose.orientation.y
+            oz = pose.orientation.z
+            ow = pose.orientation.w
+
+            new_text = (f"pos = ({x:.2f}, {y:.2f}, {z:.2f})\n"
+                        f"ori = ({ox:.2f}, {oy:.2f}, {oz:.2f}, {ow:.2f})")
+
+            current_text = self.pos_text.get("1.0", tk.END).strip()
+
+            if new_text != current_text:
+                self.pos_text.configure(state='normal')
+                self.pos_text.delete(1.0, tk.END)
+                self.pos_text.insert(tk.END, new_text)
+                self.pos_text.configure(state='disabled')
+
+        self.root.after(100, self.update_position_label)
+
+
     def spin_once(self):
     
         # Process ROS messages
@@ -86,7 +184,26 @@ class TkinterROS(Node):
         # Process Tkinter GUI events
         self.root.update_idletasks()
         self.root.update()
-            
+
+    def get_current_ee_pose(self) -> Pose:
+        try:
+            now = rclpy.time.Time()
+            trans = self.tf_buffer.lookup_transform(
+                target_frame='base_link',
+                source_frame='ee_link',
+                time=now,
+                timeout=rclpy.duration.Duration(seconds=1.0)
+            )
+
+            pose = Pose()
+            pose.position = trans.transform.translation
+            pose.orientation = trans.transform.rotation
+            return pose
+
+        except Exception as e:
+            self.get_logger().warn(f"TF lookup failed: {e}")
+            return None
+
     def response_callback(self, future):
         try:
             response = future.result()
@@ -113,12 +230,11 @@ class TkinterROS(Node):
         # Send the request
         self.arm_is_available = False
         future = self.move_client.call_async(request)
-        #self.move_client.call(request)
-        
+              
         # Add a callback to be executed when the future is complete
         future.add_done_callback(self.response_callback)
         self.wait_for_arm()
-
+ 
     def create_pose(self, position, rotation):
         """
         Creates a Pose message from position and rotation values.
@@ -154,17 +270,22 @@ class TkinterROS(Node):
     def on_homing_button_click(self):
         self.trigger_homing_service("Homing in progress...", "Homing successful!", "Homing failed")
 
-
+    def take_sample(self):
+        self.call_service_blocking(self.take_sample_client, TakeSample.Request(), timeout_sec=15.0)
+        self.get_logger().info("Sample taken - in dialog_node")
+  
+ 
     def on_calibrate_button_click(self):
 
-        position = Pose()
+        # position = Pose()
         
-        pose = self.create_pose((0.04, -0.31, 0.4), (0.044, -0.702, 0.71, -0.03))
-        print(pose)
-        print ("sending move request number 1111111") 
-        self.send_move_request(pose)
-        
-
+        # pose = self.create_pose((0.04, -0.31, 0.4), (0.044, -0.702, 0.71, -0.03))
+        # print(pose)
+        # print ("sending move request to:" + str(pose)) 
+        # self.send_move_request(pose)
+        # time.sleep(2)
+        self.take_sample()
+        self.get_logger().info("Sample taken - in dialog_node")
         # pose = self.create_pose((0.04, -0.31, 0.275), (0.1, -0.702, 0.71, -0.03))
         # print(pose)
         # print ("sending move request number 222222") 
@@ -228,13 +349,13 @@ def ros_spin(tkinter_ros):
 def main():
 
 
-    # debugpy.listen(("localhost", 5678))  # Port for debugger to connect
-    # print("Waiting for debugger to attach...")
-    # debugpy.wait_for_client()  # Ensures the debugger connects before continuing
+    debugpy.listen(("localhost", 5678))  # Port for debugger to connect
+    print("Waiting for debugger to attach...")
+    debugpy.wait_for_client()  # Ensures the debugger connects before continuing
+    print("Debugger connected.")
 
 
-
-    rclpy.init()
+    rclpy.init() 
 
     tkinter_ros = TkinterROS()
 
