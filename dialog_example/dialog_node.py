@@ -17,7 +17,7 @@ from my_robot_interfaces.srv import MoveToPose  # Import the custom service type
 from tf2_ros import Buffer, TransformListener
 import easy_handeye2_msgs as ehm
 import easy_handeye2 as hec
-from easy_handeye2_msgs.srv import TakeSample
+from easy_handeye2_msgs.srv import TakeSample, SaveCalibration,ComputeCalibration
 import queue
 
 import time
@@ -43,7 +43,7 @@ class TkinterROS(Node):
 
         #Timer: callback every 2.0 seconds
         self.test_timer_callback_group = ReentrantCallbackGroup()
-        self.test_timer = self.create_timer(2.0, self.test_timer_callback,callback_group=self.test_timer_callback_group)
+        #self.test_timer = self.create_timer(2.0, self.test_timer_callback,callback_group=self.test_timer_callback_group)
 
 
 
@@ -99,8 +99,11 @@ class TkinterROS(Node):
         # self.move_client.wait_for_service()
         self.get_logger().info('ar_move_to_pose service registered')
 
+        self.save_sample_calibration_client = self.create_client(SaveCalibration, hec.SAVE_CALIBRATION_TOPIC)
         self.take_sample_client = self.create_client(TakeSample, hec.TAKE_SAMPLE_TOPIC)
-        self.take_sample_client.wait_for_service()
+        self.compute_calibration_client = self.create_client(ComputeCalibration, hec.COMPUTE_CALIBRATION_TOPIC)
+
+        #self.take_sample_client.wait_for_service()
         self.get_logger().info('take_sample service registered')
         self.arm_is_available = True
         self.tf_buffer = Buffer()
@@ -124,31 +127,37 @@ class TkinterROS(Node):
         The waiting is done in a background thread so it does not block the ROS 2 event loop.
         """
         self.call_is_done = False
-        
+        result_container = {'result': None, 'exception': None}
+
         def _thread_func():
             future = client.call_async(request)
 
             def _on_response(fut):
                 try:
-                    self.call_is_done = True
+                    result_container['result'] = fut.result()
                 except Exception as e:
-                    self.get_logger().error(f"Service call failed: {e}")    
-                    
+                    result_container['exception'] = e
+                finally:
+                    self.call_is_done = True
 
             future.add_done_callback(_on_response)
 
         # Start background thread
         threading.Thread(target=_thread_func, daemon=True).start()
-        
+
+        # Wait until the call is done or timeout is reached
+        start_time = time.time()
         while not self.call_is_done:
             self.spin_once()
             time.sleep(0.01)
-            # Check if the future is done
+            if time.time() - start_time > timeout_sec:
+                raise TimeoutError("Service call timed out")
 
-        if isinstance(result, Exception):
-            raise RuntimeError(f"Service call failed: {result}")
+        if result_container['exception']:
+            raise RuntimeError(f"Service call failed: {result_container['exception']}")
 
-        return result
+        return result_container['result']
+
                         
     def update_position_label(self):
         pose = self.get_current_ee_pose()
@@ -208,8 +217,8 @@ class TkinterROS(Node):
         try:
             response = future.result()
             # Logging the status and message from the response
-            self.get_logger().info(f'Response Status: {response.success}')
-            self.get_logger().info(f'Response Message: {response.message}')
+            #self.get_logger().info(f'Response Status: {response.success}')
+            #self.get_logger().info(f'Response Message: {response.message}')
             self.arm_is_available = True
         except Exception as e:
             self.get_logger().error(f'Service call failed: {str(e)}')
@@ -271,9 +280,17 @@ class TkinterROS(Node):
         self.trigger_homing_service("Homing in progress...", "Homing successful!", "Homing failed")
 
     def take_sample(self):
-        self.call_service_blocking(self.take_sample_client, TakeSample.Request(), timeout_sec=15.0)
-        self.get_logger().info("Sample taken - in dialog_node")
+        self.call_service_blocking(self.take_sample_client, TakeSample.Request(), timeout_sec=115.0)
+        #self.get_logger().info("Sample taken - in dialog_node")
   
+    def save_calibration(self):
+        self.call_service_blocking(self.save_sample_calibration_client, SaveCalibration.Request(), timeout_sec=115.0)
+        self.get_logger().info("Calibration saved - in dialog_node")
+ 
+    def compute_calibration(self):
+        self.call_service_blocking(self.compute_calibration_client, ComputeCalibration.Request(), timeout_sec=115.0)
+        self.get_logger().info("Calibration computed - in dialog_node")
+
  
     def on_calibrate_button_click(self):
 
@@ -284,8 +301,26 @@ class TkinterROS(Node):
         # print ("sending move request to:" + str(pose)) 
         # self.send_move_request(pose)
         # time.sleep(2)
-        self.take_sample()
-        self.get_logger().info("Sample taken - in dialog_node")
+
+        for i, pose in enumerate(self.cal_poses):
+            #print("sending move request")
+            pose_msg = self.create_pose(pose[0], pose[1])
+            #print(pose_msg)
+            self.send_move_request(pose_msg)
+            time.sleep(3)
+            self.take_sample()
+            print(f"sample no. {i} taken")   
+           
+
+        self.compute_calibration()
+        print("calibration computed")
+        self.save_calibration()
+        print("calibration saved")
+        print("---------------done calibrating poses-------------")
+
+
+        # self.take_sample()
+        # self.get_logger().info("Sample taken - in dialog_node")
         # pose = self.create_pose((0.04, -0.31, 0.275), (0.1, -0.702, 0.71, -0.03))
         # print(pose)
         # print ("sending move request number 222222") 
@@ -297,7 +332,7 @@ class TkinterROS(Node):
         # print ("sending move request number 333333") 
         # self.send_move_request(pose)
 
-        print("done sending move request")
+        
 
     def on_validate_button_click(self):
         self.trigger_service("Validation in progress...", "Validation successful!", "Validation failed")
@@ -349,10 +384,10 @@ def ros_spin(tkinter_ros):
 def main():
 
 
-    debugpy.listen(("localhost", 5678))  # Port for debugger to connect
-    print("Waiting for debugger to attach...")
-    debugpy.wait_for_client()  # Ensures the debugger connects before continuing
-    print("Debugger connected.")
+    # debugpy.listen(("localhost", 5678))  # Port for debugger to connect
+    # print("Waiting for debugger to attach...")
+    # debugpy.wait_for_client()  # Ensures the debugger connects before continuing
+    # print("Debugger connected.")
 
 
     rclpy.init() 
