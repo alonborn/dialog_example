@@ -15,6 +15,7 @@ from geometry_msgs.msg import Pose
 from action_msgs.msg import GoalStatus
 from my_robot_interfaces.srv import MoveToPose  # Import the custom service type
 from tf2_ros import Buffer, TransformListener
+from sensor_msgs.msg import JointState
 import easy_handeye2_msgs as ehm
 import easy_handeye2 as hec
 from easy_handeye2_msgs.srv import TakeSample, SaveCalibration,ComputeCalibration
@@ -33,92 +34,132 @@ class TkinterROS(Node):
 
     def __init__(self):
         super().__init__('tkinter_ros_node')
-
-
         self.init_cal_poses()
 
         # Set up ROS publisher
         self.publisher = self.create_publisher(String, '/ar4_hardware_interface_node/homing_string', 10)
         self.timer = self.create_timer(1.0, self.publish_message)
 
-        #Timer: callback every 2.0 seconds
         self.test_timer_callback_group = ReentrantCallbackGroup()
-        #self.test_timer = self.create_timer(2.0, self.test_timer_callback,callback_group=self.test_timer_callback_group)
 
-
-
-        # Create a ROS service client to request homing
         self.homing_client = self.create_client(Trigger, '/ar4_hardware_interface_node/homing')
 
-        #Wait for homing service to be available
-        # while not self.homing_client.wait_for_service(timeout_sec=1.0):
-        #     self.get_logger().warn('Waiting for homing service to become available...')
+        # Subscribe to joint states
+        self.create_subscription(JointState, '/joint_states', self.joint_states_callback, 10)
 
         # Set up Tkinter GUI
         self.root = tk.Tk()
         self.root.title("Tkinter and ROS 2")
-        self.root.geometry("600x600")  # Increased dialog size
+        self.root.geometry("1000x600")
 
-        #Create a label
-        self.label = tk.Label(self.root, text="Waiting for messages...", font=("Arial", 16))
+        self.main_frame = tk.Frame(self.root)
+        self.main_frame.pack(fill=tk.BOTH, expand=True)
+        self.main_frame.columnconfigure(0, weight=1)
+        self.main_frame.columnconfigure(1, weight=2)
+
+        self.left_frame = tk.Frame(self.main_frame)
+        self.left_frame.grid(row=0, column=0, sticky='nsew', padx=10, pady=10)
+
+        self.right_frame = tk.Frame(self.main_frame, bg='lightgray')
+        self.right_frame.grid(row=0, column=1, sticky='nsew', padx=10, pady=10)
+
+        self.label = tk.Label(self.left_frame, text="Waiting for messages...", font=("Arial", 16))
         self.label.pack(pady=10)
 
-        # Create buttons
-        self.homing_button = tk.Button(self.root, text="Homing", command=self.on_homing_button_click, font=("Arial", 14), width=20, height=2)
+        self.homing_button = tk.Button(self.left_frame, text="Homing", command=self.on_homing_button_click, font=("Arial", 14), width=20, height=2)
         self.homing_button.pack(pady=5)
 
-        self.calibrate_button = tk.Button(self.root, text="Calibrate", command=self.on_calibrate_button_click, font=("Arial", 14), width=20, height=2)
+        self.calibrate_button = tk.Button(self.left_frame, text="Calibrate", command=self.on_calibrate_button_click, font=("Arial", 14), width=20, height=2)
         self.calibrate_button.pack(pady=5)
 
-        self.validate_button = tk.Button(self.root, text="Validate", command=self.on_validate_button_click, font=("Arial", 14), width=20, height=2)
+        self.validate_button = tk.Button(self.left_frame, text="Go Home", command=self.on_go_home_button_click, font=("Arial", 14), width=20, height=2)
         self.validate_button.pack(pady=5)
-        
-        self.init_button = tk.Button(self.root, text="Init", command=self.on_init_button_click, font=("Arial", 14), width=20, height=2)
+
+        self.init_button = tk.Button(self.left_frame, text="Send Pos", command=self.on_send_pos_button_click, font=("Arial", 14), width=20, height=2)
         self.init_button.pack(pady=5)
-        
-        # Create text field for 'Joints to calibrate'
-        self.joints_entry = tk.Entry(self.root, font=("Arial", 14), width=30)
+
+        self.joints_entry = tk.Entry(self.left_frame, font=("Arial", 14), width=30)
         self.joints_entry.pack(pady=10)
         self.joints_entry.insert(0, "000001")
 
-        self.pos_text = tk.Text(self.root, height=3, font=("Arial", 16), wrap="word")
+        self.pos_text = tk.Text(self.left_frame, height=3, font=("Arial", 12), wrap="word")
         self.pos_text.pack(pady=10)
-        self.pos_text.configure(state='disabled')  # make it look like a label
+        self.pos_text.configure(state='disabled')
+
+        self.pose_frame = tk.Frame(self.left_frame)
+        self.pose_frame.pack(pady=(20, 5))
+
+        self.translation_label = tk.Label(self.pose_frame, text="Translation:", font=("Arial", 10))
+        self.translation_label.grid(row=0, column=0, padx=5)
+        self.translation_entry = tk.Entry(self.pose_frame, font=("Arial", 10), width=12)
+        self.translation_entry.grid(row=0, column=1, padx=5)
+        self.translation_entry.insert(0, "(0.03, -0.38, 0.39)")
+
+        self.rotation_label = tk.Label(self.pose_frame, text="Rotation:", font=("Arial", 10))
+        self.rotation_label.grid(row=0, column=2, padx=5)
+        self.rotation_entry = tk.Entry(self.pose_frame, font=("Arial", 10), width=18)
+        self.rotation_entry.grid(row=0, column=3, padx=5)
+        self.rotation_entry.insert(0, "(0.0, 0.7071, 0.0, 0.7071)")
+
+        self.joint_states_var = tk.StringVar()
+        self.joint_states_entry = tk.Text(self.right_frame, font=("Courier", 10), width=30, height=10)
+        self.joint_states_entry.pack(pady=10)
 
         self.update_position_label()
-
-        # Use after to periodically update Tkinter UI in the main thread
         self.root.after(100, self.tk_mainloop)
 
-        self.arm_joint_names = [
-            "joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"
-        ]
+        self.arm_joint_names = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"]
 
         self.get_logger().info('registering ar_move_to_pose service')
-        self.move_client = self.create_client(MoveToPose,'ar_move_to_pose')
-        # self.move_client.wait_for_service()
+        self.move_client = self.create_client(MoveToPose, 'ar_move_to_pose')
         self.get_logger().info('ar_move_to_pose service registered')
 
         self.save_sample_calibration_client = self.create_client(SaveCalibration, hec.SAVE_CALIBRATION_TOPIC)
         self.take_sample_client = self.create_client(TakeSample, hec.TAKE_SAMPLE_TOPIC)
         self.compute_calibration_client = self.create_client(ComputeCalibration, hec.COMPUTE_CALIBRATION_TOPIC)
 
-        #self.take_sample_client.wait_for_service()
         self.get_logger().info('take_sample service registered')
         self.arm_is_available = True
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
     
+    def joint_states_callback(self, msg):
+        try:
+            joint_info = "\n".join([f"{pos:.4f}," for pos in msg.position])
+            self.joint_states_entry.configure(state='normal')
+            self.joint_states_entry.delete("1.0", tk.END)
+            self.joint_states_entry.insert(tk.END, joint_info)
+            self.joint_states_entry.configure(state='disabled')
+        except Exception as e:
+            self.get_logger().error(f"Error in joint_states_callback: {e}")
+
     def test_timer_callback(self):
         self.get_logger().info('ROS loop is alive!')
 
     def init_cal_poses(self):
-        self.cal_poses =    [[(0.03, -0.38, 0.39), (0.31, -0.56, 0.64, -0.43)],
-                            [(0.03, -0.39, 0.39), (0.26, -0.48, 0.70, -0.46)],
-                            [(0.03, -0.38, 0.39), (0.34, -0.43, 0.77, -0.34)],
-                            [(0.03, -0.38, 0.39), (0.36, -0.48, 0.73, -0.31)],
-                            [(0.03, -0.38, 0.39), (0.39, -0.47, 0.72, -0.33)],
-                            [(0.03, -0.38, 0.39), (0.31, -0.52, 0.66, -0.44)]]
+        # self.cal_poses =    [[(0.03, -0.38, 0.39), (0.31, -0.56, 0.64, -0.43)],
+        #                     [(0.03, -0.39, 0.39), (0.26, -0.48, 0.70, -0.46)],
+        #                     [(0.03, -0.38, 0.39), (0.34, -0.43, 0.77, -0.34)],
+        #                     [(0.03, -0.38, 0.39), (0.36, -0.48, 0.73, -0.31)],
+        #                     [(0.03, -0.38, 0.39), (0.39, -0.47, 0.72, -0.33)],
+        #                     [(0.03, -0.38, 0.39), (0.31, -0.52, 0.66, -0.44)]]
+        self.cal_poses = [
+            [(0.03, -0.38, 0.39), (0.0, 0.7071, 0.0, 0.7071)],  # Facing left (camera side)
+            [(0.03, -0.38, 0.39), (0.3827, 0.0, 0.0, 0.9239)],  # Roll +45°
+            [(0.03, -0.38, 0.39), (0.2706, 0.0, 0.0, 0.9627)],  # Roll +30° 
+            [(0.03, -0.38, 0.39), (0.0, 0.3827, 0.0, 0.9239)],  # Pitch +45°
+            [(0.03, -0.38, 0.39), (0.0, 0.2588, 0.0, 0.9659)],  # Pitch +30°
+            [(0.03, -0.38, 0.39), (0.0, 0.0, -0.2588, 0.9659)], # Yaw -30°   XXXXXXXXx
+            [(0.03, -0.38, 0.39), (0.2706, 0.2706, 0.2706, 0.8820)],  # All axes +30° ?????
+            [(0.03, -0.38, 0.39), (0.191, 0.191, -0.191, 0.9511)],  # Mixed small rotation 
+            [(0.03, -0.38, 0.39), (0.5, 0.5, 0.5, 0.5)],  # 90° on all axes
+            [(0.03, -0.38, 0.39), (-0.5, 0.5, -0.5, 0.5)],  # 90° mixed
+            [(0.03, -0.38, 0.35), (0.0, 0.7071, 0.0, 0.7071)],  # Facing left, lower Z
+            [(0.03, -0.38, 0.43), (0.0, 0.7071, 0.0, 0.7071)],  # Facing left, higher Z
+            [(0.06, -0.38, 0.41), (0.0, 0.7071, 0.0, 0.7071)],  # Slight X/Z offset, still facing camera
+            [(0.03, -0.38, 0.41), (0.191, 0.0, 0.0, 0.9815)], # Opposite lean
+            [(0.03, -0.38, 0.37), (0.191, -0.191, 0.191, 0.9511)], # Mixed small rotation, lower Z
+        ]
 
 
     def call_service_blocking(self, client, request, timeout_sec=5.0):
@@ -290,7 +331,22 @@ class TkinterROS(Node):
     def compute_calibration(self):
         self.call_service_blocking(self.compute_calibration_client, ComputeCalibration.Request(), timeout_sec=115.0)
         self.get_logger().info("Calibration computed - in dialog_node")
+    
+    def send_pose_from_entries(self):
+            try:
+                translation_str = self.translation_entry.get()
+                rotation_str = self.rotation_entry.get()
 
+                translation = tuple(float(x.strip()) for x in translation_str.strip('()').split(','))
+                rotation = tuple(float(x.strip()) for x in rotation_str.strip('()').split(','))
+
+                if len(translation) != 3 or len(rotation) != 4:
+                    raise ValueError("Invalid pose format")
+
+                pose_msg = self.create_pose(translation, rotation)
+                self.send_move_request(pose_msg)
+            except Exception as e:
+                print(f"Error sending pose: {e}")
  
     def on_calibrate_button_click(self):
 
@@ -309,36 +365,24 @@ class TkinterROS(Node):
             self.send_move_request(pose_msg)
             time.sleep(3)
             self.take_sample()
+            time.sleep(3)
+            if i > 2:
+                self.compute_calibration()
             print(f"sample no. {i} taken")   
            
 
-        self.compute_calibration()
+        #self.compute_calibration()
         print("calibration computed")
         self.save_calibration()
         print("calibration saved")
         print("---------------done calibrating poses-------------")
 
-
-        # self.take_sample()
-        # self.get_logger().info("Sample taken - in dialog_node")
-        # pose = self.create_pose((0.04, -0.31, 0.275), (0.1, -0.702, 0.71, -0.03))
-        # print(pose)
-        # print ("sending move request number 222222") 
-        # self.send_move_request(pose)
-
-
-        # pose = self.create_pose((0.04, -0.31, 0.375), (0.1, -0.702, 0.71, -0.03))
-        # print(pose)
-        # print ("sending move request number 333333") 
-        # self.send_move_request(pose)
-
-        
-
-    def on_validate_button_click(self):
-        self.trigger_service("Validation in progress...", "Validation successful!", "Validation failed")
-
-    def on_init_button_click(self):
-        self.initAR4()
+    def on_go_home_button_click(self):
+        pose = [(0.01, -0.33, 0.49), (0.01, -0.69, 0.72, 0.01)]
+        pose_msg = self.create_pose(pose[0], pose[1])
+        self.send_move_request(pose_msg)
+    def on_send_pos_button_click(self):
+        self.send_pose_from_entries()
 
     def trigger_homing_service(self, start_msg, success_msg, failure_msg):
         self.label.config(text=start_msg)
@@ -362,6 +406,7 @@ class TkinterROS(Node):
     def tk_mainloop(self):
         self.root.update_idletasks()
         self.root.update()
+        self.root.after(100, self.tk_mainloop)
 
     def on_shutdown(self):
         self.root.quit()
