@@ -10,19 +10,20 @@ from rclpy.executors import MultiThreadedExecutor
 from geometry_msgs.msg import PoseStamped
 from geometry_msgs.msg import Pose
 from geometry_msgs.msg import Pose, Point, Quaternion
-from rclpy.node import Node
 from geometry_msgs.msg import Pose
 from action_msgs.msg import GoalStatus
 from my_robot_interfaces.srv import MoveToPose  # Import the custom service type
+from my_robot_interfaces.action import MoveToPoseAc  # Import the custom service type
 from tf2_ros import Buffer, TransformListener
 from sensor_msgs.msg import JointState
 import easy_handeye2_msgs as ehm
 import easy_handeye2 as hec
 from easy_handeye2_msgs.srv import TakeSample, SaveCalibration,ComputeCalibration
 import queue
-
+from rclpy.action import ActionClient
 import time
-
+from . import Mover
+from geometry_msgs.msg import Point
 
 import debugpy
 
@@ -35,11 +36,12 @@ class TkinterROS(Node):
     def __init__(self):
         super().__init__('tkinter_ros_node')
         self.init_cal_poses()
+        self.mover = Mover.Mover(self)
 
         # Set up ROS publisher
         self.publisher = self.create_publisher(String, '/ar4_hardware_interface_node/homing_string', 10)
         self.timer = self.create_timer(1.0, self.publish_message)
-
+        self.create_subscription(Point, '/aruco_pose', self.aruco_pose_callback, 10)
         self.test_timer_callback_group = ReentrantCallbackGroup()
 
         self.homing_client = self.create_client(Trigger, '/ar4_hardware_interface_node/homing')
@@ -82,6 +84,17 @@ class TkinterROS(Node):
         self.joints_entry.pack(pady=10)
         self.joints_entry.insert(0, "000001")
 
+        self.aruco_pose_entry = tk.Text(self.right_frame, font=("Courier", 10), width=30, height=3)
+        self.aruco_pose_entry.pack(pady=10)
+
+        self.copy_aruco_button = tk.Button(
+            self.right_frame, 
+            text="Copy Aruco Pose", 
+            font=("Arial", 10), 
+            command=self.copy_aruco_pose_to_clipboard
+        )
+        self.copy_aruco_button.pack(pady=5)
+
         self.pos_text = tk.Text(self.left_frame, height=3, font=("Arial", 12), wrap="word")
         self.pos_text.pack(pady=10)
         self.pos_text.configure(state='disabled')
@@ -93,7 +106,7 @@ class TkinterROS(Node):
         self.translation_label.grid(row=0, column=0, padx=5)
         self.translation_entry = tk.Entry(self.pose_frame, font=("Arial", 10), width=12)
         self.translation_entry.grid(row=0, column=1, padx=5)
-        self.translation_entry.insert(0, "(0.03, -0.38, 0.39)")
+        self.translation_entry.insert(0, "(0.03, -0.38, 0.20)")
 
         self.rotation_label = tk.Label(self.pose_frame, text="Rotation:", font=("Arial", 10))
         self.rotation_label.grid(row=0, column=2, padx=5)
@@ -111,8 +124,11 @@ class TkinterROS(Node):
         self.arm_joint_names = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"]
 
         self.get_logger().info('registering ar_move_to_pose service')
-        self.move_client = self.create_client(MoveToPose, 'ar_move_to_pose')
-        self.get_logger().info('ar_move_to_pose service registered')
+        #self.move_client = self.create_client(MoveToPose, 'ar_move_to_pose')
+
+        #self.action_client = ActionClient(self,MoveToPoseAc, 'ar_move_to_pose')
+        
+        #self.get_logger().info('ar_move_to_pose service registered')
 
         self.save_sample_calibration_client = self.create_client(SaveCalibration, hec.SAVE_CALIBRATION_TOPIC)
         self.take_sample_client = self.create_client(TakeSample, hec.TAKE_SAMPLE_TOPIC)
@@ -123,6 +139,16 @@ class TkinterROS(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
     
+    def copy_aruco_pose_to_clipboard(self):
+        try:
+            pose_text = self.aruco_pose_entry.get("1.0", tk.END).strip()
+            self.root.clipboard_clear()
+            self.root.clipboard_append(pose_text)
+            self.root.update()  # now it stays on the clipboard after the window is closed
+            print("Aruco pose copied to clipboard:", pose_text)
+        except Exception as e:
+            self.get_logger().error(f"Error copying Aruco pose to clipboard: {e}")
+
     def joint_states_callback(self, msg):
         try:
             joint_info = "\n".join([f"{pos:.4f}," for pos in msg.position])
@@ -272,7 +298,21 @@ class TkinterROS(Node):
             time.sleep(0.01)  # Sleep for a short duration to avoid busy-waiting
             #print ("spinning")
 
+    def aruco_pose_callback(self, msg):
+        try:
+            pose_text = f"({msg.x:.4f}, {msg.y:.4f}, {msg.z:.4f})"
+            self.aruco_pose_entry.configure(state='normal')
+            self.aruco_pose_entry.delete("1.0", tk.END)
+            self.aruco_pose_entry.insert(tk.END, pose_text)
+            self.aruco_pose_entry.configure(state='disabled')
+        except Exception as e:
+            self.get_logger().error(f"Error in aruco_pose_callback: {e}")
+
     def send_move_request(self, pose):
+        time.sleep(0.5) #for some reason the arm is not available immediately after the service call
+        self.mover.MoveArm(pose.position, pose.orientation)
+        #time.sleep(1)
+        return
         # Create a request
         request = MoveToPose.Request()
         request.pose = pose
@@ -348,6 +388,26 @@ class TkinterROS(Node):
             except Exception as e:
                 print(f"Error sending pose: {e}")
  
+    def spin_until_future(self, future, timeout_sec=0.1):
+        while not future.done():
+            rclpy.spin_once(self, timeout_sec=timeout_sec)
+        return future.result()
+
+    def move_pos_action(self, pose):
+        # Create a goal message
+        goal_msg = MoveToPoseAc.Goal(pose = pose)
+        
+
+        # Send the goal to the action server
+        self.action_client.wait_for_server()
+        future = self.action_client.send_goal_async(goal_msg)
+        self.spin_until_future(future)
+        goal_handle = future.result()
+        result_future = goal_handle.get_result_async()
+        self.spin_until_future(result_future)
+        result = result_future.result().result
+        print(f"Result: {result.success}, Code: {result.error_code}, Msg: {result.message}")
+
     def on_calibrate_button_click(self):
 
         # position = Pose()
