@@ -24,8 +24,13 @@ from rclpy.action import ActionClient
 import time
 from . import Mover
 from geometry_msgs.msg import Point
-
+import re
+import json
 import debugpy
+import os
+import tf_transformations
+
+from ament_index_python.packages import get_package_share_directory
 
 class TkinterROS(Node):
     counter = 0
@@ -37,10 +42,12 @@ class TkinterROS(Node):
         super().__init__('tkinter_ros_node')
         self.init_cal_poses()
         self.mover = Mover.Mover(self)
+        self.last_joint_update_time = self.get_clock().now()
 
         # Set up ROS publisher
         self.publisher = self.create_publisher(String, '/ar4_hardware_interface_node/homing_string', 10)
-        self.timer = self.create_timer(1.0, self.publish_message)
+        #self.timer = self.create_timer(1.0, self.publish_message)
+
         self.create_subscription(Point, '/aruco_pose', self.aruco_pose_callback, 10)
         self.test_timer_callback_group = ReentrantCallbackGroup()
 
@@ -68,23 +75,28 @@ class TkinterROS(Node):
         self.label = tk.Label(self.left_frame, text="Waiting for messages...", font=("Arial", 16))
         self.label.pack(pady=10)
 
-        self.homing_button = tk.Button(self.left_frame, text="Homing", command=self.on_homing_button_click, font=("Arial", 14), width=20, height=2)
-        self.homing_button.pack(pady=5)
+       # Create a new frame to hold the row of buttons
+        self.button_row = tk.Frame(self.left_frame)
+        self.button_row.pack(pady=10)
 
-        self.calibrate_button = tk.Button(self.left_frame, text="Calibrate", command=self.on_calibrate_button_click, font=("Arial", 14), width=20, height=2)
-        self.calibrate_button.pack(pady=5)
+        # Homing button
+        self.homing_button = tk.Button(self.button_row, text="Homing", command=self.on_homing_button_click, font=("Arial", 14), width=10, height=1)
+        self.homing_button.grid(row=0, column=0, padx=5)
 
-        self.validate_button = tk.Button(self.left_frame, text="Go Home", command=self.on_go_home_button_click, font=("Arial", 14), width=20, height=2)
-        self.validate_button.pack(pady=5)
+        # Calibrate button
+        self.calibrate_button = tk.Button(self.button_row, text="Calibrate", command=self.on_calibrate_button_click, font=("Arial", 14), width=10, height=1)
+        self.calibrate_button.grid(row=0, column=1, padx=5)
 
-        self.init_button = tk.Button(self.left_frame, text="Send Pos", command=self.on_send_pos_button_click, font=("Arial", 14), width=20, height=2)
-        self.init_button.pack(pady=5)
+        # Go Home button
+        self.validate_button = tk.Button(self.button_row, text="Go Home", command=self.on_go_home_button_click, font=("Arial", 14), width=10, height=1)
+        self.validate_button.grid(row=0, column=2, padx=5)
 
-        self.joints_entry = tk.Entry(self.left_frame, font=("Arial", 14), width=30)
+
+        self.joints_entry = tk.Entry(self.left_frame, font=("Arial", 14), width=10)
         self.joints_entry.pack(pady=10)
         self.joints_entry.insert(0, "000001")
 
-        self.aruco_pose_entry = tk.Text(self.right_frame, font=("Courier", 10), width=30, height=3)
+        self.aruco_pose_entry = tk.Text(self.right_frame, font=("Courier", 10), width=21, height=2)
         self.aruco_pose_entry.pack(pady=10)
 
         self.copy_aruco_button = tk.Button(
@@ -95,7 +107,7 @@ class TkinterROS(Node):
         )
         self.copy_aruco_button.pack(pady=5)
 
-        self.pos_text = tk.Text(self.left_frame, height=3, font=("Arial", 12), wrap="word")
+        self.pos_text = tk.Text(self.left_frame, height=2, font=("Arial", 12), wrap="word")
         self.pos_text.pack(pady=10)
         self.pos_text.configure(state='disabled')
 
@@ -104,18 +116,23 @@ class TkinterROS(Node):
 
         self.translation_label = tk.Label(self.pose_frame, text="Translation:", font=("Arial", 10))
         self.translation_label.grid(row=0, column=0, padx=5)
-        self.translation_entry = tk.Entry(self.pose_frame, font=("Arial", 10), width=12)
+        self.translation_entry = tk.Entry(self.pose_frame, font=("Arial", 10), width=23)
         self.translation_entry.grid(row=0, column=1, padx=5)
         self.translation_entry.insert(0, "(0.03, -0.38, 0.20)")
 
         self.rotation_label = tk.Label(self.pose_frame, text="Rotation:", font=("Arial", 10))
         self.rotation_label.grid(row=0, column=2, padx=5)
-        self.rotation_entry = tk.Entry(self.pose_frame, font=("Arial", 10), width=18)
+        self.rotation_entry = tk.Entry(self.pose_frame, font=("Arial", 10), width=23)
         self.rotation_entry.grid(row=0, column=3, padx=5)
         self.rotation_entry.insert(0, "(0.0, 0.7071, 0.0, 0.7071)")
 
+        self.send_pos_button = tk.Button(self.pose_frame, text="Move!", command=self.on_send_pos_button_click, font=("Arial", 14), width=8, height=1)
+        self.send_pos_button.grid(row=0, column=4, padx=5)
+
+        tk.Button(self.pose_frame, text="Save Pos", command=self.save_current_pose).grid(row=0, column=5, columnspan=1)
+
         self.joint_states_var = tk.StringVar()
-        self.joint_states_entry = tk.Text(self.right_frame, font=("Courier", 10), width=30, height=10)
+        self.joint_states_entry = tk.Text(self.right_frame, font=("Courier", 10), width=21, height=10)
         self.joint_states_entry.pack(pady=10)
 
         self.update_position_label()
@@ -138,7 +155,91 @@ class TkinterROS(Node):
         self.arm_is_available = True
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
-    
+        self.add_pose_adjustment_controls()
+        
+    # --- GUI Pose Adjustment Controls (to be called inside TkinterROS.__init__()) ---
+    def add_pose_adjustment_controls(self):
+        self.pose_index = 0
+        pose_ctrl_frame = tk.Frame(self.left_frame)
+        pose_ctrl_frame.pack(pady=10)
+
+        self.current_pose_display = tk.Text(pose_ctrl_frame, height=3, font=("Courier", 10), width=40)
+        self.current_pose_display.grid(row=0, column=0, columnspan=6, pady=5)
+
+
+
+        def move_to_current_pose():
+            pos, ori = self.cal_poses[self.pose_index]
+            pose_msg = self.create_pose(pos, ori)
+            self.send_move_request(pose_msg)
+
+            # Update pose display
+            self.current_pose_display.configure(state='normal')
+            self.current_pose_display.delete("1.0", tk.END)
+            self.current_pose_display.insert(tk.END, f"{pos}\n{ori}")
+            self.current_pose_display.configure(state='disabled')
+
+            # Also update entry widgets
+            self.translation_entry.delete(0, tk.END)
+            self.translation_entry.insert(0, f"({pos[0]:.4f}, {pos[1]:.4f}, {pos[2]:.4f})")
+            self.rotation_entry.delete(0, tk.END)
+            self.rotation_entry.insert(0, f"({ori[0]:.4f}, {ori[1]:.4f}, {ori[2]:.4f}, {ori[3]:.4f})")
+
+        def adjust_orientation(axis, delta):
+            rotation_str = self.rotation_entry.get()
+            try:
+                ori = tuple(float(x.strip()) for x in rotation_str.strip("()").split(","))
+                euler = tf_transformations.euler_from_quaternion(ori)
+                euler = list(euler)
+                euler[axis] += delta
+                new_ori = tf_transformations.quaternion_from_euler(*euler)
+                self.rotation_entry.delete(0, tk.END)
+                self.rotation_entry.insert(0, f"({new_ori[0]:.4f}, {new_ori[1]:.4f}, {new_ori[2]:.4f}, {new_ori[3]:.4f})")
+            except Exception as e:
+                self.get_logger().error(f"Failed to adjust orientation: {e}")
+
+
+        tk.Button(pose_ctrl_frame, text="Prev Pose", command=lambda: (setattr(self, 'pose_index', max(0, self.pose_index - 1)), move_to_current_pose())).grid(row=1, column=0)
+        tk.Button(pose_ctrl_frame, text="Next Pose", command=lambda: (setattr(self, 'pose_index', min(len(self.cal_poses)-1, self.pose_index + 1)), move_to_current_pose())).grid(row=1, column=1)
+        tk.Button(pose_ctrl_frame, text="Roll +", command=lambda: adjust_orientation(0, 0.05)).grid(row=1, column=2)
+        tk.Button(pose_ctrl_frame, text="Roll -", command=lambda: adjust_orientation(0, -0.05)).grid(row=1, column=3)
+        tk.Button(pose_ctrl_frame, text="Pitch +", command=lambda: adjust_orientation(1, 0.05)).grid(row=2, column=2)
+        tk.Button(pose_ctrl_frame, text="Pitch -", command=lambda: adjust_orientation(1, -0.05)).grid(row=2, column=3)
+        tk.Button(pose_ctrl_frame, text="Yaw +", command=lambda: adjust_orientation(2, 0.05)).grid(row=2, column=0)
+        tk.Button(pose_ctrl_frame, text="Yaw -", command=lambda: adjust_orientation(2, -0.05)).grid(row=2, column=1)
+      
+
+        self.update_pose_display()
+
+    def update_pose_display(self):
+        pos, ori = self.cal_poses[self.pose_index]
+        self.current_pose_display.configure(state='normal')
+        self.current_pose_display.delete("1.0", tk.END)
+        self.current_pose_display.insert(tk.END, f"{pos}\n{ori}")
+        self.current_pose_display.configure(state='disabled')
+
+    def save_current_pose(self):
+        try:
+            translation_str = self.translation_entry.get()
+            rotation_str = self.rotation_entry.get()
+            new_pos = tuple(float(x.strip()) for x in translation_str.strip('()').split(','))
+            new_ori = tuple(float(x.strip()) for x in rotation_str.strip('()').split(','))
+            if len(new_pos) == 3 and len(new_ori) == 4:
+                self.cal_poses[self.pose_index] = (new_pos, new_ori)
+                update_pose_display()
+            else:
+                print("Invalid pose length.")
+        except Exception as e:
+            self.get_logger().error(f"Failed to save pose from entries: {e}")
+
+
+    def load_calibration_poses(self, json_path="cal_poses.jsonc"):
+        with open(json_path, "r") as f:
+            content = f.read()
+        content = re.sub(r"//.*?$|/\*.*?\*/", "", content, flags=re.MULTILINE | re.DOTALL)
+        data = json.loads(content)
+        return [(tuple(p["position"]), tuple(p["orientation"])) for p in data]
+
     def copy_aruco_pose_to_clipboard(self):
         try:
             pose_text = self.aruco_pose_entry.get("1.0", tk.END).strip()
@@ -150,6 +251,12 @@ class TkinterROS(Node):
             self.get_logger().error(f"Error copying Aruco pose to clipboard: {e}")
 
     def joint_states_callback(self, msg):
+
+        now = self.get_clock().now()
+        if (now - self.last_joint_update_time).nanoseconds < 1e9:
+            return  # Skip if less than 1 second since last update
+        self.last_joint_update_time = now
+        
         try:
             joint_info = "\n".join([f"{pos:.4f}," for pos in msg.position])
             self.joint_states_entry.configure(state='normal')
@@ -169,24 +276,12 @@ class TkinterROS(Node):
         #                     [(0.03, -0.38, 0.39), (0.36, -0.48, 0.73, -0.31)],
         #                     [(0.03, -0.38, 0.39), (0.39, -0.47, 0.72, -0.33)],
         #                     [(0.03, -0.38, 0.39), (0.31, -0.52, 0.66, -0.44)]]
-        self.cal_poses = [
-            [(0.03, -0.38, 0.39), (0.0, 0.7071, 0.0, 0.7071)],  # Facing left (camera side)
-            [(0.03, -0.38, 0.39), (0.3827, 0.0, 0.0, 0.9239)],  # Roll +45°
-            [(0.03, -0.38, 0.39), (0.2706, 0.0, 0.0, 0.9627)],  # Roll +30° 
-            [(0.03, -0.38, 0.39), (0.0, 0.3827, 0.0, 0.9239)],  # Pitch +45°
-            [(0.03, -0.38, 0.39), (0.0, 0.2588, 0.0, 0.9659)],  # Pitch +30°
-            [(0.03, -0.38, 0.39), (0.0, 0.0, -0.2588, 0.9659)], # Yaw -30°   XXXXXXXXx
-            [(0.03, -0.38, 0.39), (0.2706, 0.2706, 0.2706, 0.8820)],  # All axes +30° ?????
-            [(0.03, -0.38, 0.39), (0.191, 0.191, -0.191, 0.9511)],  # Mixed small rotation 
-            [(0.03, -0.38, 0.39), (0.5, 0.5, 0.5, 0.5)],  # 90° on all axes
-            [(0.03, -0.38, 0.39), (-0.5, 0.5, -0.5, 0.5)],  # 90° mixed
-            [(0.03, -0.38, 0.35), (0.0, 0.7071, 0.0, 0.7071)],  # Facing left, lower Z
-            [(0.03, -0.38, 0.43), (0.0, 0.7071, 0.0, 0.7071)],  # Facing left, higher Z
-            [(0.06, -0.38, 0.41), (0.0, 0.7071, 0.0, 0.7071)],  # Slight X/Z offset, still facing camera
-            [(0.03, -0.38, 0.41), (0.191, 0.0, 0.0, 0.9815)], # Opposite lean
-            [(0.03, -0.38, 0.37), (0.191, -0.191, 0.191, 0.9511)], # Mixed small rotation, lower Z
-        ]
+    
+        from ament_index_python.packages import get_package_share_directory
+        json_path = os.path.join(get_package_share_directory("dialog_example"), "cal_poses.jsonc")
+        path = "/home/alon/ros_ws/src/dialog_example/dialog_example/cal_poses.jsonc"
 
+        self.cal_poses = self.load_calibration_poses(path)
 
     def call_service_blocking(self, client, request, timeout_sec=5.0):
         """
@@ -249,7 +344,7 @@ class TkinterROS(Node):
                 self.pos_text.insert(tk.END, new_text)
                 self.pos_text.configure(state='disabled')
 
-        self.root.after(100, self.update_position_label)
+        self.root.after(500, self.update_position_label)
 
 
     def spin_once(self):
@@ -309,10 +404,10 @@ class TkinterROS(Node):
             self.get_logger().error(f"Error in aruco_pose_callback: {e}")
 
     def send_move_request(self, pose):
-        time.sleep(0.5) #for some reason the arm is not available immediately after the service call
-        self.mover.MoveArm(pose.position, pose.orientation)
+       
+        ret_val = self.mover.MoveArm(pose.position, pose.orientation)
         #time.sleep(1)
-        return
+        return ret_val
         # Create a request
         request = MoveToPose.Request()
         request.pose = pose
@@ -351,10 +446,10 @@ class TkinterROS(Node):
 
         return pose_msg
 
-    def publish_message(self):
-        msg = String()
-        msg.data = self.joints_entry.get()  # Send the value from the text field
-        self.publisher.publish(msg)
+    # def publish_message(self):
+    #     msg = String()
+    #     msg.data = self.joints_entry.get()  # Send the value from the text field
+    #     self.publisher.publish(msg)
         #self.get_logger().warn('Publishing message: ' + msg.data)
 
     def on_homing_button_click(self):
@@ -417,18 +512,22 @@ class TkinterROS(Node):
         # print ("sending move request to:" + str(pose)) 
         # self.send_move_request(pose)
         # time.sleep(2)
-
-        for i, pose in enumerate(self.cal_poses):
+        num_valid_samples = 0   
+        for pose in self.cal_poses:
             #print("sending move request")
             pose_msg = self.create_pose(pose[0], pose[1])
             #print(pose_msg)
-            self.send_move_request(pose_msg)
-            time.sleep(3)
-            self.take_sample()
-            time.sleep(3)
-            if i > 2:
-                self.compute_calibration()
-            print(f"sample no. {i} taken")   
+            if self.send_move_request(pose_msg):
+                num_valid_samples += 1
+                #time.sleep(3)
+                self.take_sample()
+                #time.sleep(3)
+                if num_valid_samples > 2:
+                    self.compute_calibration()
+                print(f"sample no. {num_valid_samples} taken - pose " + str(pose[0]) + " - " + str(pose[1])) 
+            else:
+                print(f"move request failed for pose " + str(pose[0]) + " - " + str(pose[1])) 
+                
            
 
         #self.compute_calibration()
@@ -486,6 +585,18 @@ class TkinterROS(Node):
 def ros_spin(tkinter_ros):
     rclpy.spin(tkinter_ros)
 
+
+class DummyNode(Node):
+    def __init__(self):
+        super().__init__('dummy_node')
+        self.timer_called = False
+        self.create_timer(1, self.timer_callback)
+
+    def timer_callback(self):
+        print("Timer callback called.")
+        self.timer_called = True
+
+
 def main():
 
 
@@ -493,7 +604,6 @@ def main():
     # print("Waiting for debugger to attach...")
     # debugpy.wait_for_client()  # Ensures the debugger connects before continuing
     # print("Debugger connected.")
-
 
     rclpy.init() 
 

@@ -8,4 +8,10 @@ install(PROGRAMS
   DESTINATION lib/${PROJECT_NAME}
 )
 
+install(
+  DIRECTORY dialog_example/
+  DESTINATION share/${PROJECT_NAME}
+  FILES_MATCHING PATTERN "*.jsonc"
+)
+
 ament_package()

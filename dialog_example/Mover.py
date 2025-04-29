@@ -159,15 +159,19 @@ class Mover:
         pose_goal.header.frame_id = "base_link"
         pose_goal.pose = Pose(position = position, orientation = quat_xyzw)
         print ("starting to move")
-        self.moveit2.move_to_pose(pose=pose_goal,
-                                    #synchronous=True,
-                                    #cancel_after_secs=0.0,
-                                    #cartesian=False,
-                                    #cartesian_max_step=0.0025,
-                                    #cartesian_fraction_threshold=0.0,
-                                    #cartesian_jump_threshold=0.0,
-                                    #cartesian_avoid_collisions=False,
-                                    #planner_id=self.moveit2.planner_id,                                                       
-                                  )
-        self.moveit2.wait_until_executed()
-        print ("move completed")
+        ret_val = False
+        try:
+            self.moveit2.move_to_pose(pose=pose_goal,
+                                        #synchronous=True,
+                                        #cancel_after_secs=0.0,
+                                        #cartesian=False,
+                                        #cartesian_max_step=0.0025,
+                                        #cartesian_fraction_threshold=0.0,
+                                        #cartesian_jump_threshold=0.0,
+                                        #cartesian_avoid_collisions=False,
+                                        #planner_id=self.moveit2.planner_id,                                                       
+                                    )
+            ret_val = self.moveit2.wait_until_executed()
+        finally:
+            print ("move completed")
+        return ret_val
