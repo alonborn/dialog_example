@@ -1,78 +1,199 @@
+// Calibration poses for the robot
+// Each item has 'position': [x, y, z] and 'orientation': [x, y, z, w]
 [
-    {
-      "position": [0.03, -0.38, 0.39],
-      "orientation": [0.0, 0.7071, 0.0, 0.7071],
-      "comment": "Facing left (camera side)"
-    },
-    {
-      "position": [0.03, -0.33, 0.39],
-      "orientation": [0.3827, 0.0, 0.0, 0.9239],
-      "comment": "Roll +45°"
-    },
-    {
-      "position": [0.03, -0.38, 0.39],
-      "orientation": [0.2706, 0.0, 0.0, 0.9627],
-      "comment": "Roll +30°"
-    },
-    {
-      "position": [0.03, -0.38, 0.39],
-      "orientation": [0.0, 0.3827, 0.0, 0.9239],
-      "comment": "Pitch +45°"
-    },
-    {
-      "position": [0.03, -0.38, 0.39],
-      "orientation": [0.0, 0.2588, 0.0, 0.9659],
-      "comment": "Pitch +30°"
-    },
-    {
-      "position": [0.03, -0.38, 0.39],
-      "orientation": [0.0, 0.0, -0.2588, 0.9659],
-      "comment": "Yaw -30°"
-    },
-    {
-      "position": [0.03, -0.38, 0.39],
-      "orientation": [0.2706, 0.2706, 0.2706, 0.8820],
-      "comment": "All axes +30°"
-    },
-    {
-      "position": [0.03, -0.38, 0.39],
-      "orientation": [0.191, 0.191, -0.191, 0.9511],
-      "comment": "Mixed small rotation"
-    },
-    {
-      "position": [0.03, -0.38, 0.39],
-      "orientation": [0.5, 0.5, 0.5, 0.5],
-      "comment": "90° on all axes"
-    },
-    {
-      "position": [0.03, -0.38, 0.39],
-      "orientation": [-0.5, 0.5, -0.5, 0.5],
-      "comment": "90° mixed axes"
-    },
-    {
-      "position": [0.03, -0.38, 0.35],
-      "orientation": [0.0, 0.7071, 0.0, 0.7071],
-      "comment": "Facing left, lower Z"
-    },
-    {
-      "position": [0.03, -0.38, 0.43],
-      "orientation": [0.0, 0.7071, 0.0, 0.7071],
-      "comment": "Facing left, higher Z"
-    },
-    {
-      "position": [0.06, -0.38, 0.41],
-      "orientation": [0.0, 0.7071, 0.0, 0.7071],
-      "comment": "Slight X/Z offset, still facing camera"
-    },
-    {
-      "position": [0.03, -0.38, 0.41],
-      "orientation": [0.191, 0.0, 0.0, 0.9815],
-      "comment": "Opposite lean"
-    },
-    {
-      "position": [0.03, -0.38, 0.37],
-      "orientation": [0.191, -0.191, 0.191, 0.9511],
-      "comment": "Mixed small rotation, lower Z"
-    }
-  ]
-  
+  {
+    "position": [
+      0.03,
+      -0.38,
+      0.2
+    ],
+    "orientation": [
+      0.0,
+      0.7072,
+      0.0,
+      0.7072
+    ]
+  },
+  {
+    "position": [
+      0.03,
+      -0.33,
+      0.39
+    ],
+    "orientation": [
+      0.4263,
+      0.0428,
+      0.0902,
+      0.899
+    ]
+  },
+  {
+    "position": [
+      0.03,
+      -0.38,
+      0.39
+    ],
+    "orientation": [
+      0.2703,
+      0.0135,
+      0.0481,
+      0.9615
+    ]
+  },
+  {
+    "position": [
+      0.03,
+      -0.38,
+      0.39
+    ],
+    "orientation": [
+      0.0722,
+      0.5952,
+      -0.0345,
+      0.7996
+    ]
+  },
+  {
+    "position": [
+      0.03,
+      -0.38,
+      0.39
+    ],
+    "orientation": [
+      -0.0063,
+      0.6859,
+      -0.0402,
+      0.7265
+    ]
+  },
+  {
+    "position": [
+      0.03,
+      -0.38,
+      0.39
+    ],
+    "orientation": [
+      -0.0406,
+      0.6848,
+      -0.0038,
+      0.7276
+    ]
+  },
+  {
+    "position": [
+      0.03,
+      -0.38,
+      0.39
+    ],
+    "orientation": [
+      0.3998,
+      0.3084,
+      0.2274,
+      0.8327
+    ]
+  },
+  {
+    "position": [
+      0.03,
+      -0.38,
+      0.39
+    ],
+    "orientation": [
+      0.1592,
+      0.2158,
+      -0.0464,
+      0.9622
+    ]
+  },
+  {
+    "position": [
+      0.03,
+      -0.38,
+      0.39
+    ],
+    "orientation": [
+      0.5,
+      0.5,
+      0.5,
+      0.5
+    ]
+  },
+  {
+    "position": [
+      0.03,
+      -0.38,
+      0.39
+    ],
+    "orientation": [
+      -0.5,
+      0.5,
+      -0.5,
+      0.5
+    ]
+  },
+  {
+    "position": [
+      0.03,
+      -0.38,
+      0.35
+    ],
+    "orientation": [
+      0.0,
+      0.7071,
+      0.0,
+      0.7071
+    ]
+  },
+  {
+    "position": [
+      0.03,
+      -0.38,
+      0.43
+    ],
+    "orientation": [
+      0.0,
+      0.7071,
+      0.0,
+      0.7071
+    ]
+  },
+  {
+    "position": [
+      0.06,
+      -0.38,
+      0.41
+    ],
+    "orientation": [
+      0.0,
+      0.7071,
+      0.0,
+      0.7071
+    ]
+  },
+  {
+    "position": [
+      0.03,
+      -0.38,
+      0.41
+    ],
+    "orientation": [
+      0.191,
+      0.0,
+      0.0,
+      0.9815
+    ]
+  },
+  {
+    "position": [
+      0.03,
+      -0.38,
+      0.37
+    ],
+    "orientation": [
+      0.191,
+      -0.191,
+      0.191,
+      0.9511
+    ]
+  }
+]

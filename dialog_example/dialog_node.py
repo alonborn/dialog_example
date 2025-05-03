@@ -5,6 +5,7 @@ from std_msgs.msg import String
 import threading
 from std_srvs.srv import Trigger  # Standard service type for triggering actions
 from pymoveit2 import MoveIt2
+
 from rclpy.callback_groups import ReentrantCallbackGroup
 from rclpy.executors import MultiThreadedExecutor
 from geometry_msgs.msg import PoseStamped
@@ -29,6 +30,8 @@ import json
 import debugpy
 import os
 import tf_transformations
+import math
+import sys
 
 from ament_index_python.packages import get_package_share_directory
 
@@ -39,27 +42,31 @@ class TkinterROS(Node):
 
 
     def __init__(self):
+        self.zero_velocity_positions = None
+        self.num_valid_samples =0
         super().__init__('tkinter_ros_node')
         self.init_cal_poses()
-        self.mover = Mover.Mover(self)
+        # self.mover = Mover.Mover(self)
         self.last_joint_update_time = self.get_clock().now()
-
+        self.last_pos = ""
         # Set up ROS publisher
         self.publisher = self.create_publisher(String, '/ar4_hardware_interface_node/homing_string', 10)
         #self.timer = self.create_timer(1.0, self.publish_message)
-
+        
         self.create_subscription(Point, '/aruco_pose', self.aruco_pose_callback, 10)
+        self.create_subscription(JointState, '/joint_states', self.joint_states_callback, 10)
+        
         self.test_timer_callback_group = ReentrantCallbackGroup()
 
         self.homing_client = self.create_client(Trigger, '/ar4_hardware_interface_node/homing')
 
         # Subscribe to joint states
-        self.create_subscription(JointState, '/joint_states', self.joint_states_callback, 10)
-
+        
+        self.last_joint_info = ""
         # Set up Tkinter GUI
         self.root = tk.Tk()
         self.root.title("Tkinter and ROS 2")
-        self.root.geometry("1000x600")
+        self.root.geometry("1000x500")
 
         self.main_frame = tk.Frame(self.root)
         self.main_frame.pack(fill=tk.BOTH, expand=True)
@@ -69,9 +76,7 @@ class TkinterROS(Node):
         self.left_frame = tk.Frame(self.main_frame)
         self.left_frame.grid(row=0, column=0, sticky='nsew', padx=10, pady=10)
 
-        self.right_frame = tk.Frame(self.main_frame, bg='lightgray')
-        self.right_frame.grid(row=0, column=1, sticky='nsew', padx=10, pady=10)
-
+ 
         self.label = tk.Label(self.left_frame, text="Waiting for messages...", font=("Arial", 16))
         self.label.pack(pady=10)
 
@@ -96,44 +101,45 @@ class TkinterROS(Node):
         self.joints_entry.pack(pady=10)
         self.joints_entry.insert(0, "000001")
 
-        self.aruco_pose_entry = tk.Text(self.right_frame, font=("Courier", 10), width=21, height=2)
-        self.aruco_pose_entry.pack(pady=10)
 
-        self.copy_aruco_button = tk.Button(
-            self.right_frame, 
-            text="Copy Aruco Pose", 
-            font=("Arial", 10), 
-            command=self.copy_aruco_pose_to_clipboard
-        )
-        self.copy_aruco_button.pack(pady=5)
-
-        self.pos_text = tk.Text(self.left_frame, height=2, font=("Arial", 12), wrap="word")
+        self.pos_text = tk.Text(self.left_frame, height=2, font=("Arial", 10), wrap="word", width=60)
         self.pos_text.pack(pady=10)
         self.pos_text.configure(state='disabled')
 
         self.pose_frame = tk.Frame(self.left_frame)
-        self.pose_frame.pack(pady=(20, 5))
+        self.pose_frame.pack(pady=(10))
+
+        self.pos_num_label = tk.Label(self.pose_frame, text="#0", font=("Arial", 12))
+        self.pos_num_label.grid(row=0, column=0, padx=5)
 
         self.translation_label = tk.Label(self.pose_frame, text="Translation:", font=("Arial", 10))
-        self.translation_label.grid(row=0, column=0, padx=5)
-        self.translation_entry = tk.Entry(self.pose_frame, font=("Arial", 10), width=23)
-        self.translation_entry.grid(row=0, column=1, padx=5)
-        self.translation_entry.insert(0, "(0.03, -0.38, 0.20)")
+        self.translation_label.grid(row=0, column=1, padx=5)
+        
+        self.translation_entry = tk.Entry(self.pose_frame, font=("Arial", 10), width=21)
+        self.translation_entry.grid(row=0, column=2, padx=5)
+        
+        self.translation_entry.insert(0, str(self.cal_poses[0][0]))
 
         self.rotation_label = tk.Label(self.pose_frame, text="Rotation:", font=("Arial", 10))
-        self.rotation_label.grid(row=0, column=2, padx=5)
-        self.rotation_entry = tk.Entry(self.pose_frame, font=("Arial", 10), width=23)
-        self.rotation_entry.grid(row=0, column=3, padx=5)
-        self.rotation_entry.insert(0, "(0.0, 0.7071, 0.0, 0.7071)")
+        self.rotation_label.grid(row=0, column=3, padx=5)
+        self.rotation_entry = tk.Entry(self.pose_frame, font=("Arial", 10), width=27)
+        self.rotation_entry.grid(row=0, column=4, padx=5)
+        self.rotation_entry.insert(0, str(self.cal_poses[0][1]))
 
         self.send_pos_button = tk.Button(self.pose_frame, text="Move!", command=self.on_send_pos_button_click, font=("Arial", 14), width=8, height=1)
-        self.send_pos_button.grid(row=0, column=4, padx=5)
+        self.send_pos_button.grid(row=0, column=5, padx=5)
 
-        tk.Button(self.pose_frame, text="Save Pos", command=self.save_current_pose).grid(row=0, column=5, columnspan=1)
+        self.sample_frame = tk.Frame(self.left_frame)
+        self.sample_frame.pack(pady=(20, 5))
 
-        self.joint_states_var = tk.StringVar()
-        self.joint_states_entry = tk.Text(self.right_frame, font=("Courier", 10), width=21, height=10)
-        self.joint_states_entry.pack(pady=10)
+
+        self.take_sample_button = tk.Button(self.sample_frame, text="Take Sample", command=self.on_take_sample_button_click, font=("Arial", 10), width=8, height=1)
+        self.take_sample_button.grid(row=0, column=0, padx=5)
+
+        self.save_sample_button = tk.Button(self.sample_frame, text="Save Samples", command=self.on_save_samples_button_click, font=("Arial", 10), width=8, height=1)
+        self.save_sample_button.grid(row=0, column=1, padx=5)
+
+        tk.Button(self.pose_frame, text="Save Pos", command=self.save_current_pose).grid(row=0, column=6, columnspan=1)
 
         self.update_position_label()
         self.root.after(100, self.tk_mainloop)
@@ -142,8 +148,6 @@ class TkinterROS(Node):
 
         self.get_logger().info('registering ar_move_to_pose service')
         #self.move_client = self.create_client(MoveToPose, 'ar_move_to_pose')
-
-        #self.action_client = ActionClient(self,MoveToPoseAc, 'ar_move_to_pose')
         
         #self.get_logger().info('ar_move_to_pose service registered')
 
@@ -156,34 +160,174 @@ class TkinterROS(Node):
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.add_pose_adjustment_controls()
+        self.init_moveit()
+        self.init_right_frame()
         
+    def on_save_samples_button_click(self):
+        self.compute_calibration()
+        self.save_calibration()
+        print("calibration saved")
+        
+
+    def on_take_sample_button_click(self):
+        self.num_valid_samples += 1
+        #time.sleep(3)
+        self.take_sample()
+        #time.sleep(3)
+        if self.num_valid_samples > 2:
+            self.compute_calibration()
+        print(f"sample no. {self.num_valid_samples} taken - pose " ) 
+    def init_right_frame(self): 
+        self.right_frame = tk.Frame(self.main_frame, bg='lightgray')
+        self.right_frame.grid(row=0, column=1, sticky='nsew', padx=10, pady=10)
+
+        self.aruco_pose_entry = tk.Text(self.right_frame, font=("Courier", 10), width=21, height=2)
+        self.aruco_pose_entry.pack(pady=10)
+
+        self.copy_aruco_button = tk.Button(
+            self.right_frame, 
+            text="Copy Aruco Pose", 
+            font=("Arial", 10), 
+            command=self.copy_aruco_pose_to_clipboard
+        )
+        self.copy_aruco_button.pack(pady=5)
+        self.joint_states_var = tk.StringVar()
+        self.joint_states_entry = tk.Text(self.right_frame, font=("Courier", 10), width=21, height=10)
+        self.joint_states_entry.pack(pady=10)
+
+
+
+    def init_moveit(self):
+        self.arm_joint_names = [
+            "joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"
+        ]
+        self.moveit2 = MoveIt2(
+            node=self,
+            joint_names=self.arm_joint_names,
+            base_link_name="base_link",
+            end_effector_name="link_6",
+            group_name="ar_manipulator",
+            callback_group=ReentrantCallbackGroup()
+        )
+
+        self.moveit2.planner_id = "RRTConnectkConfigDefault"
+        self.moveit2.max_velocity = 1.0
+        self.moveit2.max_acceleration = 1.0
+        self.moveit2.planning_time = 5.0  # Timeout in seconds
+
+        # Scale down velocity and acceleration of joints (percentage of maximum)
+        self.moveit2.max_velocity = 0.5
+        self.moveit2.max_acceleration = 0.5
+        self.moveit2.cartesian_avoid_collisions = False
+        self.moveit2.cartesian_jump_threshold = 0.0
+
+    def MoveArm(self, position, quat_xyzw):
+        time.sleep(0.5) #for some reason the arm is not available immediately after the call
+        # Get parameters
+        # cartesian = self.self.node.get_parameter("cartesian").get_parameter_value().bool_value
+        # cartesian_max_step = self.self.node.get_parameter("cartesian_max_step").get_parameter_value().double_value
+        # cartesian_fraction_threshold = self.self.node.get_parameter("cartesian_fraction_threshold").get_parameter_value().double_value
+        # cartesian_jump_threshold = self.self.node.get_parameter("cartesian_jump_threshold").get_parameter_value().double_value
+        # cartesian_avoid_collisions = self.self.node.get_parameter("cartesian_avoid_collisions").get_parameter_value().bool_value
+
+        # Move to pose goal
+        # self.moveit2.move_to_pose(
+        #     position=position,
+        #     quat_xyzw=quat_xyzw,
+        #     synchronous=synchronous,
+        #     cancel_after_secs=cancel_after_secs,
+        #     cartesian=cartesian,
+        #     cartesian_max_step=cartesian_max_step,
+        #     cartesian_fraction_threshold=cartesian_fraction_threshold,
+        #     cartesian_jump_threshold=cartesian_jump_threshold,
+        #     cartesian_avoid_collisions=cartesian_avoid_collisions,
+        # )
+        pose_goal = PoseStamped() 
+        pose_goal.header.frame_id = "base_link"
+        pose_goal.pose = Pose(position = position, orientation = quat_xyzw)
+        print ("starting to move")
+        ret_val = False
+        try:
+            self.moveit2.move_to_pose(pose=pose_goal,
+                                        #synchronous=True,
+                                        #cancel_after_secs=0.0,
+                                        #cartesian=False,
+                                        #cartesian_max_step=0.0025,
+                                        #cartesian_fraction_threshold=0.0,
+                                        #cartesian_jump_threshold=0.0,
+                                        #cartesian_avoid_collisions=False,
+                                        #planner_id=self.moveit2.planner_id,                                                       
+                                    )
+            ret_val = self.moveit2.wait_until_executed()
+        finally:
+            print ("move completed")
+        return ret_val
+
+    def MoveArmCartesian(self, position, quat_xyzw):
+        """
+        Moves the robot arm to a given position and orientation using Cartesian path planning.
+
+        Args:
+            position: Tuple or geometry_msgs.msg.Point (x, y, z)
+            quat_xyzw: Tuple or geometry_msgs.msg.Quaternion (x, y, z, w)
+
+        Returns:
+            True if motion succeeded, False otherwise.
+        """
+        time.sleep(0.5)  # Allow time for arm/controller to become ready
+        print("Starting Cartesian motion...")
+
+        ret_val = False
+        try:
+            self.moveit2.move_to_pose(
+                position=position,
+                quat_xyzw=quat_xyzw,
+                cartesian=True,
+                cartesian_max_step=0.0025,  # Step size in meters
+                cartesian_fraction_threshold=0.9  # Minimum fraction of path to accept
+            )
+            ret_val = self.moveit2.wait_until_executed()
+        finally:
+            print("Cartesian motion completed")
+
+        return ret_val
+
+
+
+
     # --- GUI Pose Adjustment Controls (to be called inside TkinterROS.__init__()) ---
     def add_pose_adjustment_controls(self):
         self.pose_index = 0
         pose_ctrl_frame = tk.Frame(self.left_frame)
         pose_ctrl_frame.pack(pady=10)
 
-        self.current_pose_display = tk.Text(pose_ctrl_frame, height=3, font=("Courier", 10), width=40)
-        self.current_pose_display.grid(row=0, column=0, columnspan=6, pady=5)
+        # self.current_pose_display = tk.Text(pose_ctrl_frame, height=3, font=("Courier", 10), width=40)
+        # self.current_pose_display.grid(row=0, column=0, columnspan=6, pady=5)
 
 
 
         def move_to_current_pose():
+
+            def format_float(f):
+                return f"{f:.4f}".rstrip("0").rstrip(".") if "." in f"{f:.4f}" else f"{f:.4f}"
+
             pos, ori = self.cal_poses[self.pose_index]
             pose_msg = self.create_pose(pos, ori)
-            self.send_move_request(pose_msg)
+            
 
             # Update pose display
-            self.current_pose_display.configure(state='normal')
-            self.current_pose_display.delete("1.0", tk.END)
-            self.current_pose_display.insert(tk.END, f"{pos}\n{ori}")
-            self.current_pose_display.configure(state='disabled')
+            # self.current_pose_display.configure(state='normal')
+            # self.current_pose_display.delete("1.0", tk.END)
+            # self.current_pose_display.insert(tk.END, f"{pos}\n{ori}")
+            # self.current_pose_display.configure(state='disabled')
 
             # Also update entry widgets
             self.translation_entry.delete(0, tk.END)
-            self.translation_entry.insert(0, f"({pos[0]:.4f}, {pos[1]:.4f}, {pos[2]:.4f})")
+            #self.translation_entry.insert(0, f"({pos[0]:.4f}, {pos[1]:.4f}, {pos[2]:.4f})")
+            self.translation_entry.insert(0, f"({', '.join(format_float(x) for x in pos)})")
             self.rotation_entry.delete(0, tk.END)
-            self.rotation_entry.insert(0, f"({ori[0]:.4f}, {ori[1]:.4f}, {ori[2]:.4f}, {ori[3]:.4f})")
+            self.rotation_entry.insert(0, f"({', '.join(format_float(x) for x in ori)})")
+            self.send_pose_from_entries()
 
         def adjust_orientation(axis, delta):
             rotation_str = self.rotation_entry.get()
@@ -195,28 +339,42 @@ class TkinterROS(Node):
                 new_ori = tf_transformations.quaternion_from_euler(*euler)
                 self.rotation_entry.delete(0, tk.END)
                 self.rotation_entry.insert(0, f"({new_ori[0]:.4f}, {new_ori[1]:.4f}, {new_ori[2]:.4f}, {new_ori[3]:.4f})")
+                self.send_pose_from_entries()
             except Exception as e:
                 self.get_logger().error(f"Failed to adjust orientation: {e}")
 
 
-        tk.Button(pose_ctrl_frame, text="Prev Pose", command=lambda: (setattr(self, 'pose_index', max(0, self.pose_index - 1)), move_to_current_pose())).grid(row=1, column=0)
-        tk.Button(pose_ctrl_frame, text="Next Pose", command=lambda: (setattr(self, 'pose_index', min(len(self.cal_poses)-1, self.pose_index + 1)), move_to_current_pose())).grid(row=1, column=1)
-        tk.Button(pose_ctrl_frame, text="Roll +", command=lambda: adjust_orientation(0, 0.05)).grid(row=1, column=2)
-        tk.Button(pose_ctrl_frame, text="Roll -", command=lambda: adjust_orientation(0, -0.05)).grid(row=1, column=3)
-        tk.Button(pose_ctrl_frame, text="Pitch +", command=lambda: adjust_orientation(1, 0.05)).grid(row=2, column=2)
-        tk.Button(pose_ctrl_frame, text="Pitch -", command=lambda: adjust_orientation(1, -0.05)).grid(row=2, column=3)
-        tk.Button(pose_ctrl_frame, text="Yaw +", command=lambda: adjust_orientation(2, 0.05)).grid(row=2, column=0)
-        tk.Button(pose_ctrl_frame, text="Yaw -", command=lambda: adjust_orientation(2, -0.05)).grid(row=2, column=1)
+        def prev_pose():
+            self.pose_index = max(0, self.pose_index - 1)
+            self.pos_num_label.configure(text=f"#{self.pose_index}")
+            #self.copy_aruco_pose_to_clipboard()
+            move_to_current_pose()
+
+        def next_pose():
+            self.pose_index = min(len(self.cal_poses) - 1, self.pose_index + 1)
+            self.pos_num_label.configure(text=f"#{self.pose_index}")
+            #self.copy_aruco_pose_to_clipboard()
+            move_to_current_pose()
+
+        tk.Button(pose_ctrl_frame, text="Prev Pose", command=prev_pose).grid(row=1, column=0)
+        tk.Button(pose_ctrl_frame, text="Next Pose", command=next_pose).grid(row=1, column=1)       
+        delta = 0.1
+        tk.Button(pose_ctrl_frame, text="Roll +", command=lambda: adjust_orientation(0, delta)).grid(row=1, column=2)
+        tk.Button(pose_ctrl_frame, text="Roll -", command=lambda: adjust_orientation(0, -delta)).grid(row=1, column=3)
+        tk.Button(pose_ctrl_frame, text="Pitch +", command=lambda: adjust_orientation(1, delta)).grid(row=2, column=2)
+        tk.Button(pose_ctrl_frame, text="Pitch -", command=lambda: adjust_orientation(1, -delta)).grid(row=2, column=3)
+        tk.Button(pose_ctrl_frame, text="Yaw +", command=lambda: adjust_orientation(2, delta)).grid(row=2, column=0)
+        tk.Button(pose_ctrl_frame, text="Yaw -", command=lambda: adjust_orientation(2, -delta)).grid(row=2, column=1)
       
 
-        self.update_pose_display()
+        #self.update_pose_display()
 
-    def update_pose_display(self):
-        pos, ori = self.cal_poses[self.pose_index]
-        self.current_pose_display.configure(state='normal')
-        self.current_pose_display.delete("1.0", tk.END)
-        self.current_pose_display.insert(tk.END, f"{pos}\n{ori}")
-        self.current_pose_display.configure(state='disabled')
+    # def update_pose_display(self):
+    #     pos, ori = self.cal_poses[self.pose_index]
+    #     self.current_pose_display.configure(state='normal')
+    #     self.current_pose_display.delete("1.0", tk.END)
+    #     self.current_pose_display.insert(tk.END, f"{pos}\n{ori}")
+    #     self.current_pose_display.configure(state='disabled')
 
     def save_current_pose(self):
         try:
@@ -226,13 +384,35 @@ class TkinterROS(Node):
             new_ori = tuple(float(x.strip()) for x in rotation_str.strip('()').split(','))
             if len(new_pos) == 3 and len(new_ori) == 4:
                 self.cal_poses[self.pose_index] = (new_pos, new_ori)
-                update_pose_display()
+                # update_pose_display()
             else:
                 print("Invalid pose length.")
+            path = "/home/alon/ros_ws/src/dialog_example/dialog_example/cal_poses.jsonc"
+            self.save_calibration_poses(self.cal_poses,path)
         except Exception as e:
             self.get_logger().error(f"Failed to save pose from entries: {e}")
 
+    def save_calibration_poses(self, poses, json_path="cal_poses.jsonc"):
+        """
+        Save calibration poses to a JSONC file.
+        
+        :param poses: List of (position, orientation) tuples.
+        :param json_path: Path to the output file.
+        """
+        data = [
+            {"position": list(pos), "orientation": list(orient)}
+            for pos, orient in poses
+        ]
 
+        comment = (
+            "// Calibration poses for the robot\n"
+            "// Each item has 'position': [x, y, z] and 'orientation': [x, y, z, w]\n"
+        )
+
+        with open(json_path, "w") as f:
+            f.write(comment)
+            json.dump(data, f, indent=2)
+            
     def load_calibration_poses(self, json_path="cal_poses.jsonc"):
         with open(json_path, "r") as f:
             content = f.read()
@@ -246,23 +426,65 @@ class TkinterROS(Node):
             self.root.clipboard_clear()
             self.root.clipboard_append(pose_text)
             self.root.update()  # now it stays on the clipboard after the window is closed
+            joint_text = self.joint_states_entry.get("1.0", tk.END).strip()
             print("Aruco pose copied to clipboard:", pose_text)
+
+            # Also retrieve and save the robot position display
+            pos_text = self.pos_text.get("1.0", tk.END).strip()
+
+            # Save both to a file
+            with open("copied_pose_log.txt", "a") as f:
+                f.write("=== Aruco Pose ===\n")
+                f.write(pose_text + "\n")
+                f.write("=== Robot Position ===\n")
+                f.write(pos_text + "\n\n")
+                f.write("===Joint States: ===\n")
+                f.write(joint_text + "\n\n")
+
         except Exception as e:
             self.get_logger().error(f"Error copying Aruco pose to clipboard: {e}")
 
-    def joint_states_callback(self, msg):
 
+
+
+    def joint_states_callback(self, msg):
         now = self.get_clock().now()
         if (now - self.last_joint_update_time).nanoseconds < 1e9:
             return  # Skip if less than 1 second since last update
         self.last_joint_update_time = now
-        
+
         try:
+            # Check if all joint velocities are near zero
+            all_zero_velocities = all(abs(v) < 1e-5 for v in msg.velocity)
+
+            if all_zero_velocities:
+                if self.zero_velocity_positions is None:
+                    # Save current positions for comparison later
+                    self.zero_velocity_positions = list(msg.position)
+                else:
+                    # Compare current positions with previously saved positions
+                    for i, (new_pos, ref_pos) in enumerate(zip(msg.position, self.zero_velocity_positions)):
+                        if abs(new_pos - ref_pos) > 0.01:  # Tolerance in radians
+                            self.get_logger().error(
+                                f"Unintended motion detected on joint {i}: "
+                                f"saved={ref_pos:.4f}, current={new_pos:.4f}, delta={abs(new_pos - ref_pos):.5f}"
+                            )
+                            sys.exit("Encoder error: unintended movement with zero velocity reported.")
+            else:
+                # If robot is moving, clear saved reference
+                self.zero_velocity_positions = None
+
+            # UI update
             joint_info = "\n".join([f"{pos:.4f}," for pos in msg.position])
+            if self.last_joint_info == joint_info:
+                return
+            self.last_joint_info = joint_info
+
             self.joint_states_entry.configure(state='normal')
             self.joint_states_entry.delete("1.0", tk.END)
             self.joint_states_entry.insert(tk.END, joint_info)
             self.joint_states_entry.configure(state='disabled')
+
         except Exception as e:
             self.get_logger().error(f"Error in joint_states_callback: {e}")
 
@@ -278,7 +500,6 @@ class TkinterROS(Node):
         #                     [(0.03, -0.38, 0.39), (0.31, -0.52, 0.66, -0.44)]]
     
         from ament_index_python.packages import get_package_share_directory
-        json_path = os.path.join(get_package_share_directory("dialog_example"), "cal_poses.jsonc")
         path = "/home/alon/ros_ws/src/dialog_example/dialog_example/cal_poses.jsonc"
 
         self.cal_poses = self.load_calibration_poses(path)
@@ -332,17 +553,18 @@ class TkinterROS(Node):
             oy = pose.orientation.y
             oz = pose.orientation.z
             ow = pose.orientation.w
+            new_text = "Cur Pose:"
+            new_text += (f"pos = ({x:.2f}, {y:.2f}, {z:.2f})"
+                        f" ori = ({ox:.2f}, {oy:.2f}, {oz:.2f}, {ow:.2f})")
+            if self.last_pos != new_text:
+                self.last_pos = new_text
+                current_text = self.pos_text.get("1.0", tk.END).strip()
 
-            new_text = (f"pos = ({x:.2f}, {y:.2f}, {z:.2f})\n"
-                        f"ori = ({ox:.2f}, {oy:.2f}, {oz:.2f}, {ow:.2f})")
-
-            current_text = self.pos_text.get("1.0", tk.END).strip()
-
-            if new_text != current_text:
-                self.pos_text.configure(state='normal')
-                self.pos_text.delete(1.0, tk.END)
-                self.pos_text.insert(tk.END, new_text)
-                self.pos_text.configure(state='disabled')
+                if new_text != current_text:
+                    self.pos_text.configure(state='normal')
+                    self.pos_text.delete(1.0, tk.END)
+                    self.pos_text.insert(tk.END, new_text)
+                    self.pos_text.configure(state='disabled')
 
         self.root.after(500, self.update_position_label)
 
@@ -405,7 +627,8 @@ class TkinterROS(Node):
 
     def send_move_request(self, pose):
        
-        ret_val = self.mover.MoveArm(pose.position, pose.orientation)
+        #ret_val = self.MoveArm(pose.position, pose.orientation)
+        ret_val = self.MoveArmCartesian(pose.position, pose.orientation)
         #time.sleep(1)
         return ret_val
         # Create a request
@@ -488,21 +711,6 @@ class TkinterROS(Node):
             rclpy.spin_once(self, timeout_sec=timeout_sec)
         return future.result()
 
-    def move_pos_action(self, pose):
-        # Create a goal message
-        goal_msg = MoveToPoseAc.Goal(pose = pose)
-        
-
-        # Send the goal to the action server
-        self.action_client.wait_for_server()
-        future = self.action_client.send_goal_async(goal_msg)
-        self.spin_until_future(future)
-        goal_handle = future.result()
-        result_future = goal_handle.get_result_async()
-        self.spin_until_future(result_future)
-        result = result_future.result().result
-        print(f"Result: {result.success}, Code: {result.error_code}, Msg: {result.message}")
-
     def on_calibrate_button_click(self):
 
         # position = Pose()
@@ -512,7 +720,7 @@ class TkinterROS(Node):
         # print ("sending move request to:" + str(pose)) 
         # self.send_move_request(pose)
         # time.sleep(2)
-        num_valid_samples = 0   
+        self.num_valid_samples = 0   
         for pose in self.cal_poses:
             #print("sending move request")
             pose_msg = self.create_pose(pose[0], pose[1])
@@ -600,11 +808,11 @@ class DummyNode(Node):
 def main():
 
 
-    # debugpy.listen(("localhost", 5678))  # Port for debugger to connect
-    # print("Waiting for debugger to attach...")
-    # debugpy.wait_for_client()  # Ensures the debugger connects before continuing
-    # print("Debugger connected.")
-
+    debugpy.listen(("localhost", 5678))  # Port for debugger to connect
+    print("Waiting for debugger to attach...")
+    debugpy.wait_for_client()  # Ensures the debugger connects before continuing
+    print("Debugger connected.")
+   
     rclpy.init() 
 
     tkinter_ros = TkinterROS()

@@ -40,10 +40,13 @@ class Mover:
             # cli_args=["--ros-args", "-r", "__node:=ex_pose_goal_unique"],  # Explicitly set node name via remapping
             # automatically_declare_parameters_from_overrides=False
         )
-
+        self.should_spin = True
         self.executor = rclpy.executors.MultiThreadedExecutor(2)
-        self.executor.add_node(self.moveit_node)
-        self.executor_thread = Thread(target=self.executor.spin, daemon=True, args=())
+        #self.executor.add_node(self.moveit_node)
+        #self.executor_thread = Thread(target=self.executor.spin, daemon=True, args=())
+        self.executor_thread = Thread(target=self.spin_loop, daemon=True, args=())
+        time.sleep(1)
+        self.should_spin = True
         self.executor_thread.start()
         self.moveit_node.create_rate(1.0).sleep()
         
@@ -133,7 +136,10 @@ class Mover:
 
         # self.moveit2.cartesian_jump_threshold = cartesian_jump_threshold
        
-        
+    def spin_loop(self):
+        while self.should_spin:
+            self.executor.spin_once(timeout_sec=0.1)
+
     def MoveArm(self, position, quat_xyzw):
         time.sleep(0.5) #for some reason the arm is not available immediately after the call
         # Get parameters
