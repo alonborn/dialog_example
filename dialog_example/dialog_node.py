@@ -12,7 +12,6 @@ from geometry_msgs.msg import PoseStamped
 from geometry_msgs.msg import Pose
 from geometry_msgs.msg import Pose, Point, Quaternion
 from geometry_msgs.msg import Pose
-from action_msgs.msg import GoalStatus
 from my_robot_interfaces.srv import MoveToPose  # Import the custom service type
 from my_robot_interfaces.action import MoveToPoseAc  # Import the custom service type
 from tf2_ros import Buffer, TransformListener
@@ -21,17 +20,15 @@ import easy_handeye2_msgs as ehm
 import easy_handeye2 as hec
 from easy_handeye2_msgs.srv import TakeSample, SaveCalibration,ComputeCalibration
 import queue
-from rclpy.action import ActionClient
 import time
-from . import Mover
 from geometry_msgs.msg import Point
 import re
 import json
 import debugpy
 import os
 import tf_transformations
-import math
 import sys
+from std_srvs.srv import SetBool
 
 from ament_index_python.packages import get_package_share_directory
 
@@ -52,7 +49,7 @@ class TkinterROS(Node):
         # Set up ROS publisher
         self.publisher = self.create_publisher(String, '/ar4_hardware_interface_node/homing_string', 10)
         #self.timer = self.create_timer(1.0, self.publish_message)
-        
+ 
         self.create_subscription(Point, '/aruco_pose', self.aruco_pose_callback, 10)
         self.create_subscription(JointState, '/joint_states', self.joint_states_callback, 10)
         
@@ -67,7 +64,7 @@ class TkinterROS(Node):
         self.root = tk.Tk()
         self.root.title("Tkinter and ROS 2")
         self.root.geometry("1000x500")
-
+        self.mode_var = tk.StringVar(value="Calibration")
         self.main_frame = tk.Frame(self.root)
         self.main_frame.pack(fill=tk.BOTH, expand=True)
         self.main_frame.columnconfigure(0, weight=1)
@@ -162,6 +159,12 @@ class TkinterROS(Node):
         self.add_pose_adjustment_controls()
         self.init_moveit()
         self.init_right_frame()
+
+        # Call the service to enable/disable follower
+        self.ruco_follower_enabled_client = self.create_client(SetBool, '/set_aruco_follower_enabled')
+
+        # while not self.ruco_follower_enabled_client.wait_for_service(timeout_sec=1.0):
+        #     self.get_logger().warn('Waiting for set_aruco_follower_enabled service...')
         
     def on_save_samples_button_click(self):
         self.compute_calibration()
@@ -195,7 +198,27 @@ class TkinterROS(Node):
         self.joint_states_entry = tk.Text(self.right_frame, font=("Courier", 10), width=21, height=10)
         self.joint_states_entry.pack(pady=10)
 
+        tk.Radiobutton(self.right_frame, text="Calibration", variable=self.mode_var, value="Calibration",
+                        command=self.on_mode_change).pack(anchor=tk.W)
+        tk.Radiobutton(self.right_frame, text="Validation", variable=self.mode_var, value="Validation",
+                    command=self.on_mode_change).pack(anchor=tk.W)
 
+    def on_mode_change(self):
+        mode = self.mode_var.get()
+        enable_follower = (mode == "Validation")  # enable only in validation
+        self.get_logger().info(f"Switching mode to: {mode} (follower {'enabled' if enable_follower else 'disabled'})")
+
+        request = SetBool.Request()
+        request.data = enable_follower
+
+        future = self.ruco_follower_enabled_client.call_async(request)
+
+        # Optionally wait (non-blocking)
+        rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
+        if future.result() is not None:
+            self.get_logger().info(f"Service response: {future.result().message}")
+        else:
+            self.get_logger().error("Service call failed")
 
     def init_moveit(self):
         self.arm_joint_names = [
@@ -428,12 +451,13 @@ class TkinterROS(Node):
             self.root.update()  # now it stays on the clipboard after the window is closed
             joint_text = self.joint_states_entry.get("1.0", tk.END).strip()
             print("Aruco pose copied to clipboard:", pose_text)
-
+            pose_id = self.pose_index if hasattr(self, "pose_index") else "N/A"
             # Also retrieve and save the robot position display
             pos_text = self.pos_text.get("1.0", tk.END).strip()
 
             # Save both to a file
             with open("copied_pose_log.txt", "a") as f:
+                f.write(f"=== Pose Index: {pose_id} ===\n")
                 f.write("=== Aruco Pose ===\n")
                 f.write(pose_text + "\n")
                 f.write("=== Robot Position ===\n")
@@ -554,8 +578,8 @@ class TkinterROS(Node):
             oz = pose.orientation.z
             ow = pose.orientation.w
             new_text = "Cur Pose:"
-            new_text += (f"pos = ({x:.2f}, {y:.2f}, {z:.2f})"
-                        f" ori = ({ox:.2f}, {oy:.2f}, {oz:.2f}, {ow:.2f})")
+            new_text += (f"pos = ({x:.3f}, {y:.3f}, {z:.3f})"
+                        f" ori = ({ox:.3f}, {oy:.3f}, {oz:.3f}, {ow:.3f})")
             if self.last_pos != new_text:
                 self.last_pos = new_text
                 current_text = self.pos_text.get("1.0", tk.END).strip()
@@ -625,10 +649,11 @@ class TkinterROS(Node):
         except Exception as e:
             self.get_logger().error(f"Error in aruco_pose_callback: {e}")
 
-    def send_move_request(self, pose):
-       
-        #ret_val = self.MoveArm(pose.position, pose.orientation)
-        ret_val = self.MoveArmCartesian(pose.position, pose.orientation)
+    def send_move_request(self, pose, is_cartesian=True):
+        if is_cartesian:
+            ret_val = self.MoveArmCartesian(pose.position, pose.orientation)
+        else:
+            ret_val = self.MoveArm(pose.position, pose.orientation)
         #time.sleep(1)
         return ret_val
         # Create a request
@@ -747,7 +772,7 @@ class TkinterROS(Node):
     def on_go_home_button_click(self):
         pose = [(0.01, -0.33, 0.49), (0.01, -0.69, 0.72, 0.01)]
         pose_msg = self.create_pose(pose[0], pose[1])
-        self.send_move_request(pose_msg)
+        self.send_move_request(pose_msg,False)
     def on_send_pos_button_click(self):
         self.send_pose_from_entries()
 
@@ -806,12 +831,10 @@ class DummyNode(Node):
 
 
 def main():
-
-
-    debugpy.listen(("localhost", 5678))  # Port for debugger to connect
-    print("Waiting for debugger to attach...")
-    debugpy.wait_for_client()  # Ensures the debugger connects before continuing
-    print("Debugger connected.")
+    # debugpy.listen(("localhost", 5678))  # Port for debugger to connect
+    # print("Waiting for debugger to attach...")
+    # debugpy.wait_for_client()  # Ensures the debugger connects before continuing
+    # print("Debugger connected.")
    
     rclpy.init() 
 
