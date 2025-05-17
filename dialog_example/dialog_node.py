@@ -13,12 +13,12 @@ from geometry_msgs.msg import Pose
 from geometry_msgs.msg import Pose, Point, Quaternion
 from geometry_msgs.msg import Pose
 from my_robot_interfaces.srv import MoveToPose  # Import the custom service type
-from my_robot_interfaces.action import MoveToPoseAc  # Import the custom service type
 from tf2_ros import Buffer, TransformListener
 from sensor_msgs.msg import JointState
 import easy_handeye2_msgs as ehm
 import easy_handeye2 as hec
 from easy_handeye2_msgs.srv import TakeSample, SaveCalibration,ComputeCalibration
+from tkinter import messagebox
 import queue
 import time
 from geometry_msgs.msg import Point
@@ -42,6 +42,7 @@ class TkinterROS(Node):
         self.zero_velocity_positions = None
         self.num_valid_samples =0
         super().__init__('tkinter_ros_node')
+        self.joint_states_enabled = True
         self.init_cal_poses()
         # self.mover = Mover.Mover(self)
         self.last_joint_update_time = self.get_clock().now()
@@ -53,9 +54,11 @@ class TkinterROS(Node):
         self.create_subscription(Point, '/aruco_pose', self.aruco_pose_callback, 10)
         self.create_subscription(JointState, '/joint_states', self.joint_states_callback, 10)
         
-        self.test_timer_callback_group = ReentrantCallbackGroup()
-
+        # self.test_timer_callback_group = ReentrantCallbackGroup()
+        self.create_timer(2, self.test_timer_callback)
         self.homing_client = self.create_client(Trigger, '/ar4_hardware_interface_node/homing')
+
+        self.move_arm_client = self.create_client(MoveToPose, '/ar_move_to_pose')
 
         # Subscribe to joint states
         
@@ -165,7 +168,32 @@ class TkinterROS(Node):
 
         # while not self.ruco_follower_enabled_client.wait_for_service(timeout_sec=1.0):
         #     self.get_logger().warn('Waiting for set_aruco_follower_enabled service...')
-        
+
+
+    def call_service_blocking(self, client, request, timeout_sec=5.0):
+        future = client.call_async(request)
+
+        # Wait for the future to be completed using a threading.Event
+        done_event = threading.Event()
+
+        def _done_cb(fut):
+            done_event.set()
+
+        future.add_done_callback(_done_cb)
+
+        if done_event.wait(timeout=timeout_sec):
+            return future.result()
+        else:
+            raise TimeoutError("Service call timed out")
+
+
+    def get_request(self, pose, is_cartesian=True):
+        # Create a request
+        request = MoveToPose.Request()
+        request.pose = pose
+        request.cartesian = is_cartesian
+        return request
+    
     def on_save_samples_button_click(self):
         self.compute_calibration()
         self.save_calibration()
@@ -180,6 +208,7 @@ class TkinterROS(Node):
         if self.num_valid_samples > 2:
             self.compute_calibration()
         print(f"sample no. {self.num_valid_samples} taken - pose " ) 
+    
     def init_right_frame(self): 
         self.right_frame = tk.Frame(self.main_frame, bg='lightgray')
         self.right_frame.grid(row=0, column=1, sticky='nsew', padx=10, pady=10)
@@ -269,6 +298,13 @@ class TkinterROS(Node):
         pose_goal.header.frame_id = "base_link"
         pose_goal.pose = Pose(position = position, orientation = quat_xyzw)
         print ("starting to move")
+
+        request = self.get_request(pose_goal, is_cartesian=False)
+        # Send the request
+        response = self.call_service_blocking(self, self.move_arm_client, request, timeout_sec=30.0)
+        print("Got response:", response)
+        return
+
         ret_val = False
         try:
             self.moveit2.move_to_pose(pose=pose_goal,
@@ -281,10 +317,31 @@ class TkinterROS(Node):
                                         #cartesian_avoid_collisions=False,
                                         #planner_id=self.moveit2.planner_id,                                                       
                                     )
-            ret_val = self.moveit2.wait_until_executed()
+            #ret_val = self.moveit2.wait_until_executed()
+            self.poll_until_done(callback=lambda success: print(f"Motion success: {success}"))
+
         finally:
             print ("move completed")
         return ret_val
+
+    def poll_until_done(self, callback=None, timeout_sec=30.0):
+        self.motion_poll_start_time = time.time()
+        self.motion_poll_callback = callback
+        self.root.after(100, self._poll_motion_state)
+
+    def _poll_motion_state(self):
+        if self.moveit2.is_executing()== False:
+            if self.motion_poll_callback:
+                self.motion_poll_callback(self.moveit2.motion_suceeded)
+            return
+
+        if time.time() - self.motion_poll_start_time > 30.0:
+            self.get_logger().warn("Timeout while waiting for motion to complete")
+            if self.motion_poll_callback:
+                self.motion_poll_callback(False)
+            return
+
+        self.root.after(100, self._poll_motion_state)
 
     def MoveArmCartesian(self, position, quat_xyzw):
         """
@@ -300,6 +357,10 @@ class TkinterROS(Node):
         time.sleep(0.5)  # Allow time for arm/controller to become ready
         print("Starting Cartesian motion...")
 
+
+        print("Got response:", response)
+        return
+
         ret_val = False
         try:
             self.moveit2.move_to_pose(
@@ -309,13 +370,13 @@ class TkinterROS(Node):
                 cartesian_max_step=0.0025,  # Step size in meters
                 cartesian_fraction_threshold=0.9  # Minimum fraction of path to accept
             )
-            ret_val = self.moveit2.wait_until_executed()
+            #ret_val = self.moveit2.wait_until_executed()
+            self.poll_until_done(callback=lambda success: print(f"Motion success: {success}"))
+
         finally:
             print("Cartesian motion completed")
 
         return ret_val
-
-
 
 
     # --- GUI Pose Adjustment Controls (to be called inside TkinterROS.__init__()) ---
@@ -472,6 +533,11 @@ class TkinterROS(Node):
 
 
     def joint_states_callback(self, msg):
+
+        if self.joint_states_enabled == False:
+            self.zero_velocity_positions = None
+            return
+        
         now = self.get_clock().now()
         if (now - self.last_joint_update_time).nanoseconds < 1e9:
             return  # Skip if less than 1 second since last update
@@ -488,12 +554,12 @@ class TkinterROS(Node):
                 else:
                     # Compare current positions with previously saved positions
                     for i, (new_pos, ref_pos) in enumerate(zip(msg.position, self.zero_velocity_positions)):
-                        if abs(new_pos - ref_pos) > 0.01:  # Tolerance in radians
+                        if abs(new_pos - ref_pos) > 0.1:  # Tolerance in radians
                             self.get_logger().error(
                                 f"Unintended motion detected on joint {i}: "
                                 f"saved={ref_pos:.4f}, current={new_pos:.4f}, delta={abs(new_pos - ref_pos):.5f}"
                             )
-                            sys.exit("Encoder error: unintended movement with zero velocity reported.")
+                            messagebox.showinfo("Info", "Encoder error: unintended movement with zero velocity reported.")
             else:
                 # If robot is moving, clear saved reference
                 self.zero_velocity_positions = None
@@ -528,42 +594,61 @@ class TkinterROS(Node):
 
         self.cal_poses = self.load_calibration_poses(path)
 
-    def call_service_blocking(self, client, request, timeout_sec=5.0):
-        """
-        Sends an async service request using the given client, and blocks until the response is received.
-        The waiting is done in a background thread so it does not block the ROS 2 event loop.
-        """
-        self.call_is_done = False
-        result_container = {'result': None, 'exception': None}
 
-        def _thread_func():
-            future = client.call_async(request)
+    
+    def call_service_blocking(node, client, request, timeout_sec=5.0):
+        future = client.call_async(request)
 
-            def _on_response(fut):
-                try:
-                    result_container['result'] = fut.result()
-                except Exception as e:
-                    result_container['exception'] = e
-                finally:
-                    self.call_is_done = True
+        # Wait for the future to be completed using a threading.Event
+        done_event = threading.Event()
 
-            future.add_done_callback(_on_response)
+        def _done_cb(fut):
+            print("[DEBUG] service done callback triggered")
+            done_event.set()
 
-        # Start background thread
-        threading.Thread(target=_thread_func, daemon=True).start()
+        future.add_done_callback(_done_cb)
 
-        # Wait until the call is done or timeout is reached
-        start_time = time.time()
-        while not self.call_is_done:
-            self.spin_once()
-            time.sleep(0.01)
-            if time.time() - start_time > timeout_sec:
-                raise TimeoutError("Service call timed out")
+        if done_event.wait(timeout=timeout_sec):
+            return future.result()
+        else:
+            raise TimeoutError("Service call timed out")
+        
+    # def call_service_blocking(self, client, request, timeout_sec=5.0):
+    #     """
+    #     Sends an async service request using the given client, and blocks until the response is received.
+    #     The waiting is done in a background thread so it does not block the ROS 2 event loop.
+    #     """
+    #     self.call_is_done = False
+    #     result_container = {'result': None, 'exception': None}
 
-        if result_container['exception']:
-            raise RuntimeError(f"Service call failed: {result_container['exception']}")
+    #     def _thread_func():
+    #         future = client.call_async(request)
 
-        return result_container['result']
+    #         def _on_response(fut):
+    #             try:
+    #                 result_container['result'] = fut.result()
+    #             except Exception as e:
+    #                 result_container['exception'] = e
+    #             finally:
+    #                 self.call_is_done = True
+
+    #         future.add_done_callback(_on_response)
+
+    #     # Start background thread
+    #     threading.Thread(target=_thread_func, daemon=True).start()
+
+    #     # Wait until the call is done or timeout is reached
+    #     start_time = time.time()
+    #     while not self.call_is_done:
+    #         self.spin_once()
+    #         time.sleep(0.01)
+    #         if time.time() - start_time > timeout_sec:
+    #             raise TimeoutError("Service call timed out")
+
+    #     if result_container['exception']:
+    #         raise RuntimeError(f"Service call failed: {result_container['exception']}")
+
+    #     return result_container['result']
 
                         
     def update_position_label(self):
@@ -631,13 +716,13 @@ class TkinterROS(Node):
         except Exception as e:
             self.get_logger().error(f'Service call failed: {str(e)}')
 
-    def wait_for_arm (self):
-        """Wait for the arm to be available before sending a move request."""
-        print ("waiting for arm to be available")
-        while not self.arm_is_available:
-            self.spin_once()
-            time.sleep(0.01)  # Sleep for a short duration to avoid busy-waiting
-            #print ("spinning")
+    # def wait_for_arm (self):
+    #     """Wait for the arm to be available before sending a move request."""
+    #     print ("waiting for arm to be available")
+    #     while not self.arm_is_available:
+    #         self.spin_once()
+    #         time.sleep(0.01)  # Sleep for a short duration to avoid busy-waiting
+    #         #print ("spinning")
 
     def aruco_pose_callback(self, msg):
         try:
@@ -650,23 +735,26 @@ class TkinterROS(Node):
             self.get_logger().error(f"Error in aruco_pose_callback: {e}")
 
     def send_move_request(self, pose, is_cartesian=True):
+        self.joint_states_enabled = False
+        # pose_goal = PoseStamped() 
+        # pose_goal.header.frame_id = "base_link"
+        # pose_goal.pose = Pose(position = pose.position, orientation = pose.orientation)
+        pose = Pose(position = pose.position, orientation = pose.orientation)
+        print ("starting to move")
+
+        request = self.get_request(pose, is_cartesian=is_cartesian)
+        # Send the request
+        response = self.call_service_blocking(self.move_arm_client, request, timeout_sec=30.0)
+        print("Got response:", response)
+        self.joint_states_enabled = True
+        return
+
         if is_cartesian:
             ret_val = self.MoveArmCartesian(pose.position, pose.orientation)
         else:
             ret_val = self.MoveArm(pose.position, pose.orientation)
         #time.sleep(1)
         return ret_val
-        # Create a request
-        request = MoveToPose.Request()
-        request.pose = pose
-        
-        # Send the request
-        self.arm_is_available = False
-        future = self.move_client.call_async(request)
-              
-        # Add a callback to be executed when the future is complete
-        future.add_done_callback(self.response_callback)
-        self.wait_for_arm()
  
     def create_pose(self, position, rotation):
         """
@@ -816,21 +904,13 @@ class TkinterROS(Node):
     
 
 def ros_spin(tkinter_ros):
-    rclpy.spin(tkinter_ros)
+    try:
+        rclpy.spin(tkinter_ros)
+    except Exception as e:
+        tkinter_ros.get_logger().error(f"Error in ROS spin loop: {e}")
 
 
-class DummyNode(Node):
-    def __init__(self):
-        super().__init__('dummy_node')
-        self.timer_called = False
-        self.create_timer(1, self.timer_callback)
-
-    def timer_callback(self):
-        print("Timer callback called.")
-        self.timer_called = True
-
-
-def main():
+def main(): 
     # debugpy.listen(("localhost", 5678))  # Port for debugger to connect
     # print("Waiting for debugger to attach...")
     # debugpy.wait_for_client()  # Ensures the debugger connects before continuing

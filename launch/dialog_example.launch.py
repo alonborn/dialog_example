@@ -13,12 +13,12 @@ def generate_launch_description():
             name='dialog_node_gui',
             output='screen'
         ),
-        # Node(
-        #     package='ar_utils',
-        #     executable='move_ar2',
-        #     name='move_ar2_node',
-        #     output='screen'
-        # ),
+        Node(
+            package='ar_utils',
+            executable='move_ar',
+            name='move_ar_node',
+            output='screen'
+        ),
         # Node(
         #     package='ar_utils',
         #     executable='move_ar2',
