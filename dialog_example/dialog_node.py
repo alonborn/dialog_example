@@ -565,9 +565,9 @@ class TkinterROS(Node):
 
         future.add_done_callback(_on_response)
 
-        # if not done_event.wait(timeout=timeout_sec):
-        #     self.get_logger().error("Service call timed out")
-        #     return None
+        if not done_event.wait(timeout=timeout_sec):
+            self.get_logger().error("Service call timed out")
+            return None
 
         return result_container['result']
 
@@ -853,13 +853,14 @@ class TkinterROS(Node):
             yaml.dump(data, f, sort_keys=False)
 
 
-def ros_spin(tkinter_ros):
+#def ros_spin(tkinter_ros):
+def ros_spin_executor(executor): # New
     try:
-        rclpy.spin(tkinter_ros)
+        #rclpy.spin(tkinter_ros)
+        executor.spin()
     except Exception as e:
-        tkinter_ros.get_logger().error(f"Error in ROS spin loop: {e}")
-
-
+        #tkinter_ros.get_logger().error(f"Error in ROS spin loop: {e}")
+        print(f"Error in ROS executor spin loop: {e}")
 
 
 
@@ -872,9 +873,13 @@ def main():
     rclpy.init() 
 
     tkinter_ros = TkinterROS()
+    
+    executor = MultiThreadedExecutor()
+    executor.add_node(tkinter_ros)
 
     # Start ROS spinning in a separate thread
-    ros_thread = threading.Thread(target=ros_spin, args=(tkinter_ros,))
+    #ros_thread = threading.Thread(target=ros_spin, args=(tkinter_ros,))
+    ros_thread = threading.Thread(target=ros_spin_executor, args=(executor,)) # New
     ros_thread.start()
 
     try:
