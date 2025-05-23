@@ -29,45 +29,62 @@ import os
 import tf_transformations
 import sys
 from std_srvs.srv import SetBool
+import yaml
+import pathlib
 
 from ament_index_python.packages import get_package_share_directory
 
 class TkinterROS(Node):
     counter = 0
-
-    arm_is_available = False
-
+    
 
     def __init__(self):
-        self.zero_velocity_positions = None
-        self.num_valid_samples =0
         super().__init__('tkinter_ros_node')
-        self.joint_states_enabled = True
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+        self.zero_velocity_positions = None
+        self.num_valid_samples = 0
+
+        self.arm_is_moving = False
         self.init_cal_poses()
-        # self.mover = Mover.Mover(self)
         self.last_joint_update_time = self.get_clock().now()
         self.last_pos = ""
-        # Set up ROS publisher
+        self.calib_dir = pathlib.Path(os.path.expanduser('~/.ros2/easy_handeye2/calibrations'))
+        self.calib_path = self.calib_dir / 'ar4_calibration.calib'
         self.publisher = self.create_publisher(String, '/ar4_hardware_interface_node/homing_string', 10)
-        #self.timer = self.create_timer(1.0, self.publish_message)
- 
         self.create_subscription(Point, '/aruco_pose', self.aruco_pose_callback, 10)
         self.create_subscription(JointState, '/joint_states', self.joint_states_callback, 10)
         
-        # self.test_timer_callback_group = ReentrantCallbackGroup()
-        self.create_timer(2, self.test_timer_callback)
         self.homing_client = self.create_client(Trigger, '/ar4_hardware_interface_node/homing')
-
         self.move_arm_client = self.create_client(MoveToPose, '/ar_move_to_pose')
-
-        # Subscribe to joint states
-        
+        self.refresh_transform_client = self.create_client(Trigger, 'refresh_handeye_transform')
         self.last_joint_info = ""
-        # Set up Tkinter GUI
+
+        # GUI init
+        self.init_dialog()
+
+        self.arm_joint_names = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"]
+        self.get_logger().info('registering ar_move_to_pose service')
+
+        self.save_sample_calibration_client = self.create_client(SaveCalibration, hec.SAVE_CALIBRATION_TOPIC)
+        self.take_sample_client = self.create_client(TakeSample, hec.TAKE_SAMPLE_TOPIC)
+        self.compute_calibration_client = self.create_client(ComputeCalibration, hec.COMPUTE_CALIBRATION_TOPIC)
+        self.get_logger().info('take_sample service registered')
+
+
+
+        
+        self.init_moveit()
+        self.init_right_frame()
+        self.periodic_status_check()
+        self.ruco_follower_enabled_client = self.create_client(SetBool, '/set_aruco_follower_enabled')
+
+    def init_dialog(self):
         self.root = tk.Tk()
         self.root.title("Tkinter and ROS 2")
-        self.root.geometry("1000x500")
+        self.root.geometry("1000x600")
         self.mode_var = tk.StringVar(value="Calibration")
+
         self.main_frame = tk.Frame(self.root)
         self.main_frame.pack(fill=tk.BOTH, expand=True)
         self.main_frame.columnconfigure(0, weight=1)
@@ -76,31 +93,24 @@ class TkinterROS(Node):
         self.left_frame = tk.Frame(self.main_frame)
         self.left_frame.grid(row=0, column=0, sticky='nsew', padx=10, pady=10)
 
- 
-        self.label = tk.Label(self.left_frame, text="Waiting for messages...", font=("Arial", 16))
-        self.label.pack(pady=10)
+        self.status_label = tk.Label(self.left_frame, text="Waiting", font=("Arial", 16))
+        self.status_label.pack(pady=10)
 
-       # Create a new frame to hold the row of buttons
         self.button_row = tk.Frame(self.left_frame)
         self.button_row.pack(pady=10)
 
-        # Homing button
         self.homing_button = tk.Button(self.button_row, text="Homing", command=self.on_homing_button_click, font=("Arial", 14), width=10, height=1)
         self.homing_button.grid(row=0, column=0, padx=5)
 
-        # Calibrate button
         self.calibrate_button = tk.Button(self.button_row, text="Calibrate", command=self.on_calibrate_button_click, font=("Arial", 14), width=10, height=1)
         self.calibrate_button.grid(row=0, column=1, padx=5)
 
-        # Go Home button
         self.validate_button = tk.Button(self.button_row, text="Go Home", command=self.on_go_home_button_click, font=("Arial", 14), width=10, height=1)
         self.validate_button.grid(row=0, column=2, padx=5)
-
 
         self.joints_entry = tk.Entry(self.left_frame, font=("Arial", 14), width=10)
         self.joints_entry.pack(pady=10)
         self.joints_entry.insert(0, "000001")
-
 
         self.pos_text = tk.Text(self.left_frame, height=2, font=("Arial", 10), wrap="word", width=60)
         self.pos_text.pack(pady=10)
@@ -114,14 +124,14 @@ class TkinterROS(Node):
 
         self.translation_label = tk.Label(self.pose_frame, text="Translation:", font=("Arial", 10))
         self.translation_label.grid(row=0, column=1, padx=5)
-        
+
         self.translation_entry = tk.Entry(self.pose_frame, font=("Arial", 10), width=21)
         self.translation_entry.grid(row=0, column=2, padx=5)
-        
         self.translation_entry.insert(0, str(self.cal_poses[0][0]))
 
         self.rotation_label = tk.Label(self.pose_frame, text="Rotation:", font=("Arial", 10))
         self.rotation_label.grid(row=0, column=3, padx=5)
+
         self.rotation_entry = tk.Entry(self.pose_frame, font=("Arial", 10), width=27)
         self.rotation_entry.grid(row=0, column=4, padx=5)
         self.rotation_entry.insert(0, str(self.cal_poses[0][1]))
@@ -129,9 +139,10 @@ class TkinterROS(Node):
         self.send_pos_button = tk.Button(self.pose_frame, text="Move!", command=self.on_send_pos_button_click, font=("Arial", 14), width=8, height=1)
         self.send_pos_button.grid(row=0, column=5, padx=5)
 
+        tk.Button(self.pose_frame, text="Save Pos", command=self.save_current_pose).grid(row=0, column=6, columnspan=1)
+
         self.sample_frame = tk.Frame(self.left_frame)
         self.sample_frame.pack(pady=(20, 5))
-
 
         self.take_sample_button = tk.Button(self.sample_frame, text="Take Sample", command=self.on_take_sample_button_click, font=("Arial", 10), width=8, height=1)
         self.take_sample_button.grid(row=0, column=0, padx=5)
@@ -139,55 +150,89 @@ class TkinterROS(Node):
         self.save_sample_button = tk.Button(self.sample_frame, text="Save Samples", command=self.on_save_samples_button_click, font=("Arial", 10), width=8, height=1)
         self.save_sample_button.grid(row=0, column=1, padx=5)
 
-        tk.Button(self.pose_frame, text="Save Pos", command=self.save_current_pose).grid(row=0, column=6, columnspan=1)
+        self.add_pose_adjustment_controls()
+        # Translation adjustment controls
+        self.add_adjustment_frame()
 
         self.update_position_label()
         self.root.after(100, self.tk_mainloop)
 
-        self.arm_joint_names = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"]
+    def add_adjustment_frame(self):
+        self.adjustment_frame = tk.Frame(self.left_frame)
+        self.adjustment_frame.pack(pady=10)
 
-        self.get_logger().info('registering ar_move_to_pose service')
-        #self.move_client = self.create_client(MoveToPose, 'ar_move_to_pose')
-        
-        #self.get_logger().info('ar_move_to_pose service registered')
+        tk.Label(self.adjustment_frame, text="Adjust Translation/Rotation", font=("Arial", 12)).grid(row=0, column=0, columnspan=6)
 
-        self.save_sample_calibration_client = self.create_client(SaveCalibration, hec.SAVE_CALIBRATION_TOPIC)
-        self.take_sample_client = self.create_client(TakeSample, hec.TAKE_SAMPLE_TOPIC)
-        self.compute_calibration_client = self.create_client(ComputeCalibration, hec.COMPUTE_CALIBRATION_TOPIC)
+        # X Axis
+        tk.Button(self.adjustment_frame, text="Further", command=lambda: self.adjust_calib_translation('x', 1.0), width=6).grid(row=1, column=0)
+        tk.Button(self.adjustment_frame, text="Closer", command=lambda: self.adjust_calib_translation('x', -1.0), width=6).grid(row=1, column=1)
 
-        self.get_logger().info('take_sample service registered')
-        self.arm_is_available = True
-        self.tf_buffer = Buffer()
-        self.tf_listener = TransformListener(self.tf_buffer, self)
-        self.add_pose_adjustment_controls()
-        self.init_moveit()
-        self.init_right_frame()
+        # Y Axis
+        tk.Button(self.adjustment_frame, text="Left", command=lambda: self.adjust_calib_translation('y', 1.0), width=6).grid(row=1, column=2)
+        tk.Button(self.adjustment_frame, text="Right", command=lambda: self.adjust_calib_translation('y', -1.0), width=6).grid(row=1, column=3)
 
-        # Call the service to enable/disable follower
-        self.ruco_follower_enabled_client = self.create_client(SetBool, '/set_aruco_follower_enabled')
+        # Z Axis
+        tk.Button(self.adjustment_frame, text="Down", command=lambda: self.adjust_calib_translation('z', 1.0), width=6).grid(row=1, column=4)
+        tk.Button(self.adjustment_frame, text="Up", command=lambda: self.adjust_calib_translation('z', -1.0), width=6).grid(row=1, column=5)
 
-        # while not self.ruco_follower_enabled_client.wait_for_service(timeout_sec=1.0):
-        #     self.get_logger().warn('Waiting for set_aruco_follower_enabled service...')
+        # Delta Entry
+        self.translation_delta_entry = tk.Entry(self.adjustment_frame, font=("Arial", 12), width=6)
+        self.translation_delta_entry.grid(row=1, column=6, padx=5)
+        self.translation_delta_entry.insert(0, "0.01")
 
 
-    def call_service_blocking(self, client, request, timeout_sec=5.0):
-        future = client.call_async(request)
 
-        # Wait for the future to be completed using a threading.Event
-        done_event = threading.Event()
+        # Roll
+        tk.Button(self.adjustment_frame, text="Roll +", command=lambda: self.adjust_calib_orientation('x',1.0), width=6).grid(row=3, column=0)
+        tk.Button(self.adjustment_frame, text="Roll -", command=lambda: self.adjust_calib_orientation('x',-1.0), width=6).grid(row=3, column=1)
 
-        def _done_cb(fut):
-            done_event.set()
+        # Pitch
+        tk.Button(self.adjustment_frame, text="Pitch +", command=lambda: self.adjust_calib_orientation('y',1.0), width=6).grid(row=3, column=2)
+        tk.Button(self.adjustment_frame, text="Pitch -", command=lambda: self.adjust_calib_orientation('y',-1.0), width=6).grid(row=3, column=3)
 
-        future.add_done_callback(_done_cb)
+        # Yaw
+        tk.Button(self.adjustment_frame, text="Yaw +", command=lambda: self.adjust_calib_orientation('z',1.0), width=6).grid(row=3, column=4)
+        tk.Button(self.adjustment_frame, text="Yaw -", command=lambda: self.adjust_calib_orientation('z',-1.0), width=6).grid(row=3, column=5)
 
-        if done_event.wait(timeout=timeout_sec):
-            return future.result()
-        else:
-            raise TimeoutError("Service call timed out")
+        # Delta Entry
+        self.orientation_delta_entry = tk.Entry(self.adjustment_frame, font=("Arial", 12), width=6)
+        self.orientation_delta_entry.grid(row=3, column=6, padx=5)
+        self.orientation_delta_entry.insert(0, "0.01")
 
+    def adjust_calib_translation(self, axis, direction):
+        delta = direction * float(self.translation_delta_entry.get())
+        # Read current calibration
+        translation, rotation = self.read_calibration_file(self.calib_path)
+        translation[axis] += delta
 
-    def get_request(self, pose, is_cartesian=True):
+        self.update_calibration_file(self.calib_path, translation, rotation)
+        self.trigger_update_calib_file()
+        # Update UI entry
+        # self.translation_entry.delete(0, tk.END)
+        # self.translation_entry.insert(0, str(translation))
+
+        self.status_label.config(text=f"{axis.upper()} adjusted by {delta:+.3f}")
+
+    def adjust_calib_orientation(self, axis, direction):
+        delta = direction * float(self.orientation_delta_entry.get())
+        # Read current calibration
+        translation, rotation = self.read_calibration_file(self.calib_path)
+        rotation[axis] += delta
+
+        self.update_calibration_file(self.calib_path, translation, rotation)
+        self.trigger_update_calib_file()
+        # Update UI entry
+        # self.translation_entry.delete(0, tk.END)
+        # self.translation_entry.insert(0, str(translation))
+
+        self.status_label.config(text=f"{axis.upper()} adjusted by {delta:+.3f}")
+
+    def trigger_update_calib_file(self):
+        self.get_logger().info("Updating calibration file...")
+        request = Trigger.Request()
+        future = self.refresh_transform_client.call_async(request)
+
+    def get_move_request(self, pose, is_cartesian=True):
         # Create a request
         request = MoveToPose.Request()
         request.pose = pose
@@ -273,111 +318,15 @@ class TkinterROS(Node):
         self.moveit2.cartesian_avoid_collisions = False
         self.moveit2.cartesian_jump_threshold = 0.0
 
-    def MoveArm(self, position, quat_xyzw):
-        time.sleep(0.5) #for some reason the arm is not available immediately after the call
-        # Get parameters
-        # cartesian = self.self.node.get_parameter("cartesian").get_parameter_value().bool_value
-        # cartesian_max_step = self.self.node.get_parameter("cartesian_max_step").get_parameter_value().double_value
-        # cartesian_fraction_threshold = self.self.node.get_parameter("cartesian_fraction_threshold").get_parameter_value().double_value
-        # cartesian_jump_threshold = self.self.node.get_parameter("cartesian_jump_threshold").get_parameter_value().double_value
-        # cartesian_avoid_collisions = self.self.node.get_parameter("cartesian_avoid_collisions").get_parameter_value().bool_value
+    def update_status_label(self):
+        if self.arm_is_moving == True:
+            self.status_label.config(text="Arm Is Moving", fg="red")
+        else:
+            self.status_label.config(text="Waiting", fg="black")
 
-        # Move to pose goal
-        # self.moveit2.move_to_pose(
-        #     position=position,
-        #     quat_xyzw=quat_xyzw,
-        #     synchronous=synchronous,
-        #     cancel_after_secs=cancel_after_secs,
-        #     cartesian=cartesian,
-        #     cartesian_max_step=cartesian_max_step,
-        #     cartesian_fraction_threshold=cartesian_fraction_threshold,
-        #     cartesian_jump_threshold=cartesian_jump_threshold,
-        #     cartesian_avoid_collisions=cartesian_avoid_collisions,
-        # )
-        pose_goal = PoseStamped() 
-        pose_goal.header.frame_id = "base_link"
-        pose_goal.pose = Pose(position = position, orientation = quat_xyzw)
-        print ("starting to move")
-
-        request = self.get_request(pose_goal, is_cartesian=False)
-        # Send the request
-        response = self.call_service_blocking(self, self.move_arm_client, request, timeout_sec=30.0)
-        print("Got response:", response)
-        return
-
-        ret_val = False
-        try:
-            self.moveit2.move_to_pose(pose=pose_goal,
-                                        #synchronous=True,
-                                        #cancel_after_secs=0.0,
-                                        #cartesian=False,
-                                        #cartesian_max_step=0.0025,
-                                        #cartesian_fraction_threshold=0.0,
-                                        #cartesian_jump_threshold=0.0,
-                                        #cartesian_avoid_collisions=False,
-                                        #planner_id=self.moveit2.planner_id,                                                       
-                                    )
-            #ret_val = self.moveit2.wait_until_executed()
-            self.poll_until_done(callback=lambda success: print(f"Motion success: {success}"))
-
-        finally:
-            print ("move completed")
-        return ret_val
-
-    def poll_until_done(self, callback=None, timeout_sec=30.0):
-        self.motion_poll_start_time = time.time()
-        self.motion_poll_callback = callback
-        self.root.after(100, self._poll_motion_state)
-
-    def _poll_motion_state(self):
-        if self.moveit2.is_executing()== False:
-            if self.motion_poll_callback:
-                self.motion_poll_callback(self.moveit2.motion_suceeded)
-            return
-
-        if time.time() - self.motion_poll_start_time > 30.0:
-            self.get_logger().warn("Timeout while waiting for motion to complete")
-            if self.motion_poll_callback:
-                self.motion_poll_callback(False)
-            return
-
-        self.root.after(100, self._poll_motion_state)
-
-    def MoveArmCartesian(self, position, quat_xyzw):
-        """
-        Moves the robot arm to a given position and orientation using Cartesian path planning.
-
-        Args:
-            position: Tuple or geometry_msgs.msg.Point (x, y, z)
-            quat_xyzw: Tuple or geometry_msgs.msg.Quaternion (x, y, z, w)
-
-        Returns:
-            True if motion succeeded, False otherwise.
-        """
-        time.sleep(0.5)  # Allow time for arm/controller to become ready
-        print("Starting Cartesian motion...")
-
-
-        print("Got response:", response)
-        return
-
-        ret_val = False
-        try:
-            self.moveit2.move_to_pose(
-                position=position,
-                quat_xyzw=quat_xyzw,
-                cartesian=True,
-                cartesian_max_step=0.0025,  # Step size in meters
-                cartesian_fraction_threshold=0.9  # Minimum fraction of path to accept
-            )
-            #ret_val = self.moveit2.wait_until_executed()
-            self.poll_until_done(callback=lambda success: print(f"Motion success: {success}"))
-
-        finally:
-            print("Cartesian motion completed")
-
-        return ret_val
-
+    def periodic_status_check(self):
+        self.update_status_label()
+        self.root.after(200, self.periodic_status_check)
 
     # --- GUI Pose Adjustment Controls (to be called inside TkinterROS.__init__()) ---
     def add_pose_adjustment_controls(self):
@@ -387,8 +336,6 @@ class TkinterROS(Node):
 
         # self.current_pose_display = tk.Text(pose_ctrl_frame, height=3, font=("Courier", 10), width=40)
         # self.current_pose_display.grid(row=0, column=0, columnspan=6, pady=5)
-
-
 
         def move_to_current_pose():
 
@@ -534,7 +481,7 @@ class TkinterROS(Node):
 
     def joint_states_callback(self, msg):
 
-        if self.joint_states_enabled == False:
+        if self.arm_is_moving == True:
             self.zero_velocity_positions = None
             return
         
@@ -596,60 +543,36 @@ class TkinterROS(Node):
 
 
     
-    def call_service_blocking(node, client, request, timeout_sec=5.0):
-        future = client.call_async(request)
-
-        # Wait for the future to be completed using a threading.Event
-        done_event = threading.Event()
-
-        def _done_cb(fut):
-            print("[DEBUG] service done callback triggered")
-            done_event.set()
-
-        future.add_done_callback(_done_cb)
-
-        if done_event.wait(timeout=timeout_sec):
-            return future.result()
-        else:
-            raise TimeoutError("Service call timed out")
+    def call_service_blocking(self, client, request, timeout_sec=10.0):
         
-    # def call_service_blocking(self, client, request, timeout_sec=5.0):
-    #     """
-    #     Sends an async service request using the given client, and blocks until the response is received.
-    #     The waiting is done in a background thread so it does not block the ROS 2 event loop.
-    #     """
-    #     self.call_is_done = False
-    #     result_container = {'result': None, 'exception': None}
+        if not client.service_is_ready():
+            self.get_logger().error("Service not available")
+            return None
 
-    #     def _thread_func():
-    #         future = client.call_async(request)
+        future = client.call_async(request)
+        done_event = threading.Event()
+        result_container = {'result': None}
 
-    #         def _on_response(fut):
-    #             try:
-    #                 result_container['result'] = fut.result()
-    #             except Exception as e:
-    #                 result_container['exception'] = e
-    #             finally:
-    #                 self.call_is_done = True
+        def _on_response(fut):
+            self.arm_is_moving = False
+            try:
+                result_container['result'] = fut.result()
+                self.get_logger().info(f"Service call ended, result: {result_container['result']}")
+            except Exception as e:
+                self.get_logger().error(f"Service call failed: {e}")
+            finally:
+                done_event.set()
 
-    #         future.add_done_callback(_on_response)
+        future.add_done_callback(_on_response)
 
-    #     # Start background thread
-    #     threading.Thread(target=_thread_func, daemon=True).start()
+        # if not done_event.wait(timeout=timeout_sec):
+        #     self.get_logger().error("Service call timed out")
+        #     return None
 
-    #     # Wait until the call is done or timeout is reached
-    #     start_time = time.time()
-    #     while not self.call_is_done:
-    #         self.spin_once()
-    #         time.sleep(0.01)
-    #         if time.time() - start_time > timeout_sec:
-    #             raise TimeoutError("Service call timed out")
+        return result_container['result']
 
-    #     if result_container['exception']:
-    #         raise RuntimeError(f"Service call failed: {result_container['exception']}")
 
-    #     return result_container['result']
-
+        
                         
     def update_position_label(self):
         pose = self.get_current_ee_pose()
@@ -706,24 +629,6 @@ class TkinterROS(Node):
             self.get_logger().warn(f"TF lookup failed: {e}")
             return None
 
-    def response_callback(self, future):
-        try:
-            response = future.result()
-            # Logging the status and message from the response
-            #self.get_logger().info(f'Response Status: {response.success}')
-            #self.get_logger().info(f'Response Message: {response.message}')
-            self.arm_is_available = True
-        except Exception as e:
-            self.get_logger().error(f'Service call failed: {str(e)}')
-
-    # def wait_for_arm (self):
-    #     """Wait for the arm to be available before sending a move request."""
-    #     print ("waiting for arm to be available")
-    #     while not self.arm_is_available:
-    #         self.spin_once()
-    #         time.sleep(0.01)  # Sleep for a short duration to avoid busy-waiting
-    #         #print ("spinning")
-
     def aruco_pose_callback(self, msg):
         try:
             pose_text = f"({msg.x:.4f}, {msg.y:.4f}, {msg.z:.4f})"
@@ -734,27 +639,27 @@ class TkinterROS(Node):
         except Exception as e:
             self.get_logger().error(f"Error in aruco_pose_callback: {e}")
 
+
+
     def send_move_request(self, pose, is_cartesian=True):
-        self.joint_states_enabled = False
+        self.arm_is_moving = True
         # pose_goal = PoseStamped() 
         # pose_goal.header.frame_id = "base_link"
         # pose_goal.pose = Pose(position = pose.position, orientation = pose.orientation)
         pose = Pose(position = pose.position, orientation = pose.orientation)
         print ("starting to move")
 
-        request = self.get_request(pose, is_cartesian=is_cartesian)
+        request = self.get_move_request(pose, is_cartesian=is_cartesian)
         # Send the request
-        response = self.call_service_blocking(self.move_arm_client, request, timeout_sec=30.0)
-        print("Got response:", response)
-        self.joint_states_enabled = True
-        return
 
-        if is_cartesian:
-            ret_val = self.MoveArmCartesian(pose.position, pose.orientation)
-        else:
-            ret_val = self.MoveArm(pose.position, pose.orientation)
-        #time.sleep(1)
-        return ret_val
+        def _done_moving(fut):
+            print("[DEBUG] service done callback triggered")
+            self.arm_is_moving = False
+
+
+        response = self.call_service_blocking(self.move_arm_client, request,timeout_sec=8.0)
+        print("Got response:", response)
+        return
  
     def create_pose(self, position, rotation):
         """
@@ -819,11 +724,6 @@ class TkinterROS(Node):
             except Exception as e:
                 print(f"Error sending pose: {e}")
  
-    def spin_until_future(self, future, timeout_sec=0.1):
-        while not future.done():
-            rclpy.spin_once(self, timeout_sec=timeout_sec)
-        return future.result()
-
     def on_calibrate_button_click(self):
 
         # position = Pose()
@@ -865,7 +765,7 @@ class TkinterROS(Node):
         self.send_pose_from_entries()
 
     def trigger_homing_service(self, start_msg, success_msg, failure_msg):
-        self.label.config(text=start_msg)
+        self.status_label.config(text=start_msg)
         request = Trigger.Request()
         future = self.homing_client.call_async(request)
         future.add_done_callback(lambda f: self.handle_service_response(f, success_msg, failure_msg))
@@ -881,7 +781,7 @@ class TkinterROS(Node):
             self.update_gui(f"Service call failed: {str(e)}")
 
     def update_gui(self, message):
-        self.label.config(text=message)
+        self.status_label.config(text=message)
 
     def tk_mainloop(self):
         self.root.update_idletasks()
@@ -902,6 +802,56 @@ class TkinterROS(Node):
         topic_names_and_types = self.get_topic_names_and_types()
         return any(topic_name == name for name, _ in topic_names_and_types)
     
+    def read_calibration_file(self,filepath):
+        """
+        Reads the calibration file and returns the translation and rotation.
+
+        Parameters:
+            filepath (str): Path to the calibration YAML file.
+
+        Returns:
+            tuple: (translation_dict, rotation_dict)
+        """
+        with open(filepath, 'r') as f:
+            data = yaml.safe_load(f)
+
+        translation = data['transform']['translation']
+        rotation = data['transform']['rotation']
+        
+        return translation, rotation
+
+    def update_calibration_file(self,filepath, new_translation, new_rotation):
+        """
+        Update the translation and rotation in a calibration file.
+
+        Parameters:
+            filepath (str): Path to the calibration file (YAML format).
+            new_translation (dict): Dictionary with keys 'x', 'y', 'z'.
+            new_rotation (dict): Dictionary with keys 'x', 'y', 'z', 'w'.
+        """
+        # Load existing calibration file
+        with open(filepath, 'r') as f:
+            data = yaml.safe_load(f)
+
+        # Update translation
+        data['transform']['translation'] = {
+            'x': new_translation['x'],
+            'y': new_translation['y'],
+            'z': new_translation['z'],
+        }
+
+        # Update rotation
+        data['transform']['rotation'] = {
+            'x': new_rotation['x'],
+            'y': new_rotation['y'],
+            'z': new_rotation['z'],
+            'w': new_rotation['w'],
+        }
+
+        # Save updated calibration back to file
+        with open(filepath, 'w') as f:
+            yaml.dump(data, f, sort_keys=False)
+
 
 def ros_spin(tkinter_ros):
     try:
@@ -910,11 +860,14 @@ def ros_spin(tkinter_ros):
         tkinter_ros.get_logger().error(f"Error in ROS spin loop: {e}")
 
 
+
+
+
 def main(): 
-    # debugpy.listen(("localhost", 5678))  # Port for debugger to connect
-    # print("Waiting for debugger to attach...")
-    # debugpy.wait_for_client()  # Ensures the debugger connects before continuing
-    # print("Debugger connected.")
+    debugpy.listen(("localhost", 5678))  # Port for debugger to connect
+    print("Waiting for debugger to attach...")
+    debugpy.wait_for_client()  # Ensures the debugger connects before continuing
+    print("Debugger connected.")
    
     rclpy.init() 
 
