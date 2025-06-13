@@ -59,7 +59,7 @@ class TkinterROS(Node):
         self.move_arm_client = self.create_client(MoveToPose, '/ar_move_to_pose')
         self.refresh_transform_client = self.create_client(Trigger, 'refresh_handeye_transform')
         self.last_joint_info = ""
-
+        self._last_aruco_update_time = 0
         # GUI init
         self.init_dialog()
 
@@ -630,6 +630,11 @@ class TkinterROS(Node):
             return None
 
     def aruco_pose_callback(self, msg):
+        current_time = time.time()
+        if current_time - self._last_aruco_update_time < 1.0:
+            return  # Skip this update if less than 1 second since last
+
+        self._last_aruco_update_time = current_time        
         try:
             pose_text = f"({msg.x:.4f}, {msg.y:.4f}, {msg.z:.4f})"
             self.aruco_pose_entry.configure(state='normal')
@@ -865,10 +870,10 @@ def ros_spin_executor(executor): # New
 
 
 def main(): 
-    debugpy.listen(("localhost", 5678))  # Port for debugger to connect
-    print("Waiting for debugger to attach...")
-    debugpy.wait_for_client()  # Ensures the debugger connects before continuing
-    print("Debugger connected.")
+    # debugpy.listen(("localhost", 5678))  # Port for debugger to connect
+    # print("Waiting for debugger to attach...")
+    # debugpy.wait_for_client()  # Ensures the debugger connects before continuing
+    # print("Debugger connected.")
    
     rclpy.init() 
 
