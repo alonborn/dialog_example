@@ -19,7 +19,9 @@ setup(
     maintainer_email='alonborn@gmail.com',
     description='TODO: Package description',
     license='TODO: License declaration',
-    tests_require=['pytest'],
+    extras_require={
+    'test': ['pytest'],
+    },
     entry_points={
         'console_scripts': [
             'dialog_node = dialog_example.dialog_node:main',  # Correct entry point for your script

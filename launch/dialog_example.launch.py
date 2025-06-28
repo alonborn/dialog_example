@@ -27,14 +27,14 @@ def generate_launch_description():
         # ),
         
         
-        IncludeLaunchDescription(
-            PythonLaunchDescriptionSource(
-                os.path.join(
-                    get_package_share_directory('ar4_hand_eye_calibration'),
-                    'launch',
-                    'visualize.launch.py'
-                )
-            )
-        )
+        # IncludeLaunchDescription(
+        #     PythonLaunchDescriptionSource(
+        #         os.path.join(
+        #             get_package_share_directory('ar4_hand_eye_calibration'),
+        #             'launch',
+        #             'visualize.launch.py'
+        #         )
+        #     )
+        # )
 
     ])
