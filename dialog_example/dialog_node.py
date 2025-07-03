@@ -382,6 +382,9 @@ class TkinterROS(Node):
             move_to_current_pose()
 
         def next_pose():
+            if self.pose_index >= len(self.cal_poses) - 1:
+                self.pose_index = 0  # Loop back to the first pose if at the end
+                return
             self.pose_index = min(len(self.cal_poses) - 1, self.pose_index + 1)
             self.pos_num_label.configure(text=f"#{self.pose_index}")
             #self.copy_aruco_pose_to_clipboard()
