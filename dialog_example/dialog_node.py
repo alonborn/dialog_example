@@ -4,35 +4,33 @@ from rclpy.node import Node
 from std_msgs.msg import String
 import threading
 from std_srvs.srv import Trigger  # Standard service type for triggering actions
-from pymoveit2 import MoveIt2
-
-from rclpy.callback_groups import ReentrantCallbackGroup
+import tf2_ros
 from rclpy.executors import MultiThreadedExecutor
 from geometry_msgs.msg import PoseStamped
-from geometry_msgs.msg import Pose
-from geometry_msgs.msg import Pose, Point, Quaternion
+from tf2_geometry_msgs.tf2_geometry_msgs import do_transform_pose
+import transforms3d
 from geometry_msgs.msg import Pose
 from my_robot_interfaces.srv import MoveToPose  # Import the custom service type
 from tf2_ros import Buffer, TransformListener
 from sensor_msgs.msg import JointState
-import easy_handeye2_msgs as ehm
 import easy_handeye2 as hec
 from easy_handeye2_msgs.srv import TakeSample, SaveCalibration,ComputeCalibration
 from tkinter import messagebox
 import queue
 import time
-from geometry_msgs.msg import Point
+import numpy as np
 import re
 import json
 import debugpy
 import os
 import tf_transformations
-import sys
 from std_srvs.srv import SetBool
 import yaml
 import pathlib
-
-from ament_index_python.packages import get_package_share_directory
+from rclpy.qos import qos_profile_sensor_data
+from geometry_msgs.msg import PoseArray, Pose
+import time
+from rclpy.time import Time
 
 class TkinterROS(Node):
     counter = 0
@@ -40,21 +38,37 @@ class TkinterROS(Node):
 
     def __init__(self):
         super().__init__('tkinter_ros_node')
+        self.gui_queue = queue.Queue()
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
         self.zero_velocity_positions = None
         self.num_valid_samples = 0
-
+        self.pose_in_camera = None
         self.arm_is_moving = False
         self.init_cal_poses()
+
         self.last_joint_update_time = self.get_clock().now()
+        self.marker_index = 0
         self.last_pos = ""
+        self.filtered_position = None
+        self.ema_alpha = 0.2  # default filter constant
         self.calib_dir = pathlib.Path(os.path.expanduser('~/.ros2/easy_handeye2/calibrations'))
         self.calib_path = self.calib_dir / 'ar4_calibration.calib'
         self.publisher = self.create_publisher(String, '/ar4_hardware_interface_node/homing_string', 10)
-        self.create_subscription(Point, '/aruco_pose', self.aruco_pose_callback, 10)
+        # self.create_subscription(Point, '/aruco_pose', self.aruco_pose_callback, 10)
         self.create_subscription(JointState, '/joint_states', self.joint_states_callback, 10)
         
+        # Subscriber to aruco_poses topic
+        self.create_subscription(
+            PoseArray,
+            '/aruco_poses',
+            self.aruco_pose_callback,
+            qos_profile_sensor_data,
+        )
+
+        self.get_logger().info('ArucoPoseFollower initialized, listening to /aruco_poses')
+
+
         self.homing_client = self.create_client(Trigger, '/ar4_hardware_interface_node/homing')
         self.move_arm_client = self.create_client(MoveToPose, '/ar_move_to_pose')
         self.refresh_transform_client = self.create_client(Trigger, 'refresh_handeye_transform')
@@ -65,26 +79,30 @@ class TkinterROS(Node):
 
         self.arm_joint_names = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"]
         self.get_logger().info('registering ar_move_to_pose service')
-
+        self.root.after(20, self.process_gui_queue) 
         self.save_sample_calibration_client = self.create_client(SaveCalibration, hec.SAVE_CALIBRATION_TOPIC)
         self.take_sample_client = self.create_client(TakeSample, hec.TAKE_SAMPLE_TOPIC)
         self.compute_calibration_client = self.create_client(ComputeCalibration, hec.COMPUTE_CALIBRATION_TOPIC)
         self.get_logger().info('take_sample service registered')
 
-
-
-        
-        self.init_moveit()
+        # self.init_moveit()
         self.init_right_frame()
         self.periodic_status_check()
-        self.ruco_follower_enabled_client = self.create_client(SetBool, '/set_aruco_follower_enabled')
+        self.aruco_follower_enabled_client = self.create_client(SetBool, '/set_aruco_follower_enabled')
+        
+
+    def process_gui_queue(self):
+        while not self.gui_queue.empty():
+            task = self.gui_queue.get()
+            task()  # Execute the GUI update
+        self.root.after(50, self.process_gui_queue)  # keep polling every 50ms
 
     def init_dialog(self):
         self.root = tk.Tk()
         self.root.title("Tkinter and ROS 2")
         self.root.geometry("1000x600")
         self.mode_var = tk.StringVar(value="Calibration")
-
+        self.cartesian_var = tk.BooleanVar(value=True)
         self.main_frame = tk.Frame(self.root)
         self.main_frame.pack(fill=tk.BOTH, expand=True)
         self.main_frame.columnconfigure(0, weight=1)
@@ -139,7 +157,10 @@ class TkinterROS(Node):
         self.send_pos_button = tk.Button(self.pose_frame, text="Move!", command=self.on_send_pos_button_click, font=("Arial", 14), width=8, height=1)
         self.send_pos_button.grid(row=0, column=5, padx=5)
 
-        tk.Button(self.pose_frame, text="Save Pos", command=self.save_current_pose).grid(row=0, column=6, columnspan=1)
+        self.cartesian_checkbox = tk.Checkbutton(self.pose_frame,text="Cartesian",variable=self.cartesian_var,font=("Arial", 12))
+        self.cartesian_checkbox.grid(row=0, column=6, padx=5)
+
+        tk.Button(self.pose_frame, text="Save Pos", command=self.save_current_pose).grid(row=0, column=7, columnspan=1)
 
         self.sample_frame = tk.Frame(self.left_frame)
         self.sample_frame.pack(pady=(20, 5))
@@ -150,12 +171,17 @@ class TkinterROS(Node):
         self.save_sample_button = tk.Button(self.sample_frame, text="Save Samples", command=self.on_save_samples_button_click, font=("Arial", 10), width=8, height=1)
         self.save_sample_button.grid(row=0, column=1, padx=5)
 
+        self.auto_adjust_button = tk.Button(self.sample_frame,text="Move To Marker",command=self.move_to_marker, font=("Arial", 10), width=12, height=1)
+        self.auto_adjust_button.grid(row=0, column=2, padx=5)
+
         self.add_pose_adjustment_controls()
         # Translation adjustment controls
         self.add_adjustment_frame()
 
         self.update_position_label()
         self.root.after(100, self.tk_mainloop)
+
+
 
     def add_adjustment_frame(self):
         self.adjustment_frame = tk.Frame(self.left_frame)
@@ -207,9 +233,6 @@ class TkinterROS(Node):
 
         self.update_calibration_file(self.calib_path, translation, rotation)
         self.trigger_update_calib_file()
-        # Update UI entry
-        # self.translation_entry.delete(0, tk.END)
-        # self.translation_entry.insert(0, str(translation))
 
         self.status_label.config(text=f"{axis.upper()} adjusted by {delta:+.3f}")
 
@@ -221,9 +244,6 @@ class TkinterROS(Node):
 
         self.update_calibration_file(self.calib_path, translation, rotation)
         self.trigger_update_calib_file()
-        # Update UI entry
-        # self.translation_entry.delete(0, tk.END)
-        # self.translation_entry.insert(0, str(translation))
 
         self.status_label.config(text=f"{axis.upper()} adjusted by {delta:+.3f}")
 
@@ -285,7 +305,7 @@ class TkinterROS(Node):
         request = SetBool.Request()
         request.data = enable_follower
 
-        future = self.ruco_follower_enabled_client.call_async(request)
+        future = self.aruco_follower_enabled_client.call_async(request)
 
         # Optionally wait (non-blocking)
         rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
@@ -293,30 +313,6 @@ class TkinterROS(Node):
             self.get_logger().info(f"Service response: {future.result().message}")
         else:
             self.get_logger().error("Service call failed")
-
-    def init_moveit(self):
-        self.arm_joint_names = [
-            "joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"
-        ]
-        self.moveit2 = MoveIt2(
-            node=self,
-            joint_names=self.arm_joint_names,
-            base_link_name="base_link",
-            end_effector_name="link_6",
-            group_name="ar_manipulator",
-            callback_group=ReentrantCallbackGroup()
-        )
-
-        self.moveit2.planner_id = "RRTConnectkConfigDefault"
-        self.moveit2.max_velocity = 1.0
-        self.moveit2.max_acceleration = 1.0
-        self.moveit2.planning_time = 5.0  # Timeout in seconds
-
-        # Scale down velocity and acceleration of joints (percentage of maximum)
-        self.moveit2.max_velocity = 0.5
-        self.moveit2.max_acceleration = 0.5
-        self.moveit2.cartesian_avoid_collisions = False
-        self.moveit2.cartesian_jump_threshold = 0.0
 
     def update_status_label(self):
         if self.arm_is_moving == True:
@@ -421,7 +417,8 @@ class TkinterROS(Node):
                 # update_pose_display()
             else:
                 print("Invalid pose length.")
-            path = "/home/alon/ros_ws/src/dialog_example/dialog_example/cal_poses.jsonc"
+            path = os.path.join(os.path.expanduser("~/ros_ws/src/dialog_example/dialog_example"), "cal_poses.jsonc")
+
             self.save_calibration_poses(self.cal_poses,path)
         except Exception as e:
             self.get_logger().error(f"Failed to save pose from entries: {e}")
@@ -480,7 +477,43 @@ class TkinterROS(Node):
             self.get_logger().error(f"Error copying Aruco pose to clipboard: {e}")
 
 
+    def pose_to_matrix(self,pose):
+        """Convert a ROS geometry_msgs/Pose to a 4x4 transformation matrix."""
+        translation = np.array([pose.position.x, pose.position.y, pose.position.z])
+        quat = [pose.orientation.w, pose.orientation.x, pose.orientation.y, pose.orientation.z]
+        rot = transforms3d.quaternions.quat2mat(quat)
+        T = np.eye(4)
+        T[0:3, 0:3] = rot
+        T[0:3, 3] = translation
+        return T
 
+        
+    def auto_adjust_calibration_from_poses(self, marker_pose, ee_pose):
+        """
+        Given the marker's and EE's poses in the same frame (base_link),
+        compute the XY offset between them and correct the base->marker calibration.
+        """
+        T_base_marker = self.pose_to_matrix(marker_pose)
+        T_base_ee = self.pose_to_matrix(ee_pose)
+
+        # Compute T_marker_ee = inv(T_base_marker) @ T_base_ee
+        T_marker_base = np.linalg.inv(T_base_marker)
+        T_marker_ee = T_marker_base @ T_base_ee
+
+        dx, dy, dz = T_marker_ee[0:3, 3]
+        self.get_logger().info(f"[AUTO CALIB] Offset detected: dx={dx:.4f}, dy={dy:.4f}, dz={dz:.4f}")
+
+        # Read current calibration translation & rotation
+        translation, rotation = self.read_calibration_file(self.calib_path)
+
+        # Apply corrections: shift calibration by -dx, -dy
+        translation[0] -= dx
+        translation[1] -= dy
+
+        # self.update_calibration_file(self.calib_path, translation, rotation)
+        # self.trigger_update_calib_file()
+
+        self.status_label.config(text=f"Calibration adjusted by dx={-dx:+.3f}, dy={-dy:+.3f}")
 
     def joint_states_callback(self, msg):
 
@@ -516,17 +549,23 @@ class TkinterROS(Node):
 
             # UI update
             joint_info = "\n".join([f"{pos:.4f}," for pos in msg.position])
-            if self.last_joint_info == joint_info:
-                return
-            self.last_joint_info = joint_info
-
-            self.joint_states_entry.configure(state='normal')
-            self.joint_states_entry.delete("1.0", tk.END)
-            self.joint_states_entry.insert(tk.END, joint_info)
-            self.joint_states_entry.configure(state='disabled')
+            self.gui_queue.put(lambda: self.update_joint_states_gui(joint_info))
+            
 
         except Exception as e:
             self.get_logger().error(f"Error in joint_states_callback: {e}")
+
+
+
+    def update_joint_states_gui(self, joint_info):
+        if self.last_joint_info == joint_info:
+            return
+        self.last_joint_info = joint_info
+        self.joint_states_entry.configure(state='normal')
+        self.joint_states_entry.delete("1.0", tk.END)
+        self.joint_states_entry.insert(tk.END, joint_info)
+        self.joint_states_entry.configure(state='disabled')
+
 
     def test_timer_callback(self):
         self.get_logger().info('ROS loop is alive!')
@@ -632,21 +671,160 @@ class TkinterROS(Node):
             self.get_logger().warn(f"TF lookup failed: {e}")
             return None
 
-    def aruco_pose_callback(self, msg):
+
+    def aruco_pose_callback(self, msg: PoseArray):
+        if not msg.poses:
+            self.get_logger().warn('Received empty PoseArray, skipping.')
+            return
+        
         current_time = time.time()
         if current_time - self._last_aruco_update_time < 1.0:
             return  # Skip this update if less than 1 second since last
 
-        self._last_aruco_update_time = current_time        
-        try:
-            pose_text = f"({msg.x:.4f}, {msg.y:.4f}, {msg.z:.4f})"
-            self.aruco_pose_entry.configure(state='normal')
-            self.aruco_pose_entry.delete("1.0", tk.END)
-            self.aruco_pose_entry.insert(tk.END, pose_text)
-            self.aruco_pose_entry.configure(state='disabled')
-        except Exception as e:
-            self.get_logger().error(f"Error in aruco_pose_callback: {e}")
+        self._last_aruco_update_time = current_time 
 
+        # ----------------------------
+        # 1) Work with pose in camera frame
+        # ----------------------------
+        self.pose_in_camera = msg.poses[self.marker_index]
+
+        # Display the camera-frame pose in the GUI
+        pose_text = f"({self.pose_in_camera.position.x:.2f}, {self.pose_in_camera.position.y:.2f}, {self.pose_in_camera.position.z:.2f})"
+        self.gui_queue.put(lambda: self.update_aruco_pose_gui(pose_text))
+
+
+    def update_aruco_pose_gui(self, pose_text):
+        self.aruco_pose_entry.configure(state='normal')
+        self.aruco_pose_entry.delete("1.0", tk.END)
+        self.aruco_pose_entry.insert(tk.END, pose_text)
+        self.aruco_pose_entry.configure(state='disabled')
+
+
+    def move_to_marker(self):
+        if self.pose_in_camera is None:
+            self.get_logger().warn("No transformed ArUco pose available to move to.")
+            return
+
+        self.move_to_marker_pose(self.pose_in_camera)
+
+    def _transform_pose2(self, pose: Pose, source_frame: str, target_frame: str) -> Pose:
+        """Transforms a pose from the source_frame to the target_frame,
+        publishes both the direct transformed pose and one offset in z by +5cm,
+        and returns the direct transformed pose."""
+        
+        # Look up the transform from source_frame -> target_frame
+        transform = self.tf_buffer.lookup_transform(target_frame, source_frame, Time())
+        
+        # Transform the original pose
+        transformed_pose = do_transform_pose(pose, transform)
+        # Publish the direct transformed pose
+        stamped_pose = PoseStamped()
+        stamped_pose.header.stamp = self.get_clock().now().to_msg()
+        stamped_pose.header.frame_id = target_frame
+        stamped_pose.pose = transformed_pose
+        
+        # Create a copy of the original pose with z offset +5cm before transforming
+        pose_with_offset = Pose()
+        pose_with_offset.position = Point(
+            x=pose.position.x,
+            y=pose.position.y,
+            z=pose.position.z + 0.05  # add 5 cm in z
+        )
+        pose_with_offset.orientation = pose.orientation
+        
+        transformed_pose_offset = do_transform_pose(pose_with_offset, transform)
+        
+        # Publish the offset pose (useful for visualizations)
+        stamped_offset_pose = PoseStamped()
+        stamped_offset_pose.header.stamp = self.get_clock().now().to_msg()
+        stamped_offset_pose.header.frame_id = target_frame
+        stamped_offset_pose.pose = transformed_pose_offset
+        self.target_pose_pub.publish(stamped_offset_pose)
+        
+        return transformed_pose
+
+    def _transform_pose(self, pose: Pose, source_frame: str, target_frame: str) -> Pose:
+        """
+        Transforms a pose from source_frame to target_frame using TF2,
+        and returns the transformed Pose in target_frame.
+        """
+
+        try:
+            # Wrap the input Pose in a PoseStamped
+            stamped_pose_in = PoseStamped()
+            stamped_pose_in.header.stamp = self.get_clock().now().to_msg()
+            stamped_pose_in.header.frame_id = source_frame
+            stamped_pose_in.pose = pose
+
+            # Lookup the transform from source_frame -> target_frame
+            now = rclpy.time.Time()
+            can_transform = self.tf_buffer.can_transform(
+                target_frame,
+                source_frame,
+                now,
+                timeout=rclpy.duration.Duration(seconds=1.0)
+            )
+            if not can_transform:
+                raise RuntimeError(f"Cannot transform from {source_frame} to {target_frame}!")
+
+            transform = self.tf_buffer.lookup_transform(
+                target_frame,
+                source_frame,
+                now,
+                timeout=rclpy.duration.Duration(seconds=1.0)
+            )
+            self.get_logger().info(f"------------------------(4)Transform: {transform}")
+            # Transform the pose into target_frame
+            transformed_pose = do_transform_pose(stamped_pose_in.pose, transform)
+            self.get_logger().info(f"------------------------(5)Transformed pose: {transformed_pose}")  
+            # Optional: publish for visualization if you defined publishers
+            # if hasattr(self, 'pose_pub'):
+            #     self.pose_pub.publish(transformed_stamped)
+
+            return transformed_pose
+
+        except Exception as e:
+            self.get_logger().error(f"[TF ERROR] Failed to transform pose: {e}")
+            raise
+
+    def move_to_marker_pose(self, pose_in_camera: Pose):
+        """Process a single Pose (in camera frame), transform it, filter it, and move the robot."""
+        try:
+            self.get_logger().info(f"--------------------(1)Received pose in camera frame: {pose_in_camera}")
+            transformed_pose = self._transform_pose(pose_in_camera,
+                                                        "camera_color_optical_frame",
+                                                        "base_link")
+
+            self.get_logger().info(f"---------------------------(2)Transformed pose (after _transform_pose): {transformed_pose}")
+        except Exception as e:
+            self.get_logger().error(f"Unexpected exception during pose processing: {e}")
+            return  # 🟢 Critical: exit early so the rest of the method isn't run on invalid data
+
+        # Continue only if no exception
+        # Flip the pose upside down by applying a 180-degree rotation around X
+        quat = [
+            transformed_pose.orientation.w,
+            transformed_pose.orientation.x,
+            transformed_pose.orientation.y,
+            transformed_pose.orientation.z,
+        ]
+        x_180_deg_quat = [0, 1, 0, 0]
+        flipped_quat = transforms3d.quaternions.qmult(quat, x_180_deg_quat)
+        transformed_pose.orientation.w = flipped_quat[0]
+        transformed_pose.orientation.x = flipped_quat[1]
+        transformed_pose.orientation.y = flipped_quat[2]
+        transformed_pose.orientation.z = flipped_quat[3]
+
+        # Offset in Z
+        transformed_pose.position.z += 0.10
+
+        self.get_logger().info(f"------------------(3)Following pose: {transformed_pose}")
+        self.move_to(transformed_pose)
+
+
+    def move_to(self, msg: Pose):
+
+        self.send_move_request(pose=msg,is_cartesian=False)
 
 
     def send_move_request(self, pose, is_cartesian=True):
@@ -667,7 +845,7 @@ class TkinterROS(Node):
 
         response = self.call_service_blocking(self.move_arm_client, request,timeout_sec=8.0)
         print("Got response:", response)
-        return
+        return response is not None
  
     def create_pose(self, position, rotation):
         """
@@ -728,7 +906,8 @@ class TkinterROS(Node):
                     raise ValueError("Invalid pose format")
 
                 pose_msg = self.create_pose(translation, rotation)
-                self.send_move_request(pose_msg)
+                is_cartesian = self.cartesian_var.get()
+                self.send_move_request(pose_msg,is_cartesian = is_cartesian)
             except Exception as e:
                 print(f"Error sending pose: {e}")
  
@@ -747,13 +926,13 @@ class TkinterROS(Node):
             pose_msg = self.create_pose(pose[0], pose[1])
             #print(pose_msg)
             if self.send_move_request(pose_msg):
-                num_valid_samples += 1
+                self.num_valid_samples += 1
                 #time.sleep(3)
                 self.take_sample()
                 #time.sleep(3)
-                if num_valid_samples > 2:
+                if self.num_valid_samples > 2:
                     self.compute_calibration()
-                print(f"sample no. {num_valid_samples} taken - pose " + str(pose[0]) + " - " + str(pose[1])) 
+                print(f"sample no. {self.num_valid_samples} taken - pose " + str(pose[0]) + " - " + str(pose[1])) 
             else:
                 print(f"move request failed for pose " + str(pose[0]) + " - " + str(pose[1])) 
                 
@@ -782,11 +961,14 @@ class TkinterROS(Node):
         try:
             response = future.result()
             if response.success:
-                self.update_gui(success_msg)
+                message = success_msg
             else:
-                self.update_gui(failure_msg + f": {response.message}")
+                message = failure_msg + f": {response.message}"
         except Exception as e:
-            self.update_gui(f"Service call failed: {str(e)}")
+            message = f"Service call failed: {str(e)}"
+        
+        # 🟢 Schedule GUI update safely in main thread:
+        self.gui_queue.put(lambda: self.update_gui(message))
 
     def update_gui(self, message):
         self.status_label.config(text=message)
