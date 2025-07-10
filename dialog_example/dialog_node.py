@@ -23,6 +23,8 @@ import re
 import json
 import debugpy
 import os
+from geometry_msgs.msg import Point
+
 import tf_transformations
 from std_srvs.srv import SetBool
 import yaml
@@ -34,7 +36,6 @@ from rclpy.time import Time
 
 class TkinterROS(Node):
     counter = 0
-    
 
     def __init__(self):
         super().__init__('tkinter_ros_node')
@@ -54,17 +55,17 @@ class TkinterROS(Node):
         self.ema_alpha = 0.2  # default filter constant
         self.calib_dir = pathlib.Path(os.path.expanduser('~/.ros2/easy_handeye2/calibrations'))
         self.calib_path = self.calib_dir / 'ar4_calibration.calib'
-        self.publisher = self.create_publisher(String, '/ar4_hardware_interface_node/homing_string', 10)
-        # self.create_subscription(Point, '/aruco_pose', self.aruco_pose_callback, 10)
+        # self.publisher = self.create_publisher(String, '/ar4_hardware_interface_node/homing_string', 10)
+        self.create_subscription(Point, '/aruco_pose', self.aruco_pose_callback, 10)
         self.create_subscription(JointState, '/joint_states', self.joint_states_callback, 10)
         
         # Subscriber to aruco_poses topic
-        self.create_subscription(
-            PoseArray,
-            '/aruco_poses',
-            self.aruco_pose_callback,
-            qos_profile_sensor_data,
-        )
+        # self.create_subscription(
+        #     PoseArray,
+        #     '/aruco_poses',
+        #     self.aruco_pose_callback,
+        #     qos_profile_sensor_data,
+        # )
 
         self.get_logger().info('ArucoPoseFollower initialized, listening to /aruco_poses')
 
@@ -87,7 +88,7 @@ class TkinterROS(Node):
 
         # self.init_moveit()
         self.init_right_frame()
-        self.periodic_status_check()
+        # self.periodic_status_check()
         self.aruco_follower_enabled_client = self.create_client(SetBool, '/set_aruco_follower_enabled')
         
 
@@ -179,7 +180,7 @@ class TkinterROS(Node):
         self.add_adjustment_frame()
 
         self.update_position_label()
-        self.root.after(100, self.tk_mainloop)
+        # self.root.after(100, self.tk_mainloop)
 
 
 
@@ -289,7 +290,7 @@ class TkinterROS(Node):
         )
         self.copy_aruco_button.pack(pady=5)
         self.joint_states_var = tk.StringVar()
-        self.joint_states_entry = tk.Text(self.right_frame, font=("Courier", 10), width=21, height=10)
+        self.joint_states_entry = tk.Text(self.right_frame, font=("Courier", 10), width=30, height=10)
         self.joint_states_entry.pack(pady=10)
 
         tk.Radiobutton(self.right_frame, text="Calibration", variable=self.mode_var, value="Calibration",
@@ -315,10 +316,15 @@ class TkinterROS(Node):
             self.get_logger().error("Service call failed")
 
     def update_status_label(self):
+        self.gui_queue.put(lambda: self._update_status_label())
+        # self.root.after(0, self.process_gui_queue)
+
+    def _update_status_label(self):
         if self.arm_is_moving == True:
             self.status_label.config(text="Arm Is Moving", fg="red")
         else:
             self.status_label.config(text="Waiting", fg="black")
+        self.update_gui_once()
 
     def periodic_status_check(self):
         self.update_status_label()
@@ -516,44 +522,108 @@ class TkinterROS(Node):
         self.status_label.config(text=f"Calibration adjusted by dx={-dx:+.3f}, dy={-dy:+.3f}")
 
     def joint_states_callback(self, msg):
-
-        if self.arm_is_moving == True:
+        if self.arm_is_moving:
             self.zero_velocity_positions = None
             return
-        
-        now = self.get_clock().now()
-        if (now - self.last_joint_update_time).nanoseconds < 1e9:
-            return  # Skip if less than 1 second since last update
-        self.last_joint_update_time = now
+
+        now = time.time()
+        if now - getattr(self, "_last_joint_update_gui", 0) < 1.0:
+            return
+        self._last_joint_update_gui = now
 
         try:
-            # Check if all joint velocities are near zero
-            all_zero_velocities = all(abs(v) < 1e-5 for v in msg.velocity)
-
-            if all_zero_velocities:
+            # --- zero‐velocity check (unchanged) ---
+            all_zero = all(abs(v) < 1e-5 for v in msg.velocity)
+            if all_zero:
                 if self.zero_velocity_positions is None:
-                    # Save current positions for comparison later
                     self.zero_velocity_positions = list(msg.position)
                 else:
-                    # Compare current positions with previously saved positions
-                    for i, (new_pos, ref_pos) in enumerate(zip(msg.position, self.zero_velocity_positions)):
-                        if abs(new_pos - ref_pos) > 0.1:  # Tolerance in radians
+                    for i, (new, old) in enumerate(zip(msg.position, self.zero_velocity_positions)):
+                        if abs(new - old) > 0.1:
                             self.get_logger().error(
-                                f"Unintended motion detected on joint {i}: "
-                                f"saved={ref_pos:.4f}, current={new_pos:.4f}, delta={abs(new_pos - ref_pos):.5f}"
+                                f"Unintended motion on joint {i}: saved={old:.4f}, now={new:.4f}"
                             )
-                            messagebox.showinfo("Info", "Encoder error: unintended movement with zero velocity reported.")
+                            messagebox.showinfo(
+                                "Info", "Encoder error: unintended movement detected."
+                            )
             else:
-                # If robot is moving, clear saved reference
                 self.zero_velocity_positions = None
 
-            # UI update
-            joint_info = "\n".join([f"{pos:.4f}," for pos in msg.position])
+            # --- build base‐frame axes for each joint ---
+            qs = msg.position  # six joint angles in radians
+
+            # rotation primitives (sxyz = roll/pitch/yaw conventions)
+            def Rz(q): return transforms3d.euler.euler2mat(0, 0, q, axes='sxyz')
+            def Ry(q): return transforms3d.euler.euler2mat(0, q, 0, axes='sxyz')
+            def Rx(q): return transforms3d.euler.euler2mat(q, 0, 0, axes='sxyz')
+
+            R0_1 = Rz(qs[0])
+            R0_2 = R0_1.dot(Ry(qs[1]))
+            R0_3 = R0_2.dot(Ry(qs[2]))
+            R0_4 = R0_3.dot(Rx(qs[3]))
+            R0_5 = R0_4.dot(Ry(qs[4]))
+            # R0_6 = R0_5.dot(Rx(qs[5]))  # only needed if you want 6th‐frame axes
+
+            # each joint's rotation axis in its local frame
+            local_axes = [
+                np.array([0, 0, 1]),  # J1 about Z
+                np.array([0, 1, 0]),  # J2 about Y
+                np.array([0, 1, 0]),  # J3 about Y
+                np.array([1, 0, 0]),  # J4 about X
+                np.array([0, 1, 0]),  # J5 about Y
+                np.array([1, 0, 0]),  # J6 about X
+            ]
+
+            # transform each into the base frame
+            abs_axes = [
+                R0_1.dot(local_axes[0]),
+                R0_1.dot(local_axes[1]),
+                R0_2.dot(local_axes[2]),
+                R0_3.dot(local_axes[3]),
+                R0_4.dot(local_axes[4]),
+                R0_5.dot(local_axes[5]),
+            ]
+
+            # --- absolute tilt from horizontal table (for each joint) ---
+            z = np.array([0, 0, 1])
+            abs_tilts = []
+            for a in abs_axes:
+                cos_vert = np.clip(abs(a.dot(z)), -1.0, 1.0)
+                angle_to_vert = np.arccos(cos_vert)
+                tilt = np.pi/2 - angle_to_vert
+                abs_tilts.append(np.degrees(tilt))
+
+            # --- relative angle between successive axes ---
+            rel_angles = []
+            for i in range(len(abs_axes) - 1):
+                a = abs_axes[i] / np.linalg.norm(abs_axes[i])
+                b = abs_axes[i + 1] / np.linalg.norm(abs_axes[i + 1])
+                cosab = np.clip(a.dot(b), -1.0, 1.0)
+                angle = np.degrees(np.arccos(cosab))
+                rel_angles.append(angle)
+
+            # --- format all into lines for GUI ---
+            names = ["J1","J2","J3","J4","J5","J6"]
+            lines = []
+            for i, q in enumerate(qs):
+                line = f"{names[i]}: {q:.4f} rad   tilt: {abs_tilts[i]:.1f}°"
+                if i < len(rel_angles):
+                    # show angle to the *next* joint
+                    line += f"   ↝ {names[i+1]}: {rel_angles[i]:.1f}°"
+                lines.append(line)
+
+            joint_info = "\n".join(lines)
             self.gui_queue.put(lambda: self.update_joint_states_gui(joint_info))
-            
 
         except Exception as e:
             self.get_logger().error(f"Error in joint_states_callback: {e}")
+
+
+    def update_joint_states_gui(self, text):
+        self.joint_states_entry.configure(state='normal')
+        self.joint_states_entry.delete("1.0", tk.END)
+        self.joint_states_entry.insert(tk.END, text)
+        self.joint_states_entry.configure(state='disabled')
 
 
 
@@ -597,6 +667,7 @@ class TkinterROS(Node):
 
         def _on_response(fut):
             self.arm_is_moving = False
+            self.update_status_label()
             try:
                 result_container['result'] = fut.result()
                 self.get_logger().info(f"Service call ended, result: {result_container['result']}")
@@ -605,12 +676,17 @@ class TkinterROS(Node):
             finally:
                 done_event.set()
 
+        self._update_status_label()
+        self.update_gui_once()
         future.add_done_callback(_on_response)
 
         if not done_event.wait(timeout=timeout_sec):
             self.get_logger().error("Service call timed out")
             return None
 
+        self._update_status_label()
+        self.update_gui_once()
+        
         return result_container['result']
 
 
@@ -640,7 +716,7 @@ class TkinterROS(Node):
                     self.pos_text.insert(tk.END, new_text)
                     self.pos_text.configure(state='disabled')
 
-        self.root.after(500, self.update_position_label)
+        self.root.after(1000, self.update_position_label)
 
 
     def spin_once(self):
@@ -673,6 +749,7 @@ class TkinterROS(Node):
 
 
     def aruco_pose_callback(self, msg: PoseArray):
+        # return
         if not msg.poses:
             self.get_logger().warn('Received empty PoseArray, skipping.')
             return
@@ -829,6 +906,7 @@ class TkinterROS(Node):
 
     def send_move_request(self, pose, is_cartesian=True):
         self.arm_is_moving = True
+        self.update_status_label()
         # pose_goal = PoseStamped() 
         # pose_goal.header.frame_id = "base_link"
         # pose_goal.pose = Pose(position = pose.position, orientation = pose.orientation)
@@ -837,10 +915,6 @@ class TkinterROS(Node):
 
         request = self.get_move_request(pose, is_cartesian=is_cartesian)
         # Send the request
-
-        def _done_moving(fut):
-            print("[DEBUG] service done callback triggered")
-            self.arm_is_moving = False
 
 
         response = self.call_service_blocking(self.move_arm_client, request,timeout_sec=8.0)
@@ -958,6 +1032,7 @@ class TkinterROS(Node):
         future.add_done_callback(lambda f: self.handle_service_response(f, success_msg, failure_msg))
 
     def handle_service_response(self, future, success_msg, failure_msg):
+        return
         try:
             response = future.result()
             if response.success:
@@ -973,10 +1048,23 @@ class TkinterROS(Node):
     def update_gui(self, message):
         self.status_label.config(text=message)
 
+    # def tk_mainloop(self):
+    #     self.root.update_idletasks()
+    #     self.root.update()
+    #     self.root.after(100, self.tk_mainloop)
     def tk_mainloop(self):
-        self.root.update_idletasks()
-        self.root.update()
-        self.root.after(100, self.tk_mainloop)
+        try:
+            self.root.update_idletasks()
+            self.root.update()
+        except tk.TclError:
+            # This means the window was closed
+            self.get_logger().info("Tkinter window closed. Shutting down.")
+            return
+
+        # Schedule this method again
+        self.root.after(20, self.tk_mainloop)
+
+
 
     def on_shutdown(self):
         self.root.quit()
@@ -1042,46 +1130,56 @@ class TkinterROS(Node):
         with open(filepath, 'w') as f:
             yaml.dump(data, f, sort_keys=False)
 
+    def update_gui_once(self):
+            self.root.update_idletasks()
+            self.root.update()
+            time.sleep(0.01)
 
 #def ros_spin(tkinter_ros):
 def ros_spin_executor(executor): # New
-    try:
-        #rclpy.spin(tkinter_ros)
-        executor.spin()
-    except Exception as e:
-        #tkinter_ros.get_logger().error(f"Error in ROS spin loop: {e}")
-        print(f"Error in ROS executor spin loop: {e}")
+    while rclpy.ok():
+        # process any ready ROS callbacks, then give the GIL back
+        executor.spin_once(timeout_sec=0.01)
+        time.sleep(0.005)
 
 
 
 def main(): 
-    # debugpy.listen(("localhost", 5678))  # Port for debugger to connect
-    # print("Waiting for debugger to attach...")
-    # debugpy.wait_for_client()  # Ensures the debugger connects before continuing
-    # print("Debugger connected.")
+    debugpy.listen(("localhost", 5678))  # Port for debugger to connect
+    print("Waiting for debugger to attach...")
+    debugpy.wait_for_client()
+    print("Debugger connected.")
    
-    rclpy.init() 
+    rclpy.init()
 
+    # Create GUI + ROS2 app
     tkinter_ros = TkinterROS()
     
-    executor = MultiThreadedExecutor()
+    # Start ROS executor in background
+    executor = MultiThreadedExecutor(3)
     executor.add_node(tkinter_ros)
-
-    # Start ROS spinning in a separate thread
-    #ros_thread = threading.Thread(target=ros_spin, args=(tkinter_ros,))
-    ros_thread = threading.Thread(target=ros_spin_executor, args=(executor,)) # New
+    ros_thread = threading.Thread(target=ros_spin_executor, args=(executor,))
     ros_thread.start()
+    
+    while True:
+        try:
+            tkinter_ros.update_gui_once()
+        except tk.TclError:
+            # This means the window was closed
+            tkinter_ros.get_logger().info("Tkinter window closed. Shutting down.")
+    
+    
 
+    # Run Tkinter's custom main loop in the foreground
     try:
-        # Run Tkinter main loop in the main thread
-        tkinter_ros.root.mainloop()
-
+        while True:
+            time.sleep(0.001)  # just keep the process alive
     except KeyboardInterrupt:
         pass
+    finally:
+        tkinter_ros.destroy_node()
+        rclpy.shutdown()
 
-    # Gracefully shutdown
-    tkinter_ros.destroy_node()
-    rclpy.shutdown()
 
 if __name__ == '__main__':
     main()
