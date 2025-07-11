@@ -522,101 +522,44 @@ class TkinterROS(Node):
         self.status_label.config(text=f"Calibration adjusted by dx={-dx:+.3f}, dy={-dy:+.3f}")
 
     def joint_states_callback(self, msg):
-        if self.arm_is_moving:
-            self.zero_velocity_positions = None
-            return
 
-        now = time.time()
-        if now - getattr(self, "_last_joint_update_gui", 0) < 1.0:
-            return
-        self._last_joint_update_gui = now
-
-        try:
-            # --- zero‐velocity check (unchanged) ---
-            all_zero = all(abs(v) < 1e-5 for v in msg.velocity)
-            if all_zero:
-                if self.zero_velocity_positions is None:
-                    self.zero_velocity_positions = list(msg.position)
-                else:
-                    for i, (new, old) in enumerate(zip(msg.position, self.zero_velocity_positions)):
-                        if abs(new - old) > 0.1:
-                            self.get_logger().error(
-                                f"Unintended motion on joint {i}: saved={old:.4f}, now={new:.4f}"
-                            )
-                            messagebox.showinfo(
-                                "Info", "Encoder error: unintended movement detected."
-                            )
-            else:
+            if self.arm_is_moving == True:
                 self.zero_velocity_positions = None
+                return
+            
+            now = time.time()
+            if now - getattr(self, "_last_joint_update_gui", 0) < 0.5:
+                return
+            self._last_joint_update_gui = now
 
-            # --- build base‐frame axes for each joint ---
-            qs = msg.position  # six joint angles in radians
+            try:
+                # Check if all joint velocities are near zero
+                all_zero_velocities = all(abs(v) < 1e-5 for v in msg.velocity)
 
-            # rotation primitives (sxyz = roll/pitch/yaw conventions)
-            def Rz(q): return transforms3d.euler.euler2mat(0, 0, q, axes='sxyz')
-            def Ry(q): return transforms3d.euler.euler2mat(0, q, 0, axes='sxyz')
-            def Rx(q): return transforms3d.euler.euler2mat(q, 0, 0, axes='sxyz')
+                if all_zero_velocities:
+                    if self.zero_velocity_positions is None:
+                        # Save current positions for comparison later
+                        self.zero_velocity_positions = list(msg.position)
+                    else:
+                        # Compare current positions with previously saved positions
+                        for i, (new_pos, ref_pos) in enumerate(zip(msg.position, self.zero_velocity_positions)):
+                            if abs(new_pos - ref_pos) > 0.1:  # Tolerance in radians
+                                self.get_logger().error(
+                                    f"Unintended motion detected on joint {i}: "
+                                    f"saved={ref_pos:.4f}, current={new_pos:.4f}, delta={abs(new_pos - ref_pos):.5f}"
+                                )
+                                messagebox.showinfo("Info", "Encoder error: unintended movement with zero velocity reported.")
+                else:
+                    # If robot is moving, clear saved reference
+                    self.zero_velocity_positions = None
 
-            R0_1 = Rz(qs[0])
-            R0_2 = R0_1.dot(Ry(qs[1]))
-            R0_3 = R0_2.dot(Ry(qs[2]))
-            R0_4 = R0_3.dot(Rx(qs[3]))
-            R0_5 = R0_4.dot(Ry(qs[4]))
-            # R0_6 = R0_5.dot(Rx(qs[5]))  # only needed if you want 6th‐frame axes
+                # UI update
+                joint_info = "\n".join([f"{pos:.4f}," for pos in msg.position])
+                self.gui_queue.put(lambda: self.update_joint_states_gui(joint_info))
+                
 
-            # each joint's rotation axis in its local frame
-            local_axes = [
-                np.array([0, 0, 1]),  # J1 about Z
-                np.array([0, 1, 0]),  # J2 about Y
-                np.array([0, 1, 0]),  # J3 about Y
-                np.array([1, 0, 0]),  # J4 about X
-                np.array([0, 1, 0]),  # J5 about Y
-                np.array([1, 0, 0]),  # J6 about X
-            ]
-
-            # transform each into the base frame
-            abs_axes = [
-                R0_1.dot(local_axes[0]),
-                R0_1.dot(local_axes[1]),
-                R0_2.dot(local_axes[2]),
-                R0_3.dot(local_axes[3]),
-                R0_4.dot(local_axes[4]),
-                R0_5.dot(local_axes[5]),
-            ]
-
-            # --- absolute tilt from horizontal table (for each joint) ---
-            z = np.array([0, 0, 1])
-            abs_tilts = []
-            for a in abs_axes:
-                cos_vert = np.clip(abs(a.dot(z)), -1.0, 1.0)
-                angle_to_vert = np.arccos(cos_vert)
-                tilt = np.pi/2 - angle_to_vert
-                abs_tilts.append(np.degrees(tilt))
-
-            # --- relative angle between successive axes ---
-            rel_angles = []
-            for i in range(len(abs_axes) - 1):
-                a = abs_axes[i] / np.linalg.norm(abs_axes[i])
-                b = abs_axes[i + 1] / np.linalg.norm(abs_axes[i + 1])
-                cosab = np.clip(a.dot(b), -1.0, 1.0)
-                angle = np.degrees(np.arccos(cosab))
-                rel_angles.append(angle)
-
-            # --- format all into lines for GUI ---
-            names = ["J1","J2","J3","J4","J5","J6"]
-            lines = []
-            for i, q in enumerate(qs):
-                line = f"{names[i]}: {q:.4f} rad   tilt: {abs_tilts[i]:.1f}°"
-                if i < len(rel_angles):
-                    # show angle to the *next* joint
-                    line += f"   ↝ {names[i+1]}: {rel_angles[i]:.1f}°"
-                lines.append(line)
-
-            joint_info = "\n".join(lines)
-            self.gui_queue.put(lambda: self.update_joint_states_gui(joint_info))
-
-        except Exception as e:
-            self.get_logger().error(f"Error in joint_states_callback: {e}")
+            except Exception as e:
+                self.get_logger().error(f"Error in joint_states_callback: {e}")
 
 
     def update_joint_states_gui(self, text):
@@ -1145,10 +1088,10 @@ def ros_spin_executor(executor): # New
 
 
 def main(): 
-    debugpy.listen(("localhost", 5678))  # Port for debugger to connect
-    print("Waiting for debugger to attach...")
-    debugpy.wait_for_client()
-    print("Debugger connected.")
+    # debugpy.listen(("localhost", 5678))  # Port for debugger to connect
+    # print("Waiting for debugger to attach...")
+    # debugpy.wait_for_client()
+    # print("Debugger connected.")
    
     rclpy.init()
 
