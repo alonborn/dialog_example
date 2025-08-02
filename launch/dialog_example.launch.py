@@ -4,6 +4,8 @@ from launch.actions import IncludeLaunchDescription, DeclareLaunchArgument
 from launch.launch_description_sources import PythonLaunchDescriptionSource
 from launch.substitutions import LaunchConfiguration
 from launch.conditions import IfCondition
+from launch.substitutions import ThisLaunchFileDir
+from launch.actions import ExecuteProcess
 from ament_index_python.packages import get_package_share_directory
 import os
 
@@ -47,10 +49,20 @@ def generate_launch_description():
         condition=IfCondition(use_handeye_publisher),
     )
 
+    inferences_node = ExecuteProcess(
+        cmd=[
+            '/home/alon/venv/bin/python',
+            '-m', 'detector.inferences'
+        ],
+        name='brick_inference_node',
+        output='screen'
+    )
+
     return LaunchDescription([
         use_handeye_publisher_arg,
         dialog_node,
         move_ar_node,
         aruco_node,
         hand_eye_tf_publisher,
+        inferences_node
     ])

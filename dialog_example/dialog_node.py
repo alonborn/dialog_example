@@ -24,7 +24,8 @@ import json
 import debugpy
 import os
 from geometry_msgs.msg import Point
-
+from geometry_msgs.msg import Point
+from std_msgs.msg import Float32MultiArray
 import tf_transformations
 from std_srvs.srv import SetBool
 import yaml
@@ -33,6 +34,8 @@ from rclpy.qos import qos_profile_sensor_data
 from geometry_msgs.msg import PoseArray, Pose
 import time
 from rclpy.time import Time
+import datetime
+
 
 class TkinterROS(Node):
     counter = 0
@@ -47,6 +50,7 @@ class TkinterROS(Node):
         self.pose_in_camera = None
         self.arm_is_moving = False
         self.init_cal_poses()
+        self.initial_marker_pose_base = None
 
         self.last_joint_update_time = self.get_clock().now()
         self.marker_index = 0
@@ -56,9 +60,8 @@ class TkinterROS(Node):
         self.calib_dir = pathlib.Path(os.path.expanduser('~/.ros2/easy_handeye2/calibrations'))
         self.calib_path = self.calib_dir / 'ar4_calibration.calib'
         # self.publisher = self.create_publisher(String, '/ar4_hardware_interface_node/homing_string', 10)
-        self.create_subscription(Point, '/aruco_pose', self.aruco_pose_callback, 10)
-        self.create_subscription(JointState, '/joint_states', self.joint_states_callback, 10)
-        
+        self.create_subscription(PoseArray, '/aruco_poses', self.aruco_pose_callback, 10)
+
         # Subscriber to aruco_poses topic
         # self.create_subscription(
         #     PoseArray,
@@ -66,6 +69,18 @@ class TkinterROS(Node):
         #     self.aruco_pose_callback,
         #     qos_profile_sensor_data,
         # )
+
+        self.create_subscription(JointState, '/joint_states', self.joint_states_callback, 10)
+        
+        self.brick_info_sub = self.create_subscription(
+            Float32MultiArray,
+            '/brick_info_array',
+            self.brick_info_callback,
+            10
+        )
+        self.latest_brick_center = None  # store camera-frame center
+        self.latest_brick_yaw = None
+
 
         self.get_logger().info('ArucoPoseFollower initialized, listening to /aruco_poses')
 
@@ -91,7 +106,14 @@ class TkinterROS(Node):
         # self.periodic_status_check()
         self.aruco_follower_enabled_client = self.create_client(SetBool, '/set_aruco_follower_enabled')
         
-
+    def brick_info_callback(self, msg):
+        if len(msg.data) == 4:
+            self.latest_brick_center = tuple(msg.data[0:3])
+            self.latest_brick_yaw = msg.data[3]
+            # self.get_logger().info(f"Received brick center: {self.latest_brick_center}, yaw: {self.latest_brick_yaw:.2f}")
+        else:
+            self.get_logger().warn("Received unexpected brick info format.")
+            
     def process_gui_queue(self):
         while not self.gui_queue.empty():
             task = self.gui_queue.get()
@@ -101,7 +123,7 @@ class TkinterROS(Node):
     def init_dialog(self):
         self.root = tk.Tk()
         self.root.title("Tkinter and ROS 2")
-        self.root.geometry("1000x600")
+        self.root.geometry("1200x600")
         self.mode_var = tk.StringVar(value="Calibration")
         self.cartesian_var = tk.BooleanVar(value=True)
         self.main_frame = tk.Frame(self.root)
@@ -175,12 +197,119 @@ class TkinterROS(Node):
         self.auto_adjust_button = tk.Button(self.sample_frame,text="Move To Marker",command=self.move_to_marker, font=("Arial", 10), width=12, height=1)
         self.auto_adjust_button.grid(row=0, column=2, padx=5)
 
+        self.brick_center_button = tk.Button(self.sample_frame,text="Move to Brick",command=self.on_use_brick_center_click,font=("Arial", 10),width=12,height=1)
+        self.brick_center_button.grid(row=0, column=3, padx=5)
+
+
+        self.auto_align_button = tk.Button(self.sample_frame,text="Auto Calib",command=self.on_auto_calibrate_button_click,font=("Arial", 10),width=12,height=1)
+        self.auto_align_button.grid(row=0, column=4, padx=5)
+
+
         self.add_pose_adjustment_controls()
         # Translation adjustment controls
         self.add_adjustment_frame()
 
         self.update_position_label()
         # self.root.after(100, self.tk_mainloop)
+        
+    def on_auto_calibrate_button_click(self):
+        if self.pose_in_camera is None:
+            messagebox.showwarning("No Marker", "No ArUco marker pose available.")
+            return
+
+        # Convert pose from camera to base_link
+        try:
+            marker_pose_base = self._transform_pose(
+                self.pose_in_camera,
+                source_frame="camera_color_optical_frame",
+                target_frame="base_link"
+            )
+        except Exception as e:
+            self.get_logger().error(f"Failed to transform marker pose: {e}")
+            messagebox.showerror("Transform Error", "Could not transform marker pose to base_link.")
+            return
+
+        # If first press: save and wait for second press
+        if self.initial_marker_pose_base is None:
+            self.initial_marker_pose_base = marker_pose_base
+            self.status_label.config(text="Marker pose saved. Now move the marker under the arm and press again.")
+            return
+
+        # Second press: compute delta and correct calibration
+        dx = marker_pose_base.position.x - self.initial_marker_pose_base.position.x
+        dy = marker_pose_base.position.y - self.initial_marker_pose_base.position.y
+
+        self.get_logger().info(f"[Auto Calib] Marker moved: dx={dx:.4f}, dy={dy:.4f}")
+
+        # Load current calibration
+        translation, rotation = self.read_calibration_file(self.calib_path)
+
+        # Apply correction (camera moved dx, so base->camera should be corrected -dx)
+        translation['x'] -= dx
+        translation['y'] -= dy
+
+        self.update_calibration_file(self.calib_path, translation, rotation)
+        self.trigger_update_calib_file()
+
+        self.status_label.config(text=f"Calibration adjusted by Δx={-dx:+.3f}, Δy={-dy:+.3f}")
+        self.initial_marker_pose_base = None  # reset for next use
+
+
+
+    def on_use_brick_center_click(self):
+        if self.latest_brick_center is None:
+            messagebox.showwarning("No Brick Info", "No brick info received yet.")
+            return
+
+        x, y, z = self.latest_brick_center
+        yaw = self.latest_brick_yaw
+
+        # Use fixed quaternion: yaw only
+        quat = tf_transformations.quaternion_from_euler(np.pi, 0, yaw)  # 180° flip around X + yaw
+
+        # Update GUI fields
+        translation_str = f"({x:.3f}, {y:.3f}, {z:.3f})"
+        rotation_str = f"({quat[0]:.4f}, {quat[1]:.4f}, {quat[2]:.4f}, {quat[3]:.4f})"
+
+        self.translation_entry.delete(0, tk.END)
+        self.translation_entry.insert(0, translation_str)
+
+        self.rotation_entry.delete(0, tk.END)
+        self.rotation_entry.insert(0, rotation_str)
+
+        self.status_label.config(text="Loaded brick center")
+
+        # === Build pose in camera frame ===
+        pose_in_camera = Pose()
+        pose_in_camera.position.x = x
+        pose_in_camera.position.y = y
+        pose_in_camera.position.z = z 
+
+        pose_in_camera.orientation.x = quat[0]
+        pose_in_camera.orientation.y = quat[1]
+        pose_in_camera.orientation.z = quat[2]
+        pose_in_camera.orientation.w = quat[3]
+
+        # === Transform to base_link ===
+        try:
+            transformed_pose = self._transform_pose(
+                pose=pose_in_camera,
+                source_frame="camera_color_optical_frame",
+                target_frame="base_link"
+            )
+            transformed_pose.position.z += 0.1  # Adjust height if needed
+            transformed_pose.orientation.x = 0.0
+            transformed_pose.orientation.y = 0.999
+            transformed_pose.orientation.z = 0.001
+            transformed_pose.orientation.w = 0.0  # Reset orientation to no rotation
+
+        except Exception as e:
+            self.get_logger().error(f"Failed to transform brick center pose: {e}")
+            messagebox.showerror("Transform Error", "Could not transform brick pose to base_link.")
+            return
+
+        # === Send move request ===
+        self.send_move_request(transformed_pose, is_cartesian=False)
 
 
 
@@ -236,6 +365,7 @@ class TkinterROS(Node):
         self.trigger_update_calib_file()
 
         self.status_label.config(text=f"{axis.upper()} adjusted by {delta:+.3f}")
+        self.move_to_marker()
 
     def adjust_calib_orientation(self, axis, direction):
         delta = direction * float(self.orientation_delta_entry.get())
@@ -709,7 +839,20 @@ class TkinterROS(Node):
         self.pose_in_camera = msg.poses[self.marker_index]
 
         # Display the camera-frame pose in the GUI
-        pose_text = f"({self.pose_in_camera.position.x:.2f}, {self.pose_in_camera.position.y:.2f}, {self.pose_in_camera.position.z:.2f})"
+
+        try:
+            transformed_pose = self._transform_pose(
+                self.pose_in_camera,
+                source_frame="camera_color_optical_frame",
+                target_frame="base_link"
+            )
+            p = transformed_pose.position
+            suffix = "(B)"
+        except Exception as e:
+            p = self.pose_in_camera.position
+            suffix = "(C)"
+        
+        pose_text = f"({p.x:.3f}, {p.y:.3f}, {p.z:.3f}) {suffix}"
         self.gui_queue.put(lambda: self.update_aruco_pose_gui(pose_text))
 
 
@@ -781,7 +924,8 @@ class TkinterROS(Node):
             can_transform = self.tf_buffer.can_transform(
                 target_frame,
                 source_frame,
-                now,
+                # now,
+                self.get_clock().now(),
                 timeout=rclpy.duration.Duration(seconds=1.0)
             )
             if not can_transform:
@@ -793,10 +937,10 @@ class TkinterROS(Node):
                 now,
                 timeout=rclpy.duration.Duration(seconds=1.0)
             )
-            self.get_logger().info(f"------------------------(4)Transform: {transform}")
+            # self.get_logger().info(f"------------------------(4)Transform: {transform}")
             # Transform the pose into target_frame
             transformed_pose = do_transform_pose(stamped_pose_in.pose, transform)
-            self.get_logger().info(f"------------------------(5)Transformed pose: {transformed_pose}")  
+            # self.get_logger().info(f"------------------------(5)Transformed pose: {transformed_pose}")  
             # Optional: publish for visualization if you defined publishers
             # if hasattr(self, 'pose_pub'):
             #     self.pose_pub.publish(transformed_stamped)
@@ -855,12 +999,19 @@ class TkinterROS(Node):
         # pose_goal.pose = Pose(position = pose.position, orientation = pose.orientation)
         pose = Pose(position = pose.position, orientation = pose.orientation)
         print ("starting to move")
+        
+        now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        motion_type = "Cartesian" if is_cartesian else "Joint-space"
+        if not (-0.5 <= pose.position.x <= 0.5 and -0.5 <= pose.position.y <= 0.6 and 0.03 <= pose.position.z <= 0.55):
+            print(f"[{now}] 🚫 Refused Motion: {motion_type} target out of bounds! Target: pos=({pose.position.x:.3f},{pose.position.y:.3f},{pose.position.z:.3f}) ori={pose.orientation}")
+            self.arm_is_moving = False
+            return False
 
         request = self.get_move_request(pose, is_cartesian=is_cartesian)
         # Send the request
 
 
-        response = self.call_service_blocking(self.move_arm_client, request,timeout_sec=8.0)
+        response = self.call_service_blocking(self.move_arm_client, request,timeout_sec=4448.0)
         print("Got response:", response)
         return response is not None
  
@@ -915,6 +1066,9 @@ class TkinterROS(Node):
             try:
                 translation_str = self.translation_entry.get()
                 rotation_str = self.rotation_entry.get()
+                
+                translation_str = translation_str.replace(" ", "")
+                rotation_str = rotation_str.replace(" ", "")
 
                 translation = tuple(float(x.strip()) for x in translation_str.strip('()').split(','))
                 rotation = tuple(float(x.strip()) for x in rotation_str.strip('()').split(','))
@@ -1041,7 +1195,7 @@ class TkinterROS(Node):
         
         return translation, rotation
 
-    def update_calibration_file(self,filepath, new_translation, new_rotation):
+    def update_calibration_file(self, filepath, new_translation, new_rotation):
         """
         Update the translation and rotation in a calibration file.
 
@@ -1050,26 +1204,31 @@ class TkinterROS(Node):
             new_translation (dict): Dictionary with keys 'x', 'y', 'z'.
             new_rotation (dict): Dictionary with keys 'x', 'y', 'z', 'w'.
         """
+        import numpy as np
+
+        def to_float(x):
+            return float(x) if isinstance(x, (np.integer, np.floating)) else x
+
         # Load existing calibration file
         with open(filepath, 'r') as f:
             data = yaml.safe_load(f)
 
-        # Update translation
+        # Update translation with safe casting
         data['transform']['translation'] = {
-            'x': new_translation['x'],
-            'y': new_translation['y'],
-            'z': new_translation['z'],
+            'x': to_float(new_translation['x']),
+            'y': to_float(new_translation['y']),
+            'z': to_float(new_translation['z']),
         }
 
-        # Update rotation
+        # Update rotation with safe casting
         data['transform']['rotation'] = {
-            'x': new_rotation['x'],
-            'y': new_rotation['y'],
-            'z': new_rotation['z'],
-            'w': new_rotation['w'],
+            'x': to_float(new_rotation['x']),
+            'y': to_float(new_rotation['y']),
+            'z': to_float(new_rotation['z']),
+            'w': to_float(new_rotation['w']),
         }
 
-        # Save updated calibration back to file
+        # Save updated calibration back to file with clean output
         with open(filepath, 'w') as f:
             yaml.dump(data, f, sort_keys=False)
 
@@ -1088,10 +1247,10 @@ def ros_spin_executor(executor): # New
 
 
 def main(): 
-    # debugpy.listen(("localhost", 5678))  # Port for debugger to connect
-    # print("Waiting for debugger to attach...")
-    # debugpy.wait_for_client()
-    # print("Debugger connected.")
+    debugpy.listen(("localhost", 5678))  # Port for debugger to connect
+    print("Waiting for debugger to attach...")
+    debugpy.wait_for_client()
+    print("Debugger connected.")
    
     rclpy.init()
 
