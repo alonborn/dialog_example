@@ -149,10 +149,6 @@ class TkinterROS(Node):
         self.validate_button = tk.Button(self.button_row, text="Go Home", command=self.on_go_home_button_click, font=("Arial", 14), width=10, height=1)
         self.validate_button.grid(row=0, column=2, padx=5)
 
-        self.joints_entry = tk.Entry(self.left_frame, font=("Arial", 14), width=10)
-        self.joints_entry.pack(pady=10)
-        self.joints_entry.insert(0, "000001")
-
         self.pos_text = tk.Text(self.left_frame, height=2, font=("Arial", 10), wrap="word", width=60)
         self.pos_text.pack(pady=10)
         self.pos_text.configure(state='disabled')
@@ -197,7 +193,9 @@ class TkinterROS(Node):
         self.auto_adjust_button = tk.Button(self.sample_frame,text="Move To Marker",command=self.move_to_marker, font=("Arial", 10), width=12, height=1)
         self.auto_adjust_button.grid(row=0, column=2, padx=5)
 
-        self.brick_center_button = tk.Button(self.sample_frame,text="Move to Brick",command=self.on_use_brick_center_click,font=("Arial", 10),width=12,height=1)
+        # self.brick_center_button = tk.Button(self.sample_frame,text="Move to Brick",command=self.on_use_brick_center_click,font=("Arial", 10),width=12,height=1)
+        self.brick_center_button = tk.Button(self.sample_frame,text="Move to Brick",command=self.refine_pose_with_ee_camera,font=("Arial", 10),width=12,height=1)
+        
         self.brick_center_button.grid(row=0, column=3, padx=5)
 
 
@@ -253,6 +251,55 @@ class TkinterROS(Node):
 
         self.status_label.config(text=f"Calibration adjusted by Δx={-dx:+.3f}, Δy={-dy:+.3f}")
         self.initial_marker_pose_base = None  # reset for next use
+
+    def refine_pose_with_ee_camera(self):
+        if self.latest_brick_center is None or self.latest_brick_yaw is None:
+            self.get_logger().warn("No brick info from end-effector camera.")
+            return
+
+        dx_cam, dy_cam, dz_cam = self.latest_brick_center
+        angle_deg = self.latest_brick_yaw
+
+        # Read current EE pose
+        ee_pose = self.get_current_ee_pose()
+        if ee_pose is None:
+            self.get_logger().error("Cannot read current end-effector pose.")
+            return
+
+        # Convert EE quaternion to rotation matrix
+        quat = [
+            ee_pose.orientation.x,
+            ee_pose.orientation.y,
+            ee_pose.orientation.z,
+            ee_pose.orientation.w,
+        ]
+        R = tf_transformations.quaternion_matrix(quat)[0:3, 0:3]  # 3x3 rotation matrix
+
+        # Transform dx,dy from camera frame to base frame
+        offset_cam = np.array([dx_cam, dy_cam, 0.0])  # offset in camera (EE) frame
+        offset_base = R @ offset_cam  # rotate into base frame
+
+        # Build corrected pose
+        corrected_pose = Pose()
+        corrected_pose.position.x = ee_pose.position.x + offset_base[0]
+        corrected_pose.position.y = ee_pose.position.y + offset_base[1]
+        # corrected_pose.position.z = ee_pose.position.z + offset_base[2]  # typically 0, but included for completeness
+        corrected_pose.position.z = ee_pose.position.z   # typically 0, but included for completeness
+
+        # Apply yaw from camera and flip 180° around X
+        yaw_rad = np.radians(angle_deg)
+        x_flip = tf_transformations.quaternion_from_euler(np.pi, 0, 0)
+        yaw_only = tf_transformations.quaternion_from_euler(0, 0, yaw_rad)
+        final_quat = tf_transformations.quaternion_multiply(x_flip, yaw_only)
+
+        corrected_pose.orientation.x = final_quat[0]
+        corrected_pose.orientation.y = final_quat[1]
+        corrected_pose.orientation.z = final_quat[2]
+        corrected_pose.orientation.w = final_quat[3]
+
+        self.get_logger().info("Refining pose with transformed EE camera offsets.")
+        self.send_move_request(corrected_pose, is_cartesian=False)
+
 
 
 
@@ -310,6 +357,10 @@ class TkinterROS(Node):
 
         # === Send move request ===
         self.send_move_request(transformed_pose, is_cartesian=False)
+
+        # Now do the fine adjustment using EE camera
+        self.get_logger().info("Initial move done. Refining using EE camera...")
+        self.root.after(500, self.refine_pose_with_ee_camera)
 
 
 
@@ -1247,10 +1298,10 @@ def ros_spin_executor(executor): # New
 
 
 def main(): 
-    debugpy.listen(("localhost", 5678))  # Port for debugger to connect
-    print("Waiting for debugger to attach...")
-    debugpy.wait_for_client()
-    print("Debugger connected.")
+    # debugpy.listen(("localhost", 5678))  # Port for debugger to connect
+    # print("Waiting for debugger to attach...")
+    # debugpy.wait_for_client()
+    # print("Debugger connected.")
    
     rclpy.init()
 

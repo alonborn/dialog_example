@@ -30,6 +30,13 @@ def generate_launch_description():
         output='screen'
     )
 
+    arm_cam_publisher = Node(
+        package='dialog_example',
+        executable='ov5640_publisher',
+        name='ov5640_publisher_gui',
+        output='screen'
+    )
+
     move_ar_node = Node(
         package='ar_utils',
         executable='move_ar',
@@ -61,6 +68,7 @@ def generate_launch_description():
     return LaunchDescription([
         use_handeye_publisher_arg,
         dialog_node,
+        arm_cam_publisher,
         move_ar_node,
         aruco_node,
         hand_eye_tf_publisher,
