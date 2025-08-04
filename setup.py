@@ -25,6 +25,7 @@ setup(
     entry_points={
         'console_scripts': [
             'dialog_node = dialog_example.dialog_node:main',  # Correct entry point for your script
+            'ov5640_publisher = dialog_example.ov5640_publisher:main',
         ],
 }
 )

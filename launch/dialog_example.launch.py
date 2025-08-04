@@ -30,9 +30,12 @@ def generate_launch_description():
         output='screen'
     )
 
-    arm_cam_publisher = Node(
-        package='dialog_example',
-        executable='ov5640_publisher',
+    # Run ov5640_publisher with venv Python
+    arm_cam_publisher = ExecuteProcess(
+        cmd=[
+            '/home/alon/venv/bin/python',
+            '/home/alon/ros_ws/src/dialog_example/dialog_example/ov5640_publisher.py'
+        ],
         name='ov5640_publisher_gui',
         output='screen'
     )

@@ -1,3 +1,8 @@
+#!/home/alon/venv/bin/python
+
+import sys
+print(f"[DEBUG] Running with Python interpreter: {sys.executable}")
+
 import rclpy
 from rclpy.node import Node
 import cv2
@@ -18,7 +23,7 @@ class OV5640Publisher(Node):
         # ROS image publisher
         # self.publisher_ = self.create_publisher(Image, 'camera/image_raw', 10)
         # self.pose_pub = self.create_publisher(Pose2D, 'brick_info', 10)
-        self.info_publisher = self.create_publisher(Float32MultiArray, 'brick_info', 10)
+        self.info_publisher = self.create_publisher(Float32MultiArray, 'brick_top_info', 10)
 
 
         self.timer = self.create_timer(0.1, self.timer_callback)  # 10 Hz

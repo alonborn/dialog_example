@@ -52,6 +52,11 @@ class TkinterROS(Node):
         self.init_cal_poses()
         self.initial_marker_pose_base = None
 
+        self.top_dx_mm = None
+        self.top_dy_mm = None
+        self.top_angle_deg = None
+        self.top_est_height_mm = None
+
         self.last_joint_update_time = self.get_clock().now()
         self.marker_index = 0
         self.last_pos = ""
@@ -77,6 +82,13 @@ class TkinterROS(Node):
             '/brick_info_array',
             self.brick_info_callback,
             10
+        )
+
+        self.create_subscription(
+            Float32MultiArray,           # Message type
+            'brick_top_info',            # Topic name
+            self.brick_top_info_callback,# Callback function
+            10                           # QoS
         )
         self.latest_brick_center = None  # store camera-frame center
         self.latest_brick_yaw = None
@@ -113,7 +125,27 @@ class TkinterROS(Node):
             # self.get_logger().info(f"Received brick center: {self.latest_brick_center}, yaw: {self.latest_brick_yaw:.2f}")
         else:
             self.get_logger().warn("Received unexpected brick info format.")
-            
+
+    def brick_top_info_callback(self, msg: Float32MultiArray):
+        """
+        Callback for receiving brick top info [dx_mm, dy_mm, angle_deg, est_height_mm].
+        """
+        if len(msg.data) != 4:
+            self.get_logger().warn(f"Received brick_top_info with unexpected length: {len(msg.data)}")
+            return
+
+        self.top_dx_mm, self.top_dy_mm, self.top_angle_deg, self.top_est_height_mm = msg.data
+        # self.get_logger().info(
+        #     f"Brick offset: dx={dx_mm:.1f} mm, dy={dy_mm:.1f} mm, "
+        #     f"angle={angle_deg:.1f}°, height={est_height_mm:.1f} mm"
+        # )
+
+        # Example: trigger an action when the brick is centered
+        # if abs(dx_mm) < 5 and abs(dy_mm) < 5:
+        #     self.get_logger().info("✅ Brick is centered within 5 mm!")
+
+
+
     def process_gui_queue(self):
         while not self.gui_queue.empty():
             task = self.gui_queue.get()
@@ -253,53 +285,87 @@ class TkinterROS(Node):
         self.initial_marker_pose_base = None  # reset for next use
 
     def refine_pose_with_ee_camera(self):
-        if self.latest_brick_center is None or self.latest_brick_yaw is None:
+        if None in (self.top_dx_mm, self.top_dy_mm, self.top_angle_deg, self.top_est_height_mm):
             self.get_logger().warn("No brick info from end-effector camera.")
             return
 
-        dx_cam, dy_cam, dz_cam = self.latest_brick_center
-        angle_deg = self.latest_brick_yaw
+        dx_cam = self.top_dx_mm / 1000.0
+        dy_cam = self.top_dy_mm / 1000.0
+        est_height_m = self.top_est_height_mm / 1000.0
+        brick_yaw_deg = self.top_angle_deg
 
-        # Read current EE pose
+        # Get current EE pose
         ee_pose = self.get_current_ee_pose()
         if ee_pose is None:
             self.get_logger().error("Cannot read current end-effector pose.")
             return
 
-        # Convert EE quaternion to rotation matrix
+        # Current yaw
         quat = [
             ee_pose.orientation.x,
             ee_pose.orientation.y,
             ee_pose.orientation.z,
             ee_pose.orientation.w,
         ]
-        R = tf_transformations.quaternion_matrix(quat)[0:3, 0:3]  # 3x3 rotation matrix
+        roll, pitch, yaw = tf_transformations.euler_from_quaternion(quat)
+        current_yaw_deg = np.degrees(yaw) % 360
 
-        # Transform dx,dy from camera frame to base frame
-        offset_cam = np.array([dx_cam, dy_cam, 0.0])  # offset in camera (EE) frame
-        offset_base = R @ offset_cam  # rotate into base frame
+        # --- Symmetry and shortest signed delta ---
+        brick_yaw_options = [brick_yaw_deg % 360, (brick_yaw_deg + 180) % 360]
+        best_target = min(brick_yaw_options,
+                        key=lambda a: min(abs(a - current_yaw_deg),
+                                            360 - abs(a - current_yaw_deg)))
+
+        # Get signed delta (-180, 180)
+        delta = (best_target - current_yaw_deg + 540) % 360 - 180
+
+        rotation_diff = abs(delta)
+        new_yaw_deg = (current_yaw_deg + delta) % 360
+
+        self.get_logger().info(
+            f"[EE Rotation] Current EE yaw: {current_yaw_deg:.2f}°, "
+            f"Detected brick yaw: {brick_yaw_deg:.2f}°, "
+            f"Chosen brick equiv yaw: {best_target:.2f}°, "
+            f"Signed delta: {delta:.2f}°, "
+            f"Target EE yaw: {new_yaw_deg:.2f}°, "
+            f"Rotation diff: {rotation_diff:.2f}°"
+        )
+
+        # Transform dx/dy to base frame
+        R = tf_transformations.quaternion_matrix(quat)[0:3, 0:3]
+        offset_base = R @ np.array([dx_cam, dy_cam, 0.0])
 
         # Build corrected pose
         corrected_pose = Pose()
         corrected_pose.position.x = ee_pose.position.x + offset_base[0]
         corrected_pose.position.y = ee_pose.position.y + offset_base[1]
-        # corrected_pose.position.z = ee_pose.position.z + offset_base[2]  # typically 0, but included for completeness
-        corrected_pose.position.z = ee_pose.position.z   # typically 0, but included for completeness
+        corrected_pose.position.z = ee_pose.position.z
 
-        # Apply yaw from camera and flip 180° around X
-        yaw_rad = np.radians(angle_deg)
-        x_flip = tf_transformations.quaternion_from_euler(np.pi, 0, 0)
-        yaw_only = tf_transformations.quaternion_from_euler(0, 0, yaw_rad)
-        final_quat = tf_transformations.quaternion_multiply(x_flip, yaw_only)
-
+        # Keep roll/pitch, update yaw to new_yaw_deg
+        yaw_rad = np.radians(new_yaw_deg)
+        final_quat = tf_transformations.quaternion_from_euler(roll, pitch, yaw_rad)
         corrected_pose.orientation.x = final_quat[0]
         corrected_pose.orientation.y = final_quat[1]
         corrected_pose.orientation.z = final_quat[2]
         corrected_pose.orientation.w = final_quat[3]
 
+        # Move
         self.get_logger().info("Refining pose with transformed EE camera offsets.")
         self.send_move_request(corrected_pose, is_cartesian=False)
 
+        # Read back final yaw
+        final_pose = self.get_current_ee_pose()
+        if final_pose:
+            _, _, final_yaw = tf_transformations.euler_from_quaternion([
+                final_pose.orientation.x,
+                final_pose.orientation.y,
+                final_pose.orientation.z,
+                final_pose.orientation.w,
+            ])
+            final_yaw_deg = np.degrees(final_yaw) % 360
+            self.get_logger().info(
+                f"[EE Rotation] Final EE yaw after motion: {final_yaw_deg:.2f}°"
+            )
 
 
 
@@ -1298,10 +1364,10 @@ def ros_spin_executor(executor): # New
 
 
 def main(): 
-    # debugpy.listen(("localhost", 5678))  # Port for debugger to connect
-    # print("Waiting for debugger to attach...")
-    # debugpy.wait_for_client()
-    # print("Debugger connected.")
+    debugpy.listen(("localhost", 5678))  # Port for debugger to connect
+    print("Waiting for debugger to attach...")
+    debugpy.wait_for_client()
+    print("Debugger connected.")
    
     rclpy.init()
 
