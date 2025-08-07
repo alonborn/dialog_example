@@ -181,9 +181,17 @@ class TkinterROS(Node):
         self.validate_button = tk.Button(self.button_row, text="Go Home", command=self.on_go_home_button_click, font=("Arial", 14), width=10, height=1)
         self.validate_button.grid(row=0, column=2, padx=5)
 
-        self.pos_text = tk.Text(self.left_frame, height=2, font=("Arial", 10), wrap="word", width=60)
-        self.pos_text.pack(pady=10)
-        self.pos_text.configure(state='disabled')
+        # --- Create a frame to hold the text and button side by side ---
+        self.pos_container = tk.Frame(self.left_frame)
+        self.pos_container.pack(pady=10)
+
+        # --- Add the Text widget to the container ---
+        self.pos_text = tk.Text(self.pos_container, height=2, font=("Arial", 10), wrap="word", width=60)
+        self.pos_text.pack(side=tk.LEFT)
+
+        # --- Add the Button to the right ---
+        self.copy_button = tk.Button(self.pos_container, text="Copy to entries", command=self.copy_pos_to_entries)
+        self.copy_button.pack(side=tk.LEFT, padx=5)
 
         self.pose_frame = tk.Frame(self.left_frame)
         self.pose_frame.pack(pady=(10))
@@ -226,7 +234,7 @@ class TkinterROS(Node):
         self.auto_adjust_button.grid(row=0, column=2, padx=5)
 
         # self.brick_center_button = tk.Button(self.sample_frame,text="Move to Brick",command=self.on_use_brick_center_click,font=("Arial", 10),width=12,height=1)
-        self.brick_center_button = tk.Button(self.sample_frame,text="Move to Brick",command=self.refine_pose_with_ee_camera,font=("Arial", 10),width=12,height=1)
+        self.brick_center_button = tk.Button(self.sample_frame,text="Move to Brick",command=self.move_to_brick_process,font=("Arial", 10),width=12,height=1)
         
         self.brick_center_button.grid(row=0, column=3, padx=5)
 
@@ -242,6 +250,46 @@ class TkinterROS(Node):
         self.update_position_label()
         # self.root.after(100, self.tk_mainloop)
         
+
+    def copy_pos_to_entries(self):
+        """
+        Parse the text from `self.pos_text`, extract position and orientation,
+        and update `self.translation_entry` and `self.rotation_entry`.
+        """
+        try:
+            # Get the text
+            text = self.pos_text.get("1.0", "end").strip()
+
+            # Use regex to extract position and orientation
+            import re
+            match = re.search(
+                r"pos\s*=\s*\((-?\d*\.?\d+),\s*(-?\d*\.?\d+),\s*(-?\d*\.?\d+)\)\s*ori\s*=\s*\((-?\d*\.?\d+),\s*(-?\d*\.?\d+),\s*(-?\d*\.?\d+),\s*(-?\d*\.?\d+)\)",
+                text
+            )
+
+            if not match:
+                self.get_logger().error("Failed to parse pose from pos_text")
+                return
+
+            # Extract groups
+            translation = tuple(match.groups()[0:3])
+            rotation = tuple(match.groups()[3:7])
+
+            # Format for entries
+            translation_str = f"({', '.join(translation)})"
+            rotation_str = f"({', '.join(rotation)})"
+
+            # Update entry fields
+            self.translation_entry.delete(0, "end")
+            self.translation_entry.insert(0, translation_str)
+
+            self.rotation_entry.delete(0, "end")
+            self.rotation_entry.insert(0, rotation_str)
+
+        except Exception as e:
+            self.get_logger().error(f"Error in copy_pos_to_entries: {e}")
+
+
     def on_auto_calibrate_button_click(self):
         if self.pose_in_camera is None:
             messagebox.showwarning("No Marker", "No ArUco marker pose available.")
@@ -283,6 +331,14 @@ class TkinterROS(Node):
 
         self.status_label.config(text=f"Calibration adjusted by Δx={-dx:+.3f}, Δy={-dy:+.3f}")
         self.initial_marker_pose_base = None  # reset for next use
+
+    def move_to_brick_process(self):
+        self.refine_pose_with_ee_camera()
+        # self.refine_pose_with_ee_camera()
+
+        self.move_to_height (0.17)
+        self.refine_pose_with_ee_camera()
+        self.move_to_height (0.12)
 
     def refine_pose_with_ee_camera(self):
         if None in (self.top_dx_mm, self.top_dy_mm, self.top_angle_deg, self.top_est_height_mm):
@@ -348,6 +404,24 @@ class TkinterROS(Node):
             self.get_logger().info(
                 f"[EE Rotation] Final EE yaw after motion: {final_yaw_deg:.2f}°"
             )
+            
+        if final_pose:
+            # Format and update the GUI entries with the final pose
+            pos = final_pose.position
+            ori = final_pose.orientation
+
+            # Format as tuples
+            pos_str = f"({pos.x:.3f}, {pos.y:.3f}, {pos.z:.3f})"
+            ori_str = f"({ori.x:.3f}, {ori.y:.3f}, {ori.z:.3f}, {ori.w:.3f})"
+
+            # Update GUI entries (on the main thread)
+            def update_entries():
+                self.translation_entry.delete(0, tk.END)
+                self.translation_entry.insert(0, pos_str)
+                self.rotation_entry.delete(0, tk.END)
+                self.rotation_entry.insert(0, ori_str)
+
+            self.gui_queue.put(update_entries)
 
 
 
@@ -1045,6 +1119,37 @@ class TkinterROS(Node):
             except Exception as e:
                 print(f"Error sending pose: {e}")
  
+
+    def move_to_height(self, height: float, is_cartesian: bool = True):
+        """
+        Move the robot to a specified height while preserving X, Y, and orientation.
+
+        Parameters:
+            height (float): Desired Z value in meters.
+            is_cartesian (bool): Whether to use Cartesian motion.
+        """
+        try:
+            # Get current pose
+            current_pose = self.get_current_ee_pose()
+
+            # Extract translation and rotation
+            x = current_pose.position.x
+            y = current_pose.position.y
+            translation = (x, y, height)
+
+            # Preserve current orientation
+            orientation = current_pose.orientation
+            rotation = (orientation.x, orientation.y, orientation.z, orientation.w)
+
+            # Create updated pose message
+            pose_msg = self.create_pose(translation, rotation)
+
+            # Send motion request
+            self.send_move_request(pose_msg, is_cartesian=is_cartesian)
+
+        except Exception as e:
+            self.get_logger().error(f"Failed to move to new height: {e}")
+
     def on_calibrate_button_click(self):
 
         # position = Pose()

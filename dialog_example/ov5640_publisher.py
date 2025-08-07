@@ -49,7 +49,29 @@ class OV5640Publisher(Node):
         # Load YOLOv8 OBB model
         model_path = "/home/alon/Documents/Projects/top_view_train/runs/obb/train8/weights/best.pt"
         self.model = YOLO(model_path)
+        self.handle_camera_calibration()
 
+    def handle_camera_calibration(self):
+        # === Load calibration data ===
+        calib_path = "/home/alon/ros_ws/src/dialog_example/dialog_example/camera_calibration.npz"
+        if not os.path.exists(calib_path):
+            self.get_logger().error(f"Calibration file not found: {calib_path}")
+            rclpy.shutdown()
+
+        data = np.load(calib_path)
+        self.K = data["K"]
+        self.dist = data["dist"]
+
+        # Precompute undistortion map
+        ret, frame = self.cap.read()
+        if not ret or frame is None:
+            self.get_logger().error("Failed to read initial frame")
+            rclpy.shutdown()
+
+        h, w = frame.shape[:2]
+        self.new_K, _ = cv2.getOptimalNewCameraMatrix(self.K, self.dist, (w, h), 1, (w, h))
+        self.map1, self.map2 = cv2.initUndistortRectifyMap(self.K, self.dist, None, self.new_K, (w, h), cv2.CV_16SC2)
+        self.optical_center = (self.new_K[0, 2], self.new_K[1, 2])  # (cx, cy)
 
     def joint_state_callback(self, msg: JointState):
         self.joint_states = msg
@@ -156,13 +178,71 @@ class OV5640Publisher(Node):
 
         return corrected
 
+    def draw_optical_center(self, image):
+        """
+        Draws a red crosshair and label at the optical center of the camera.
+
+        Args:
+            image (np.ndarray): The image to annotate (typically annotated_frame)
+        """
+        if not hasattr(self, 'optical_center'):
+            return  # skip if not yet initialized
+
+        optical_x = int(self.optical_center[0])
+        optical_y = int(self.optical_center[1])
+
+        # Draw cross
+        cv2.drawMarker(
+            image,
+            (optical_x, optical_y),
+            (0, 0, 255),  # Red
+            markerType=cv2.MARKER_CROSS,
+            markerSize=10,
+            thickness=2,
+            line_type=cv2.LINE_AA
+        )
+
+        # Add label
+        cv2.putText(
+            image,
+            "Optical Center",
+            (optical_x + 10, optical_y - 10),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.4,
+            (0, 0, 255),
+            1,
+            cv2.LINE_AA
+        )
+
+
 
     def timer_callback(self):
         ret, frame = self.cap.read()
         if not ret or frame is None:
             self.get_logger().warn('Failed to read frame')
             return
-        
+
+        frame = cv2.remap(frame, self.map1, self.map2, interpolation=cv2.INTER_LINEAR)
+
+
+        # Shift the image so the optical center becomes the image center
+        cx, cy = self.optical_center
+        h, w = frame.shape[:2]
+        target_cx = w / 2
+        target_cy = h / 2
+
+        # Compute translation to shift optical center to image center
+        dx = target_cx - cx
+        dy = target_cy - cy
+
+        # Build translation matrix
+        M_translate = np.float32([[1, 0, dx], [0, 1, dy]])
+
+        # Apply translation
+        frame = cv2.warpAffine(frame, M_translate, (w, h))
+
+
+
         orig_frame = frame.copy()
 
 
@@ -212,6 +292,7 @@ class OV5640Publisher(Node):
 
         frame_h, frame_w = frame.shape[:2]
         center_x, center_y = frame_w / 2, frame_h / 2
+        
 
         # Process oriented bounding boxes (OBB) safely
         if hasattr(results, "obb") and results.obb is not None \
@@ -312,7 +393,7 @@ class OV5640Publisher(Node):
 
             except Exception as e:
                 self.get_logger().error(f"Error processing OBB: {e}")
-
+        # self.draw_optical_center(annotated_frame)
         cv2.imshow('YOLOv8 OBB Inference', annotated_frame)
         key = cv2.waitKey(1) & 0xFF
 
@@ -376,6 +457,8 @@ def main(args=None):
     # print("Waiting for debugger to attach...")
     # debugpy.wait_for_client()
     # print("Debugger connected.")
+
+
     rclpy.init(args=args)
     node = OV5640Publisher()
     try:
