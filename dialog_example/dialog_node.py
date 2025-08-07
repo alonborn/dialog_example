@@ -292,15 +292,13 @@ class TkinterROS(Node):
         dx_cam = self.top_dx_mm / 1000.0
         dy_cam = self.top_dy_mm / 1000.0
         est_height_m = self.top_est_height_mm / 1000.0
-        brick_yaw_deg = self.top_angle_deg
+        rel_rotation_deg = -self.top_angle_deg  # Directly from vision: rotation to apply to EE
 
-        # Get current EE pose
         ee_pose = self.get_current_ee_pose()
         if ee_pose is None:
             self.get_logger().error("Cannot read current end-effector pose.")
             return
 
-        # Current yaw
         quat = [
             ee_pose.orientation.x,
             ee_pose.orientation.y,
@@ -310,38 +308,25 @@ class TkinterROS(Node):
         roll, pitch, yaw = tf_transformations.euler_from_quaternion(quat)
         current_yaw_deg = np.degrees(yaw) % 360
 
-        # --- Symmetry and shortest signed delta ---
-        brick_yaw_options = [brick_yaw_deg % 360, (brick_yaw_deg + 180) % 360]
-        best_target = min(brick_yaw_options,
-                        key=lambda a: min(abs(a - current_yaw_deg),
-                                            360 - abs(a - current_yaw_deg)))
-
-        # Get signed delta (-180, 180)
-        delta = (best_target - current_yaw_deg + 540) % 360 - 180
-
-        rotation_diff = abs(delta)
-        new_yaw_deg = (current_yaw_deg + delta) % 360
+        # New yaw = current yaw + relative rotation from vision
+        new_yaw_deg = (current_yaw_deg + rel_rotation_deg) % 360
 
         self.get_logger().info(
             f"[EE Rotation] Current EE yaw: {current_yaw_deg:.2f}°, "
-            f"Detected brick yaw: {brick_yaw_deg:.2f}°, "
-            f"Chosen brick equiv yaw: {best_target:.2f}°, "
-            f"Signed delta: {delta:.2f}°, "
-            f"Target EE yaw: {new_yaw_deg:.2f}°, "
-            f"Rotation diff: {rotation_diff:.2f}°"
+            f"Relative rotation needed: {rel_rotation_deg:.2f}°, "
+            f"Target EE yaw: {new_yaw_deg:.2f}°"
         )
 
         # Transform dx/dy to base frame
         R = tf_transformations.quaternion_matrix(quat)[0:3, 0:3]
         offset_base = R @ np.array([dx_cam, dy_cam, 0.0])
 
-        # Build corrected pose
         corrected_pose = Pose()
-        corrected_pose.position.x = ee_pose.position.x + offset_base[0]
-        corrected_pose.position.y = ee_pose.position.y + offset_base[1]
+        corrected_pose.position.x += ee_pose.position.x + dx_cam
+        corrected_pose.position.y += ee_pose.position.y + dy_cam
         corrected_pose.position.z = ee_pose.position.z
 
-        # Keep roll/pitch, update yaw to new_yaw_deg
+        # Keep roll/pitch, update yaw
         yaw_rad = np.radians(new_yaw_deg)
         final_quat = tf_transformations.quaternion_from_euler(roll, pitch, yaw_rad)
         corrected_pose.orientation.x = final_quat[0]
@@ -349,11 +334,8 @@ class TkinterROS(Node):
         corrected_pose.orientation.z = final_quat[2]
         corrected_pose.orientation.w = final_quat[3]
 
-        # Move
-        self.get_logger().info("Refining pose with transformed EE camera offsets.")
         self.send_move_request(corrected_pose, is_cartesian=False)
 
-        # Read back final yaw
         final_pose = self.get_current_ee_pose()
         if final_pose:
             _, _, final_yaw = tf_transformations.euler_from_quaternion([
@@ -366,67 +348,6 @@ class TkinterROS(Node):
             self.get_logger().info(
                 f"[EE Rotation] Final EE yaw after motion: {final_yaw_deg:.2f}°"
             )
-
-
-
-    def on_use_brick_center_click(self):
-        if self.latest_brick_center is None:
-            messagebox.showwarning("No Brick Info", "No brick info received yet.")
-            return
-
-        x, y, z = self.latest_brick_center
-        yaw = self.latest_brick_yaw
-
-        # Use fixed quaternion: yaw only
-        quat = tf_transformations.quaternion_from_euler(np.pi, 0, yaw)  # 180° flip around X + yaw
-
-        # Update GUI fields
-        translation_str = f"({x:.3f}, {y:.3f}, {z:.3f})"
-        rotation_str = f"({quat[0]:.4f}, {quat[1]:.4f}, {quat[2]:.4f}, {quat[3]:.4f})"
-
-        self.translation_entry.delete(0, tk.END)
-        self.translation_entry.insert(0, translation_str)
-
-        self.rotation_entry.delete(0, tk.END)
-        self.rotation_entry.insert(0, rotation_str)
-
-        self.status_label.config(text="Loaded brick center")
-
-        # === Build pose in camera frame ===
-        pose_in_camera = Pose()
-        pose_in_camera.position.x = x
-        pose_in_camera.position.y = y
-        pose_in_camera.position.z = z 
-
-        pose_in_camera.orientation.x = quat[0]
-        pose_in_camera.orientation.y = quat[1]
-        pose_in_camera.orientation.z = quat[2]
-        pose_in_camera.orientation.w = quat[3]
-
-        # === Transform to base_link ===
-        try:
-            transformed_pose = self._transform_pose(
-                pose=pose_in_camera,
-                source_frame="camera_color_optical_frame",
-                target_frame="base_link"
-            )
-            transformed_pose.position.z += 0.1  # Adjust height if needed
-            transformed_pose.orientation.x = 0.0
-            transformed_pose.orientation.y = 0.999
-            transformed_pose.orientation.z = 0.001
-            transformed_pose.orientation.w = 0.0  # Reset orientation to no rotation
-
-        except Exception as e:
-            self.get_logger().error(f"Failed to transform brick center pose: {e}")
-            messagebox.showerror("Transform Error", "Could not transform brick pose to base_link.")
-            return
-
-        # === Send move request ===
-        self.send_move_request(transformed_pose, is_cartesian=False)
-
-        # Now do the fine adjustment using EE camera
-        self.get_logger().info("Initial move done. Refining using EE camera...")
-        self.root.after(500, self.refine_pose_with_ee_camera)
 
 
 
@@ -730,44 +651,6 @@ class TkinterROS(Node):
             self.get_logger().error(f"Error copying Aruco pose to clipboard: {e}")
 
 
-    def pose_to_matrix(self,pose):
-        """Convert a ROS geometry_msgs/Pose to a 4x4 transformation matrix."""
-        translation = np.array([pose.position.x, pose.position.y, pose.position.z])
-        quat = [pose.orientation.w, pose.orientation.x, pose.orientation.y, pose.orientation.z]
-        rot = transforms3d.quaternions.quat2mat(quat)
-        T = np.eye(4)
-        T[0:3, 0:3] = rot
-        T[0:3, 3] = translation
-        return T
-
-        
-    def auto_adjust_calibration_from_poses(self, marker_pose, ee_pose):
-        """
-        Given the marker's and EE's poses in the same frame (base_link),
-        compute the XY offset between them and correct the base->marker calibration.
-        """
-        T_base_marker = self.pose_to_matrix(marker_pose)
-        T_base_ee = self.pose_to_matrix(ee_pose)
-
-        # Compute T_marker_ee = inv(T_base_marker) @ T_base_ee
-        T_marker_base = np.linalg.inv(T_base_marker)
-        T_marker_ee = T_marker_base @ T_base_ee
-
-        dx, dy, dz = T_marker_ee[0:3, 3]
-        self.get_logger().info(f"[AUTO CALIB] Offset detected: dx={dx:.4f}, dy={dy:.4f}, dz={dz:.4f}")
-
-        # Read current calibration translation & rotation
-        translation, rotation = self.read_calibration_file(self.calib_path)
-
-        # Apply corrections: shift calibration by -dx, -dy
-        translation[0] -= dx
-        translation[1] -= dy
-
-        # self.update_calibration_file(self.calib_path, translation, rotation)
-        # self.trigger_update_calib_file()
-
-        self.status_label.config(text=f"Calibration adjusted by dx={-dx:+.3f}, dy={-dy:+.3f}")
-
     def joint_states_callback(self, msg):
 
             if self.arm_is_moving == True:
@@ -826,9 +709,6 @@ class TkinterROS(Node):
         self.joint_states_entry.insert(tk.END, joint_info)
         self.joint_states_entry.configure(state='disabled')
 
-
-    def test_timer_callback(self):
-        self.get_logger().info('ROS loop is alive!')
 
     def init_cal_poses(self):
         # self.cal_poses =    [[(0.03, -0.38, 0.39), (0.31, -0.56, 0.64, -0.43)],
@@ -987,41 +867,7 @@ class TkinterROS(Node):
 
         self.move_to_marker_pose(self.pose_in_camera)
 
-    def _transform_pose2(self, pose: Pose, source_frame: str, target_frame: str) -> Pose:
-        """Transforms a pose from the source_frame to the target_frame,
-        publishes both the direct transformed pose and one offset in z by +5cm,
-        and returns the direct transformed pose."""
-        
-        # Look up the transform from source_frame -> target_frame
-        transform = self.tf_buffer.lookup_transform(target_frame, source_frame, Time())
-        
-        # Transform the original pose
-        transformed_pose = do_transform_pose(pose, transform)
-        # Publish the direct transformed pose
-        stamped_pose = PoseStamped()
-        stamped_pose.header.stamp = self.get_clock().now().to_msg()
-        stamped_pose.header.frame_id = target_frame
-        stamped_pose.pose = transformed_pose
-        
-        # Create a copy of the original pose with z offset +5cm before transforming
-        pose_with_offset = Pose()
-        pose_with_offset.position = Point(
-            x=pose.position.x,
-            y=pose.position.y,
-            z=pose.position.z + 0.05  # add 5 cm in z
-        )
-        pose_with_offset.orientation = pose.orientation
-        
-        transformed_pose_offset = do_transform_pose(pose_with_offset, transform)
-        
-        # Publish the offset pose (useful for visualizations)
-        stamped_offset_pose = PoseStamped()
-        stamped_offset_pose.header.stamp = self.get_clock().now().to_msg()
-        stamped_offset_pose.header.frame_id = target_frame
-        stamped_offset_pose.pose = transformed_pose_offset
-        self.target_pose_pub.publish(stamped_offset_pose)
-        
-        return transformed_pose
+    
 
     def _transform_pose(self, pose: Pose, source_frame: str, target_frame: str) -> Pose:
         """
@@ -1245,27 +1091,9 @@ class TkinterROS(Node):
         future = self.homing_client.call_async(request)
         future.add_done_callback(lambda f: self.handle_service_response(f, success_msg, failure_msg))
 
-    def handle_service_response(self, future, success_msg, failure_msg):
-        return
-        try:
-            response = future.result()
-            if response.success:
-                message = success_msg
-            else:
-                message = failure_msg + f": {response.message}"
-        except Exception as e:
-            message = f"Service call failed: {str(e)}"
-        
-        # 🟢 Schedule GUI update safely in main thread:
-        self.gui_queue.put(lambda: self.update_gui(message))
-
     def update_gui(self, message):
         self.status_label.config(text=message)
 
-    # def tk_mainloop(self):
-    #     self.root.update_idletasks()
-    #     self.root.update()
-    #     self.root.after(100, self.tk_mainloop)
     def tk_mainloop(self):
         try:
             self.root.update_idletasks()
@@ -1283,17 +1111,7 @@ class TkinterROS(Node):
     def on_shutdown(self):
         self.root.quit()
 
-    
-    def service_exists(self, service_name):
-        """Check if a service exists by looking it up in the ROS graph"""
-        service_names_and_types = self.get_service_names_and_types()
-        return any(service_name == name for name, _ in service_names_and_types)
-    
-    def topic_exists(self, topic_name):
-        """Check if a topic exists by looking it up in the ROS graph"""
-        topic_names_and_types = self.get_topic_names_and_types()
-        return any(topic_name == name for name, _ in topic_names_and_types)
-    
+     
     def read_calibration_file(self,filepath):
         """
         Reads the calibration file and returns the translation and rotation.
