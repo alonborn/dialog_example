@@ -94,7 +94,7 @@ class TkinterROS(Node):
         self.latest_brick_yaw = None
 
 
-        self.get_logger().info('ArucoPoseFollower initialized, listening to /aruco_poses')
+        self.log_with_time('info', 'ArucoPoseFollower initialized, listening to /aruco_poses')
 
 
         self.homing_client = self.create_client(Trigger, '/ar4_hardware_interface_node/homing')
@@ -106,12 +106,12 @@ class TkinterROS(Node):
         self.init_dialog()
 
         self.arm_joint_names = ["joint_1", "joint_2", "joint_3", "joint_4", "joint_5", "joint_6"]
-        self.get_logger().info('registering ar_move_to_pose service')
+        self.log_with_time('info', 'registering ar_move_to_pose service')
         self.root.after(20, self.process_gui_queue) 
         self.save_sample_calibration_client = self.create_client(SaveCalibration, hec.SAVE_CALIBRATION_TOPIC)
         self.take_sample_client = self.create_client(TakeSample, hec.TAKE_SAMPLE_TOPIC)
         self.compute_calibration_client = self.create_client(ComputeCalibration, hec.COMPUTE_CALIBRATION_TOPIC)
-        self.get_logger().info('take_sample service registered')
+        self.log_with_time('info', 'take_sample service registered')
 
         # self.init_moveit()
         self.init_right_frame()
@@ -122,27 +122,27 @@ class TkinterROS(Node):
         if len(msg.data) == 4:
             self.latest_brick_center = tuple(msg.data[0:3])
             self.latest_brick_yaw = msg.data[3]
-            # self.get_logger().info(f"Received brick center: {self.latest_brick_center}, yaw: {self.latest_brick_yaw:.2f}")
+            # self.log_with_time('info', f"Received brick center: {self.latest_brick_center}, yaw: {self.latest_brick_yaw:.2f}")
         else:
-            self.get_logger().warn("Received unexpected brick info format.")
+            self.log_with_time('warn' ,"Received unexpected brick info format.")
 
     def brick_top_info_callback(self, msg: Float32MultiArray):
         """
         Callback for receiving brick top info [dx_mm, dy_mm, angle_deg, est_height_mm].
         """
         if len(msg.data) != 4:
-            self.get_logger().warn(f"Received brick_top_info with unexpected length: {len(msg.data)}")
+            self.log_with_time('warn' ,f"Received brick_top_info with unexpected length: {len(msg.data)}")
             return
 
         self.top_dx_mm, self.top_dy_mm, self.top_angle_deg, self.top_est_height_mm = msg.data
-        # self.get_logger().info(
+        # self.log_with_time('info', 
         #     f"Brick offset: dx={dx_mm:.1f} mm, dy={dy_mm:.1f} mm, "
         #     f"angle={angle_deg:.1f}°, height={est_height_mm:.1f} mm"
         # )
 
         # Example: trigger an action when the brick is centered
         # if abs(dx_mm) < 5 and abs(dy_mm) < 5:
-        #     self.get_logger().info("✅ Brick is centered within 5 mm!")
+        #     self.log_with_time('info', "✅ Brick is centered within 5 mm!")
 
 
 
@@ -250,6 +250,17 @@ class TkinterROS(Node):
         self.update_position_label()
         # self.root.after(100, self.tk_mainloop)
         
+    def log_with_time(self, level, message):
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        full_message = f"[{timestamp}] {message}"
+        if level == 'info':
+            self.get_logger().info(full_message)
+        elif level == 'error':
+            self.get_logger().error(full_message)
+        elif level == 'warn':
+            self.get_logger().warn(full_message)
+        else:
+            self.get_logger().debug(full_message)
 
     def copy_pos_to_entries(self):
         """
@@ -268,7 +279,7 @@ class TkinterROS(Node):
             )
 
             if not match:
-                self.get_logger().error("Failed to parse pose from pos_text")
+                self.log_with_time('error' ,"Failed to parse pose from pos_text")
                 return
 
             # Extract groups
@@ -287,7 +298,7 @@ class TkinterROS(Node):
             self.rotation_entry.insert(0, rotation_str)
 
         except Exception as e:
-            self.get_logger().error(f"Error in copy_pos_to_entries: {e}")
+            self.log_with_time('error' ,f"Error in copy_pos_to_entries: {e}")
 
 
     def on_auto_calibrate_button_click(self):
@@ -303,7 +314,7 @@ class TkinterROS(Node):
                 target_frame="base_link"
             )
         except Exception as e:
-            self.get_logger().error(f"Failed to transform marker pose: {e}")
+            self.log_with_time('error' ,f"Failed to transform marker pose: {e}")
             messagebox.showerror("Transform Error", "Could not transform marker pose to base_link.")
             return
 
@@ -317,7 +328,7 @@ class TkinterROS(Node):
         dx = marker_pose_base.position.x - self.initial_marker_pose_base.position.x
         dy = marker_pose_base.position.y - self.initial_marker_pose_base.position.y
 
-        self.get_logger().info(f"[Auto Calib] Marker moved: dx={dx:.4f}, dy={dy:.4f}")
+        self.log_with_time('info', f"[Auto Calib] Marker moved: dx={dx:.4f}, dy={dy:.4f}")
 
         # Load current calibration
         translation, rotation = self.read_calibration_file(self.calib_path)
@@ -342,7 +353,7 @@ class TkinterROS(Node):
 
     def refine_pose_with_ee_camera(self):
         if None in (self.top_dx_mm, self.top_dy_mm, self.top_angle_deg, self.top_est_height_mm):
-            self.get_logger().warn("No brick info from end-effector camera.")
+            self.log_with_time('warn' ,"No brick info from end-effector camera.")
             return
 
         dx_cam = self.top_dx_mm / 1000.0
@@ -352,7 +363,7 @@ class TkinterROS(Node):
 
         ee_pose = self.get_current_ee_pose()
         if ee_pose is None:
-            self.get_logger().error("Cannot read current end-effector pose.")
+            self.log_with_time('error' ,"Cannot read current end-effector pose.")
             return
 
         quat = [
@@ -367,7 +378,7 @@ class TkinterROS(Node):
         # New yaw = current yaw + relative rotation from vision
         new_yaw_deg = (current_yaw_deg + rel_rotation_deg) % 360
 
-        self.get_logger().info(
+        self.log_with_time('info', 
             f"[EE Rotation] Current EE yaw: {current_yaw_deg:.2f}°, "
             f"Relative rotation needed: {rel_rotation_deg:.2f}°, "
             f"Target EE yaw: {new_yaw_deg:.2f}°"
@@ -401,7 +412,7 @@ class TkinterROS(Node):
                 final_pose.orientation.w,
             ])
             final_yaw_deg = np.degrees(final_yaw) % 360
-            self.get_logger().info(
+            self.log_with_time('info', 
                 f"[EE Rotation] Final EE yaw after motion: {final_yaw_deg:.2f}°"
             )
             
@@ -491,7 +502,7 @@ class TkinterROS(Node):
         self.status_label.config(text=f"{axis.upper()} adjusted by {delta:+.3f}")
 
     def trigger_update_calib_file(self):
-        self.get_logger().info("Updating calibration file...")
+        self.log_with_time('info', "Updating calibration file...")
         request = Trigger.Request()
         future = self.refresh_transform_client.call_async(request)
 
@@ -543,7 +554,7 @@ class TkinterROS(Node):
     def on_mode_change(self):
         mode = self.mode_var.get()
         enable_follower = (mode == "Validation")  # enable only in validation
-        self.get_logger().info(f"Switching mode to: {mode} (follower {'enabled' if enable_follower else 'disabled'})")
+        self.log_with_time('info', f"Switching mode to: {mode} (follower {'enabled' if enable_follower else 'disabled'})")
 
         request = SetBool.Request()
         request.data = enable_follower
@@ -553,9 +564,9 @@ class TkinterROS(Node):
         # Optionally wait (non-blocking)
         rclpy.spin_until_future_complete(self, future, timeout_sec=2.0)
         if future.result() is not None:
-            self.get_logger().info(f"Service response: {future.result().message}")
+            self.log_with_time('info', f"Service response: {future.result().message}")
         else:
-            self.get_logger().error("Service call failed")
+            self.log_with_time('error' ,"Service call failed")
 
     def update_status_label(self):
         self.gui_queue.put(lambda: self._update_status_label())
@@ -616,7 +627,7 @@ class TkinterROS(Node):
                 self.rotation_entry.insert(0, f"({new_ori[0]:.4f}, {new_ori[1]:.4f}, {new_ori[2]:.4f}, {new_ori[3]:.4f})")
                 self.send_pose_from_entries()
             except Exception as e:
-                self.get_logger().error(f"Failed to adjust orientation: {e}")
+                self.log_with_time('error' ,f"Failed to adjust orientation: {e}")
 
 
         def prev_pose():
@@ -669,7 +680,7 @@ class TkinterROS(Node):
 
             self.save_calibration_poses(self.cal_poses,path)
         except Exception as e:
-            self.get_logger().error(f"Failed to save pose from entries: {e}")
+            self.log_with_time('error' ,f"Failed to save pose from entries: {e}")
 
     def save_calibration_poses(self, poses, json_path="cal_poses.jsonc"):
         """
@@ -722,7 +733,7 @@ class TkinterROS(Node):
                 f.write(joint_text + "\n\n")
 
         except Exception as e:
-            self.get_logger().error(f"Error copying Aruco pose to clipboard: {e}")
+            self.log_with_time('error' ,f"Error copying Aruco pose to clipboard: {e}")
 
 
     def joint_states_callback(self, msg):
@@ -748,7 +759,7 @@ class TkinterROS(Node):
                         # Compare current positions with previously saved positions
                         for i, (new_pos, ref_pos) in enumerate(zip(msg.position, self.zero_velocity_positions)):
                             if abs(new_pos - ref_pos) > 0.1:  # Tolerance in radians
-                                self.get_logger().error(
+                                self.log_with_time('error' ,
                                     f"Unintended motion detected on joint {i}: "
                                     f"saved={ref_pos:.4f}, current={new_pos:.4f}, delta={abs(new_pos - ref_pos):.5f}"
                                 )
@@ -763,7 +774,7 @@ class TkinterROS(Node):
                 
 
             except Exception as e:
-                self.get_logger().error(f"Error in joint_states_callback: {e}")
+                self.log_with_time('error' ,f"Error in joint_states_callback: {e}")
 
 
     def update_joint_states_gui(self, text):
@@ -802,7 +813,7 @@ class TkinterROS(Node):
     def call_service_blocking(self, client, request, timeout_sec=10.0):
         
         if not client.service_is_ready():
-            self.get_logger().error("Service not available")
+            self.log_with_time('error' ,"Service not available")
             return None
 
         future = client.call_async(request)
@@ -814,9 +825,9 @@ class TkinterROS(Node):
             self.update_status_label()
             try:
                 result_container['result'] = fut.result()
-                self.get_logger().info(f"Service call ended, result: {result_container['result']}")
+                self.log_with_time('info', f"Service call ended, result: {result_container['result']}")
             except Exception as e:
-                self.get_logger().error(f"Service call failed: {e}")
+                self.log_with_time('error' ,f"Service call failed: {e}")
             finally:
                 done_event.set()
 
@@ -825,7 +836,7 @@ class TkinterROS(Node):
         future.add_done_callback(_on_response)
 
         if not done_event.wait(timeout=timeout_sec):
-            self.get_logger().error("Service call timed out")
+            self.log_with_time('error' ,"Service call timed out")
             return None
 
         self._update_status_label()
@@ -888,14 +899,14 @@ class TkinterROS(Node):
             return pose
 
         except Exception as e:
-            self.get_logger().warn(f"TF lookup failed: {e}")
+            self.log_with_time('warn' ,f"TF lookup failed: {e}")
             return None
 
 
     def aruco_pose_callback(self, msg: PoseArray):
         # return
         if not msg.poses:
-            self.get_logger().warn('Received empty PoseArray, skipping.')
+            self.log_with_time('warn' ,'Received empty PoseArray, skipping.')
             return
         
         current_time = time.time()
@@ -936,7 +947,7 @@ class TkinterROS(Node):
 
     def move_to_marker(self):
         if self.pose_in_camera is None:
-            self.get_logger().warn("No transformed ArUco pose available to move to.")
+            self.log_with_time('warn' ,"No transformed ArUco pose available to move to.")
             return
 
         self.move_to_marker_pose(self.pose_in_camera)
@@ -974,10 +985,10 @@ class TkinterROS(Node):
                 now,
                 timeout=rclpy.duration.Duration(seconds=1.0)
             )
-            # self.get_logger().info(f"------------------------(4)Transform: {transform}")
+            # self.log_with_time('info', f"------------------------(4)Transform: {transform}")
             # Transform the pose into target_frame
             transformed_pose = do_transform_pose(stamped_pose_in.pose, transform)
-            # self.get_logger().info(f"------------------------(5)Transformed pose: {transformed_pose}")  
+            # self.log_with_time('info', f"------------------------(5)Transformed pose: {transformed_pose}")  
             # Optional: publish for visualization if you defined publishers
             # if hasattr(self, 'pose_pub'):
             #     self.pose_pub.publish(transformed_stamped)
@@ -985,20 +996,20 @@ class TkinterROS(Node):
             return transformed_pose
 
         except Exception as e:
-            self.get_logger().error(f"[TF ERROR] Failed to transform pose: {e}")
+            self.log_with_time('error' ,f"[TF ERROR] Failed to transform pose: {e}")
             raise
 
     def move_to_marker_pose(self, pose_in_camera: Pose):
         """Process a single Pose (in camera frame), transform it, filter it, and move the robot."""
         try:
-            self.get_logger().info(f"--------------------(1)Received pose in camera frame: {pose_in_camera}")
+            self.log_with_time('info', f"--------------------(1)Received pose in camera frame: {pose_in_camera}")
             transformed_pose = self._transform_pose(pose_in_camera,
                                                         "camera_color_optical_frame",
                                                         "base_link")
 
-            self.get_logger().info(f"---------------------------(2)Transformed pose (after _transform_pose): {transformed_pose}")
+            self.log_with_time('info', f"---------------------------(2)Transformed pose (after _transform_pose): {transformed_pose}")
         except Exception as e:
-            self.get_logger().error(f"Unexpected exception during pose processing: {e}")
+            self.log_with_time('error' ,f"Unexpected exception during pose processing: {e}")
             return  # 🟢 Critical: exit early so the rest of the method isn't run on invalid data
 
         # Continue only if no exception
@@ -1019,7 +1030,7 @@ class TkinterROS(Node):
         # Offset in Z
         transformed_pose.position.z += 0.10
 
-        self.get_logger().info(f"------------------(3)Following pose: {transformed_pose}")
+        self.log_with_time('info', f"------------------(3)Following pose: {transformed_pose}")
         self.move_to(transformed_pose)
 
 
@@ -1082,22 +1093,22 @@ class TkinterROS(Node):
     #     msg = String()
     #     msg.data = self.joints_entry.get()  # Send the value from the text field
     #     self.publisher.publish(msg)
-        #self.get_logger().warn('Publishing message: ' + msg.data)
+        #self.log_with_time('warn' ,'Publishing message: ' + msg.data)
 
     def on_homing_button_click(self):
         self.trigger_homing_service("Homing in progress...", "Homing successful!", "Homing failed")
 
     def take_sample(self):
         self.call_service_blocking(self.take_sample_client, TakeSample.Request(), timeout_sec=115.0)
-        #self.get_logger().info("Sample taken - in dialog_node")
+        #self.log_with_time('info', "Sample taken - in dialog_node")
   
     def save_calibration(self):
         self.call_service_blocking(self.save_sample_calibration_client, SaveCalibration.Request(), timeout_sec=115.0)
-        self.get_logger().info("Calibration saved - in dialog_node")
+        self.log_with_time('info', "Calibration saved - in dialog_node")
  
     def compute_calibration(self):
         self.call_service_blocking(self.compute_calibration_client, ComputeCalibration.Request(), timeout_sec=115.0)
-        self.get_logger().info("Calibration computed - in dialog_node")
+        self.log_with_time('info', "Calibration computed - in dialog_node")
     
     def send_pose_from_entries(self):
             try:
@@ -1148,7 +1159,7 @@ class TkinterROS(Node):
             self.send_move_request(pose_msg, is_cartesian=is_cartesian)
 
         except Exception as e:
-            self.get_logger().error(f"Failed to move to new height: {e}")
+            self.log_with_time('error' ,f"Failed to move to new height: {e}")
 
     def on_calibrate_button_click(self):
 
@@ -1205,7 +1216,7 @@ class TkinterROS(Node):
             self.root.update()
         except tk.TclError:
             # This means the window was closed
-            self.get_logger().info("Tkinter window closed. Shutting down.")
+            self.log_with_time('info', "Tkinter window closed. Shutting down.")
             return
 
         # Schedule this method again
