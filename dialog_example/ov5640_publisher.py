@@ -222,181 +222,157 @@ class OV5640Publisher(Node):
             self.get_logger().warn('Failed to read frame')
             return
 
+        # Undistort/rectify
         frame = cv2.remap(frame, self.map1, self.map2, interpolation=cv2.INTER_LINEAR)
 
-
-        # Shift the image so the optical center becomes the image center
+        # Shift so optical center becomes image center
         cx, cy = self.optical_center
         h, w = frame.shape[:2]
-        target_cx = w / 2
-        target_cy = h / 2
-
-        # Compute translation to shift optical center to image center
-        dx = target_cx - cx
-        dy = target_cy - cy
-
-        # Build translation matrix
+        target_cx, target_cy = w / 2, h / 2
+        dx, dy = target_cx - cx, target_cy - cy
         M_translate = np.float32([[1, 0, dx], [0, 1, dy]])
-
-        # Apply translation
         frame = cv2.warpAffine(frame, M_translate, (w, h))
-
-
 
         orig_frame = frame.copy()
 
-
+        # Align camera orientation
         frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
         frame = cv2.flip(frame, 1)
 
-        # --- Get joint 1 and joint 6 angles ---
-        joint1_angle = self.get_joint_angle('joint_1')
-        joint6_angle = self.get_joint_angle('joint_6')
+        # --- Read joint angles ---
+        j1 = self.get_joint_angle('joint_1')
+        j2 = self.get_joint_angle('joint_2')
+        j3 = self.get_joint_angle('joint_3')
+        j5 = self.get_joint_angle('joint_5')
+        j6 = self.get_joint_angle('joint_6')
 
-        if joint1_angle is None or joint6_angle is None:
+        if j1 is None or j6 is None:
             self.get_logger().warn("Joint angles not available, skipping frame processing")
             return
 
-        # Total rotation angle
-        total_angle = joint1_angle + joint6_angle  # degrees
+        # Total rotation for the image (use J1 + J6)
+        total_angle = j1 + j6
 
-        # --- Rotate the frame around its center ---
-        (h, w) = frame.shape[:2]
+        # Rotate the frame about its center
+        h, w = frame.shape[:2]
         center = (w // 2, h // 2)
-
-        # Get rotation matrix
         M = cv2.getRotationMatrix2D(center, total_angle, 1.0)
-
-        # Perform the rotation
         frame = cv2.warpAffine(frame, M, (w, h))
 
-
+        # Inference
         try:
-            # Run inference (disable verbose)
             results = self.model.predict(frame, imgsz=640, conf=0.8, verbose=False)[0]
             orig_results = self.model.predict(orig_frame, imgsz=640, conf=0.8, verbose=False)[0]
-            
         except Exception as e:
             self.get_logger().error(f"Inference failed: {e}")
             return
 
         annotated_frame = results.plot()
 
-
-
-        if joint1_angle is not None and joint6_angle is not None:
-            cv2.putText(annotated_frame, f"J1: {joint1_angle:.1f}", (10, 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
-            cv2.putText(annotated_frame, f"J6: {joint6_angle:.1f}", (10, 60),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+        # --- Overlay joint angles (J1, J2, J3, J5, J6) ---
+        # Only print those we actually have
+        y = 30
+        for label, angle in (("J1", j1), ("J2", j2), ("J3", j3), ("J5", j5), ("J6", j6)):
+            if angle is not None:
+                cv2.putText(annotated_frame, f"{label}: {angle:.1f}", (10, y),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                y += 30
 
         frame_h, frame_w = frame.shape[:2]
         center_x, center_y = frame_w / 2, frame_h / 2
-        
 
-        # Process oriented bounding boxes (OBB) safely
-        if hasattr(results, "obb") and results.obb is not None \
-            and getattr(results.obb, "xyxyxyxy", None) is not None:
+        # --- Process oriented bounding boxes (OBB) ---
+        if hasattr(results, "obb") and results.obb is not None and getattr(results.obb, "xyxyxyxy", None) is not None:
             try:
                 boxes = results.obb.xyxyxyxy
                 orig_boxes = orig_results.obb.xyxyxyxy
-
                 confs = results.obb.conf.cpu().numpy()
 
-                for obb, conf,obb_orig in zip(boxes, confs,orig_boxes):
+                for obb, conf, obb_orig in zip(boxes, confs, orig_boxes):
                     if conf is None or conf < 0.7:
                         continue
 
                     points = obb.cpu().numpy().reshape(4, 2)
                     orig_points = obb_orig.cpu().numpy().reshape(4, 2)
-                    
                     if points.shape != (4, 2) or np.isnan(points).any():
                         continue
 
                     cx = float(points[:, 0].mean())
                     cy = float(points[:, 1].mean())
 
-                    # Draw center point
+                    # Draw center
                     cv2.circle(annotated_frame, (int(cx), int(cy)), 4, (0, 255, 255), -1)
 
                     angle_deg = self.calculate_brick_yaw(orig_points)
- 
                     if angle_deg is None:
                         continue
- 
-                    cv2.putText(annotated_frame,
-                                f"{angle_deg:.1f}°",
-                                (int(cx) + 30, int(cy) - 30),
-                                cv2.FONT_HERSHEY_SIMPLEX,
-                                0.5, (0, 0, 0), 1, cv2.LINE_AA)
 
-                    # Line from center to brick
+                    cv2.putText(
+                        annotated_frame, f"{angle_deg:.1f}°",
+                        (int(cx) + 30, int(cy) - 30),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA
+                    )
+
+                    # Vector from image center to brick center
                     cv2.line(annotated_frame, (int(center_x), int(center_y)), (int(cx), int(cy)), (255, 0, 0), 1)
                     dx_px = cx - center_x
                     dy_px = cy - center_y
-                    pixel_dist = np.sqrt(dx_px**2 + dy_px**2)
+                    pixel_dist = float(np.hypot(dx_px, dy_px))
 
-
+                    # Estimate pixel→mm using long edge of OBB (assume 23mm long side)
                     edge1 = np.linalg.norm(points[1] - points[0])
                     edge2 = np.linalg.norm(points[2] - points[1])
-
                     pixel_long_edge = max(edge1, edge2)
-                    if pixel_long_edge > 0:
-                        pixel_to_mm = 23.0 / pixel_long_edge
-                        dx_mm = dx_px * pixel_to_mm
-                        dy_mm = dy_px * pixel_to_mm
+                    if pixel_long_edge <= 0:
+                        continue
 
-                        dx_base, dy_base = self.offset_cam_to_base(
-                            dx_mm, dy_mm,
-                            joint1_angle if joint1_angle is not None else 0.0,
-                            joint6_angle if joint6_angle is not None else 0.0
-                        )
+                    pixel_to_mm = 23.0 / pixel_long_edge
+                    dx_mm = dx_px * pixel_to_mm
+                    dy_mm = dy_px * pixel_to_mm
 
-                        if dx_base is None or dy_base is None:
-                            continue  # Skip if offset conversion failed
+                    # Convert camera-plane offsets to base frame using J1 & J6
+                    dx_base, dy_base = self.offset_cam_to_base(
+                        dx_mm, dy_mm,
+                        j1 if j1 is not None else 0.0,
+                        j6 if j6 is not None else 0.0
+                    )
+                    if dx_base is None or dy_base is None:
+                        continue
 
-                        # Height estimate
-                        focal_length_px = (frame_w / 2) / np.tan(np.radians(72 / 2))
-                        brick_half = pixel_long_edge / 2
-                        hypotenuse_px = np.sqrt(brick_half**2 + pixel_dist**2)
-                        if hypotenuse_px > 0:
-                            est_height_mm = (focal_length_px * 23.0) / hypotenuse_px
-                        else:
-                            est_height_mm = 0.0
+                    # Height estimate
+                    focal_length_px = (frame_w / 2) / np.tan(np.radians(72 / 2))
+                    brick_half = pixel_long_edge / 2
+                    hypotenuse_px = float(np.hypot(brick_half, pixel_dist))
+                    est_height_mm = (focal_length_px * 23.0) / hypotenuse_px if hypotenuse_px > 0 else 0.0
 
-                        height_text = f"H: {est_height_mm:.1f} mm"
-                        cv2.putText(annotated_frame,
-                                    height_text,
-                                    (int(cx) + 30, int(cy) + 30),
-                                    cv2.FONT_HERSHEY_SIMPLEX,
-                                    0.5, (0, 0, 255), 1, cv2.LINE_AA)
+                    # Publish info
+                    info_msg = Float32MultiArray()
+                    info_msg.data = [dx_base, dy_base, float(angle_deg), float(est_height_mm)]
+                    self.info_publisher.publish(info_msg)
 
-                        # Publish info
-                        info_msg = Float32MultiArray()
-                        info_msg.data = [dx_base, dy_base, angle_deg, est_height_mm]
-                        self.info_publisher.publish(info_msg)
+                    # Nice overlays
+                    mid_x = int((center_x + cx) / 2)
+                    mid_y = int((center_y + cy) / 2)
+                    dist_mm = float(np.hypot(dx_mm, dy_mm))
+                    dir_angle_deg = float(np.degrees(np.arctan2(dy_mm, dx_mm)))
 
-                        # Distance and angle from center → brick
-                        mid_x = int((center_x + cx) / 2)
-                        mid_y = int((center_y + cy) / 2)
-                        dist_mm = np.sqrt(dx_mm**2 + dy_mm**2)
-                        dir_angle_deg = np.degrees(np.arctan2(dy_mm, dx_mm))
-
-                        dist_angle_text = f"{dist_mm:.1f} mm @ {dir_angle_deg:.1f}\n deg"
-                        cv2.putText(annotated_frame, dist_angle_text, (mid_x-50, mid_y-50),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1, cv2.LINE_AA)
-                        
-                        cv2.putText(annotated_frame, f"dx_base: {dx_base:.1f}", (10, 90),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
-                        cv2.putText(annotated_frame, f"dy_base: {dy_base:.1f}", (10, 120),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+                    cv2.putText(
+                        annotated_frame,
+                        f"{dist_mm:.1f} mm @ {dir_angle_deg:.1f} deg",
+                        (mid_x - 50, mid_y - 50),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1, cv2.LINE_AA
+                    )
+                    cv2.putText(annotated_frame, f"dx_base: {dx_base:.1f}", (10, y),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+                    cv2.putText(annotated_frame, f"dy_base: {dy_base:.1f}", (10, y + 30),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
 
             except Exception as e:
                 self.get_logger().error(f"Error processing OBB: {e}")
-        # self.draw_optical_center(annotated_frame)
+
+        # Show window + keys
         cv2.imshow('YOLOv8 OBB Inference', annotated_frame)
         key = cv2.waitKey(1) & 0xFF
-
         if key == ord('q'):
             self.get_logger().info("Quit requested, shutting down node.")
             self.destroy_node()
@@ -409,9 +385,6 @@ class OV5640Publisher(Node):
                 self.get_logger().info(f"Saved: {filepath}")
             except Exception as e:
                 self.get_logger().error(f"Failed to save frame: {e}")
-
-
-
 
 
 
@@ -453,10 +426,10 @@ class OV5640Publisher(Node):
 
 
 def main(args=None):
-    # debugpy.listen(("localhost", 5678))  # Port for debugger to connect
-    # print("Waiting for debugger to attach...")
-    # debugpy.wait_for_client()
-    # print("Debugger connected.")
+    debugpy.listen(("localhost", 5678))  # Port for debugger to connect
+    print("Waiting for debugger to attach...")
+    debugpy.wait_for_client()
+    print("Debugger connected.")
 
 
     rclpy.init(args=args)
