@@ -75,5 +75,5 @@ def generate_launch_description():
         move_ar_node,
         aruco_node,
         hand_eye_tf_publisher,
-        inferences_node
+        # inferences_node
     ])

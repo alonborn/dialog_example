@@ -35,6 +35,11 @@ from geometry_msgs.msg import PoseArray, Pose
 import time
 from rclpy.time import Time
 import datetime
+import serial
+from tkinter import ttk
+from functools import partial
+from my_robot_interfaces.srv import NudgeJoint
+import threading
 
 
 class TkinterROS(Node):
@@ -42,6 +47,18 @@ class TkinterROS(Node):
 
     def __init__(self):
         super().__init__('tkinter_ros_node')
+
+
+        # --- Serial connection to Arduino ---
+        # Change '/dev/ttyUSB0' and baudrate to match your setup
+        try:
+            self.serial_port = serial.Serial('/dev/ttyUSB0', 9600, timeout=1)
+            self.log_with_time('info', "Serial port opened successfully")
+        except Exception as e:
+            self.serial_port = None
+            self.log_with_time('error', f"Failed to open serial port: {e}")
+
+            
         self.gui_queue = queue.Queue()
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -118,6 +135,34 @@ class TkinterROS(Node):
         # self.periodic_status_check()
         self.aruco_follower_enabled_client = self.create_client(SetBool, '/set_aruco_follower_enabled')
         
+    def log_with_time(self, level, message):
+        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
+        full_message = f"[{timestamp}] {message}"
+        if level == 'info':
+            self.get_logger().info(full_message)
+        elif level == 'error':
+            self.get_logger().error(full_message)
+        elif level == 'warn':
+            self.get_logger().warn(full_message)
+        else:
+            self.get_logger().debug(full_message)        
+
+    def send_gripper_command(self, command: str):
+        """Send 'open' or 'close' to Arduino via serial."""
+        if self.serial_port and self.serial_port.is_open:
+            try:
+                self.serial_port.write((command + "\n").encode('utf-8'))
+                self.log_with_time('info', f"Sent gripper command: {command}")
+                self.status_label.config(text=f"Gripper {command} command sent")
+            except Exception as e:
+                self.log_with_time('error', f"Failed to send gripper command: {e}")
+                self.status_label.config(text=f"Failed to send {command}")
+        else:
+            self.log_with_time('error', "Serial port not open")
+            self.status_label.config(text="Serial not open")
+
+
+
     def brick_info_callback(self, msg):
         if len(msg.data) == 4:
             self.latest_brick_center = tuple(msg.data[0:3])
@@ -155,112 +200,207 @@ class TkinterROS(Node):
     def init_dialog(self):
         self.root = tk.Tk()
         self.root.title("Tkinter and ROS 2")
-        self.root.geometry("1200x600")
+        self.root.geometry("1200x800")
+
         self.mode_var = tk.StringVar(value="Calibration")
         self.cartesian_var = tk.BooleanVar(value=True)
+
+        # Main container
         self.main_frame = tk.Frame(self.root)
         self.main_frame.pack(fill=tk.BOTH, expand=True)
         self.main_frame.columnconfigure(0, weight=1)
         self.main_frame.columnconfigure(1, weight=2)
 
+        # LEFT side with tabs
         self.left_frame = tk.Frame(self.main_frame)
         self.left_frame.grid(row=0, column=0, sticky='nsew', padx=10, pady=10)
 
-        self.status_label = tk.Label(self.left_frame, text="Waiting", font=("Arial", 16))
+        self.notebook = ttk.Notebook(self.left_frame)
+        self.notebook.pack(fill=tk.BOTH, expand=True)
+
+        # Tabs
+        self.tab_main = tk.Frame(self.notebook)
+        self.tab_tools = tk.Frame(self.notebook)
+        self.notebook.add(self.tab_main, text="Main")
+        self.notebook.add(self.tab_tools, text="Tools")
+        
+        self.init_calibration_tab()
+
+        # ======== MAIN TAB ========
+        self.status_label = tk.Label(self.tab_main, text="Waiting", font=("Arial", 16))
         self.status_label.pack(pady=10)
 
-        self.button_row = tk.Frame(self.left_frame)
+        # Homing / Calibrate / Go Home
+        self.button_row = tk.Frame(self.tab_main)
         self.button_row.pack(pady=10)
 
-        self.homing_button = tk.Button(self.button_row, text="Homing", command=self.on_homing_button_click, font=("Arial", 14), width=10, height=1)
-        self.homing_button.grid(row=0, column=0, padx=5)
+        tk.Button(self.button_row, text="Homing", command=self.on_homing_button_click,
+                font=("Arial", 14), width=10, height=1).grid(row=0, column=0, padx=5)
+        tk.Button(self.button_row, text="Calibrate", command=self.on_calibrate_button_click,
+                font=("Arial", 14), width=10, height=1).grid(row=0, column=1, padx=5)
+        tk.Button(self.button_row, text="Go Home", command=self.on_go_home_button_click,
+                font=("Arial", 14), width=10, height=1).grid(row=0, column=2, padx=5)
 
-        self.calibrate_button = tk.Button(self.button_row, text="Calibrate", command=self.on_calibrate_button_click, font=("Arial", 14), width=10, height=1)
-        self.calibrate_button.grid(row=0, column=1, padx=5)
-
-        self.validate_button = tk.Button(self.button_row, text="Go Home", command=self.on_go_home_button_click, font=("Arial", 14), width=10, height=1)
-        self.validate_button.grid(row=0, column=2, padx=5)
-
-        # --- Create a frame to hold the text and button side by side ---
-        self.pos_container = tk.Frame(self.left_frame)
+        # Pose text + copy button
+        self.pos_container = tk.Frame(self.tab_main)
         self.pos_container.pack(pady=10)
 
-        # --- Add the Text widget to the container ---
         self.pos_text = tk.Text(self.pos_container, height=2, font=("Arial", 10), wrap="word", width=60)
         self.pos_text.pack(side=tk.LEFT)
 
-        # --- Add the Button to the right ---
         self.copy_button = tk.Button(self.pos_container, text="Copy to entries", command=self.copy_pos_to_entries)
         self.copy_button.pack(side=tk.LEFT, padx=5)
 
-        self.pose_frame = tk.Frame(self.left_frame)
-        self.pose_frame.pack(pady=(10))
+        # Pose entries + move
+        self.pose_frame = tk.Frame(self.tab_main)
+        self.pose_frame.pack(pady=10)
 
         self.pos_num_label = tk.Label(self.pose_frame, text="#0", font=("Arial", 12))
         self.pos_num_label.grid(row=0, column=0, padx=5)
-
-        self.translation_label = tk.Label(self.pose_frame, text="Translation:", font=("Arial", 10))
-        self.translation_label.grid(row=0, column=1, padx=5)
 
         self.translation_entry = tk.Entry(self.pose_frame, font=("Arial", 10), width=21)
         self.translation_entry.grid(row=0, column=2, padx=5)
         self.translation_entry.insert(0, str(self.cal_poses[0][0]))
 
-        self.rotation_label = tk.Label(self.pose_frame, text="Rotation:", font=("Arial", 10))
-        self.rotation_label.grid(row=0, column=3, padx=5)
-
         self.rotation_entry = tk.Entry(self.pose_frame, font=("Arial", 10), width=27)
         self.rotation_entry.grid(row=0, column=4, padx=5)
         self.rotation_entry.insert(0, str(self.cal_poses[0][1]))
 
-        self.send_pos_button = tk.Button(self.pose_frame, text="Move!", command=self.on_send_pos_button_click, font=("Arial", 14), width=8, height=1)
-        self.send_pos_button.grid(row=0, column=5, padx=5)
+        tk.Button(self.pose_frame, text="Move!", command=self.on_send_pos_button_click,
+                font=("Arial", 14), width=8, height=1).grid(row=0, column=5, padx=5)
 
-        self.cartesian_checkbox = tk.Checkbutton(self.pose_frame,text="Cartesian",variable=self.cartesian_var,font=("Arial", 12))
+        self.cartesian_checkbox = tk.Checkbutton(self.pose_frame, text="Cartesian",
+                                                variable=self.cartesian_var, font=("Arial", 12))
         self.cartesian_checkbox.grid(row=0, column=6, padx=5)
 
-        tk.Button(self.pose_frame, text="Save Pos", command=self.save_current_pose).grid(row=0, column=7, columnspan=1)
+        tk.Button(self.pose_frame, text="Save Pos", command=self.save_current_pose).grid(row=0, column=7, padx=5)
 
-        self.sample_frame = tk.Frame(self.left_frame)
+        # Sample / calibration buttons
+        self.sample_frame = tk.Frame(self.tab_main)
         self.sample_frame.pack(pady=(20, 5))
 
-        self.take_sample_button = tk.Button(self.sample_frame, text="Take Sample", command=self.on_take_sample_button_click, font=("Arial", 10), width=8, height=1)
-        self.take_sample_button.grid(row=0, column=0, padx=5)
+        tk.Button(self.sample_frame, text="Take Sample", command=self.on_take_sample_button_click,
+                font=("Arial", 10), width=8).grid(row=0, column=0, padx=5)
+        tk.Button(self.sample_frame, text="Save Samples", command=self.on_save_samples_button_click,
+                font=("Arial", 10), width=8).grid(row=0, column=1, padx=5)
+        tk.Button(self.sample_frame, text="Move To Marker", command=self.move_to_marker,
+                font=("Arial", 10), width=12).grid(row=0, column=2, padx=5)
+        tk.Button(self.sample_frame, text="Move to Brick", command=self.move_to_brick_process,
+                font=("Arial", 10), width=12).grid(row=0, column=3, padx=5)
+        tk.Button(self.sample_frame, text="Auto Calib", command=self.on_auto_calibrate_button_click,
+                font=("Arial", 10), width=12).grid(row=0, column=4, padx=5)
 
-        self.save_sample_button = tk.Button(self.sample_frame, text="Save Samples", command=self.on_save_samples_button_click, font=("Arial", 10), width=8, height=1)
-        self.save_sample_button.grid(row=0, column=1, padx=5)
-
-        self.auto_adjust_button = tk.Button(self.sample_frame,text="Move To Marker",command=self.move_to_marker, font=("Arial", 10), width=12, height=1)
-        self.auto_adjust_button.grid(row=0, column=2, padx=5)
-
-        # self.brick_center_button = tk.Button(self.sample_frame,text="Move to Brick",command=self.on_use_brick_center_click,font=("Arial", 10),width=12,height=1)
-        self.brick_center_button = tk.Button(self.sample_frame,text="Move to Brick",command=self.move_to_brick_process,font=("Arial", 10),width=12,height=1)
-        
-        self.brick_center_button.grid(row=0, column=3, padx=5)
-
-
-        self.auto_align_button = tk.Button(self.sample_frame,text="Auto Calib",command=self.on_auto_calibrate_button_click,font=("Arial", 10),width=12,height=1)
-        self.auto_align_button.grid(row=0, column=4, padx=5)
-
-
-        self.add_pose_adjustment_controls()
-        # Translation adjustment controls
+        # Jog / adjustment controls
+        self.add_pose_adjustment_controls()  # ← contains your further/closer/left/right/up/down
         self.add_adjustment_frame()
 
+        # ======== TOOLS TAB ========
+        tk.Label(self.tab_tools, text="Utilities", font=("Arial", 12, "bold")).pack(pady=(8, 4))
+
+        # Gripper controls
+        grip = tk.LabelFrame(self.tab_tools, text="Gripper")
+        grip.pack(fill=tk.X, padx=8, pady=6)
+
+        tk.Button(grip, text="Open Gripper",
+                command=lambda: self.send_gripper_command("open"),
+                width=12, height=1).pack(side=tk.LEFT, padx=5, pady=5)
+        tk.Button(grip, text="Close Gripper",
+                command=lambda: self.send_gripper_command("close"),
+                width=12, height=1).pack(side=tk.LEFT, padx=5, pady=5)
+
+        # Z quick moves
+        zgrp = tk.LabelFrame(self.tab_tools, text="Z Height (absolute)")
+        zgrp.pack(fill=tk.X, padx=8, pady=6)
+
+        tk.Button(zgrp, text="31 cm", command=lambda: self.move_to_height_cm(31), width=8)\
+            .pack(side=tk.LEFT, padx=4, pady=5)
+        tk.Button(zgrp, text="17 cm", command=lambda: self.move_to_height_cm(17), width=8)\
+            .pack(side=tk.LEFT, padx=4, pady=5)
+        tk.Button(zgrp, text="14 cm", command=lambda: self.move_to_height_cm(14), width=8)\
+            .pack(side=tk.LEFT, padx=4, pady=5)
+
+        # Start periodic updates
         self.update_position_label()
-        # self.root.after(100, self.tk_mainloop)
-        
-    def log_with_time(self, level, message):
-        timestamp = datetime.datetime.now().strftime("%H:%M:%S")
-        full_message = f"[{timestamp}] {message}"
-        if level == 'info':
-            self.get_logger().info(full_message)
-        elif level == 'error':
-            self.get_logger().error(full_message)
-        elif level == 'warn':
-            self.get_logger().warn(full_message)
-        else:
-            self.get_logger().debug(full_message)
+
+
+    def init_calibration_tab(self):
+        """Initialize and populate the Calibration tab with ± buttons for each joint."""
+        # Create Calibration tab
+        self.tab_calibration = tk.Frame(self.notebook)
+        self.notebook.add(self.tab_calibration, text="Calibration")
+
+        # Column config
+        for c in range(4):
+            self.tab_calibration.grid_columnconfigure(c, weight=1, uniform="cal")
+
+        # Header and step size control
+        tk.Label(
+            self.tab_calibration, text="Joint Nudges (HM)", font=("Arial", 12, "bold")
+        ).grid(row=0, column=0, columnspan=4, pady=(8, 6), sticky="w")
+
+        tk.Label(self.tab_calibration, text="Step size (steps):").grid(row=1, column=0, sticky="e", padx=4, pady=2)
+        self.hm_step_entry = tk.Entry(self.tab_calibration, width=6)
+        self.hm_step_entry.grid(row=1, column=1, sticky="w", padx=4, pady=2)
+        self.hm_step_entry.insert(0, "5")
+
+        # Service status label
+        self.nudge_status_var = tk.StringVar(value="Service: unknown")
+        tk.Label(self.tab_calibration, textvariable=self.nudge_status_var).grid(row=1, column=2, columnspan=2, sticky="w")
+
+        # --- Joint 1 ---
+        tk.Label(self.tab_calibration, text="1. Base Rotate").grid(row=2, column=0, sticky="e", padx=6, pady=4)
+        tk.Button(self.tab_calibration, text="–", width=6,
+                command=partial(self.hm_nudge, 0, -1)).grid(row=2, column=1, padx=4, pady=4, sticky="ew")
+        tk.Button(self.tab_calibration, text="+", width=6,
+                command=partial(self.hm_nudge, 0, +1)).grid(row=2, column=2, padx=4, pady=4, sticky="ew")
+
+        # --- Joint 2 ---
+        tk.Label(self.tab_calibration, text="2. Shoulder").grid(row=3, column=0, sticky="e", padx=6, pady=4)
+        tk.Button(self.tab_calibration, text="BACK", width=6,
+                command=partial(self.hm_nudge, 1, -1)).grid(row=3, column=1, padx=4, pady=4, sticky="ew")
+        tk.Button(self.tab_calibration, text="FWD", width=6,
+                command=partial(self.hm_nudge, 1, +1)).grid(row=3, column=2, padx=4, pady=4, sticky="ew")
+
+        # --- Joint 3 ---
+        tk.Label(self.tab_calibration, text="3. Elbow").grid(row=4, column=0, sticky="e", padx=6, pady=4)
+        tk.Button(self.tab_calibration, text="UP", width=6,
+                command=partial(self.hm_nudge, 2, -1)).grid(row=4, column=1, padx=4, pady=4, sticky="ew")
+        tk.Button(self.tab_calibration, text="DOWN", width=6,
+                command=partial(self.hm_nudge, 2, +1)).grid(row=4, column=2, padx=4, pady=4, sticky="ew")
+
+        # --- Joint 4 ---
+        tk.Label(self.tab_calibration, text="4. Wrist Pitch").grid(row=5, column=0, sticky="e", padx=6, pady=4)
+        tk.Button(self.tab_calibration, text="CW", width=6,
+                command=partial(self.hm_nudge, 3, -1)).grid(row=5, column=1, padx=4, pady=4, sticky="ew")
+        tk.Button(self.tab_calibration, text="CCW", width=6,
+                command=partial(self.hm_nudge, 3, +1)).grid(row=5, column=2, padx=4, pady=4, sticky="ew")
+
+        # --- Joint 5 ---
+        tk.Label(self.tab_calibration, text="5. Wrist Rotate").grid(row=6, column=0, sticky="e", padx=6, pady=4)
+        tk.Button(self.tab_calibration, text="UP", width=6,
+                command=partial(self.hm_nudge, 4, -1)).grid(row=6, column=1, padx=4, pady=4, sticky="ew")
+        tk.Button(self.tab_calibration, text="DOWN", width=6,
+                command=partial(self.hm_nudge, 4, +1)).grid(row=6, column=2, padx=4, pady=4, sticky="ew")
+
+        # --- Joint 6 ---
+        tk.Label(self.tab_calibration, text="6. End Effector").grid(row=7, column=0, sticky="e", padx=6, pady=4)
+        tk.Button(self.tab_calibration, text="CW", width=6,
+                command=partial(self.hm_nudge, 5, -1)).grid(row=7, column=1, padx=4, pady=4, sticky="ew")
+        tk.Button(self.tab_calibration, text="CCW", width=6,
+                command=partial(self.hm_nudge, 5, +1)).grid(row=7, column=2, padx=4, pady=4, sticky="ew")
+
+        # --- Create the NudgeJoint service client ---
+        self.nudge_service_name = "/ar4_hardware_interface_node/nudge_joint"
+        self.nudge_joint_srv_type = NudgeJoint
+        self.nudge_joint_client = self.create_client(self.nudge_joint_srv_type, self.nudge_service_name)
+
+        try:
+            self.nudge_cli = self.create_client(NudgeJoint, self.nudge_service_name)
+        except Exception as e:
+            self.log_with_time('error', f"Failed to create NudgeJoint client: {e}")
+            # self.nudge_status_var.set("Service: client create failed")
+
+
 
     def copy_pos_to_entries(self):
         """
@@ -351,6 +491,65 @@ class TkinterROS(Node):
         self.refine_pose_with_ee_camera()
         self.move_to_height (0.12)
 
+
+    def _get_hm_step_magnitude(self) -> int:
+        raw = self.hm_step_entry.get().strip()
+        try:
+            mag = int(raw)
+        except Exception:
+            self.log_with_time('warn', f"Invalid HM step '{raw}', defaulting to 1")
+            mag = 1
+        if mag == 0:
+            self.log_with_time('warn', "HM step of 0 ignored; using 1")
+            mag = 1
+        return abs(mag)  # magnitude only; sign comes from button
+
+
+    def hm_nudge(self, joint_index: int, direction: int):
+        # direction is ±1 from the button
+        magnitude = self._get_hm_step_magnitude()
+        steps = int(direction) * magnitude
+
+        client = self.nudge_joint_client
+        if client is None:
+            self.log_with_time('error', "Nudge client not initialized")
+            return
+
+        try:
+            if not client.wait_for_service(timeout_sec=0.5):
+                # self.nudge_status_var.set("Service: not available")
+                self.log_with_time('warn', f"{self.nudge_service_name} not available yet")
+                return
+        except Exception as e:
+            self.log_with_time('error', f"Waiting for {self.nudge_service_name} failed: {e}")
+            return
+
+        req = self.nudge_joint_srv_type.Request()
+        req.joint_index = int(joint_index)
+        req.steps = steps
+
+        self.log_with_time('info', f"Sending NudgeJoint: joint_index={req.joint_index}, steps={req.steps}")
+        future = client.call_async(req)
+
+        def _on_done(fut):
+            try:
+                resp = fut.result()
+                if getattr(resp, "success", False):
+                    self.log_with_time('info', f"Nudged joint {req.joint_index} by {req.steps} steps")
+                    # self.nudge_status_var.set("Service: OK")
+                else:
+                    msg = getattr(resp, "message", "(no message)")
+                    self.log_with_time('warn', f"Nudge failed: {msg}")
+                    # self.nudge_status_var.set(f"Service: failed — {msg}")
+            except Exception as e:
+                self.log_with_time('error', f"Nudge call exception: {e}")
+                # self.nudge_status_var.set("Service: error")
+
+        future.add_done_callback(_on_done)
+
+
+
+
     def refine_pose_with_ee_camera(self):
         if None in (self.top_dx_mm, self.top_dy_mm, self.top_angle_deg, self.top_est_height_mm):
             self.log_with_time('warn' ,"No brick info from end-effector camera.")
@@ -435,48 +634,79 @@ class TkinterROS(Node):
             self.gui_queue.put(update_entries)
 
 
-
     def add_adjustment_frame(self):
-        self.adjustment_frame = tk.Frame(self.left_frame)
-        self.adjustment_frame.pack(pady=10)
+        # Parent is the Main tab
+        self.adjustment_frame = tk.Frame(self.tab_main)
+        self.adjustment_frame.pack(pady=10, fill="x", expand=True)
 
-        tk.Label(self.adjustment_frame, text="Adjust Translation/Rotation", font=("Arial", 12)).grid(row=0, column=0, columnspan=6)
+        # 7 columns (0..6) because we also place the delta entry in column 6
+        for i in range(7):
+            self.adjustment_frame.grid_columnconfigure(i, weight=1, uniform="adj")
 
-        # X Axis
-        tk.Button(self.adjustment_frame, text="Further", command=lambda: self.adjust_calib_translation('x', 1.0), width=6).grid(row=1, column=0)
-        tk.Button(self.adjustment_frame, text="Closer", command=lambda: self.adjust_calib_translation('x', -1.0), width=6).grid(row=1, column=1)
+        tk.Label(self.adjustment_frame, text="Adjust Translation/Rotation",
+                font=("Arial", 12)).grid(row=0, column=0, columnspan=7, pady=(0, 4), sticky="w")
 
-        # Y Axis
-        tk.Button(self.adjustment_frame, text="Left", command=lambda: self.adjust_calib_translation('y', 1.0), width=6).grid(row=1, column=2)
-        tk.Button(self.adjustment_frame, text="Right", command=lambda: self.adjust_calib_translation('y', -1.0), width=6).grid(row=1, column=3)
+        # --- Translation row ---
+        btn = tk.Button(self.adjustment_frame, text="Further",
+                        command=lambda: self.adjust_calib_translation('x', 1.0))
+        btn.grid(row=1, column=0, padx=2, pady=2, sticky="ew")
 
-        # Z Axis
-        tk.Button(self.adjustment_frame, text="Down", command=lambda: self.adjust_calib_translation('z', 1.0), width=6).grid(row=1, column=4)
-        tk.Button(self.adjustment_frame, text="Up", command=lambda: self.adjust_calib_translation('z', -1.0), width=6).grid(row=1, column=5)
+        btn = tk.Button(self.adjustment_frame, text="Closer",
+                        command=lambda: self.adjust_calib_translation('x', -1.0))
+        btn.grid(row=1, column=1, padx=2, pady=2, sticky="ew")
 
-        # Delta Entry
+        btn = tk.Button(self.adjustment_frame, text="Left",
+                        command=lambda: self.adjust_calib_translation('y', 1.0))
+        btn.grid(row=1, column=2, padx=2, pady=2, sticky="ew")
+
+        btn = tk.Button(self.adjustment_frame, text="Right",
+                        command=lambda: self.adjust_calib_translation('y', -1.0))
+        btn.grid(row=1, column=3, padx=2, pady=2, sticky="ew")
+
+        btn = tk.Button(self.adjustment_frame, text="Down",
+                        command=lambda: self.adjust_calib_translation('z', 1.0))
+        btn.grid(row=1, column=4, padx=2, pady=2, sticky="ew")
+
+        btn = tk.Button(self.adjustment_frame, text="Up",
+                        command=lambda: self.adjust_calib_translation('z', -1.0))
+        btn.grid(row=1, column=5, padx=2, pady=2, sticky="ew")
+
         self.translation_delta_entry = tk.Entry(self.adjustment_frame, font=("Arial", 12), width=6)
-        self.translation_delta_entry.grid(row=1, column=6, padx=5)
+        self.translation_delta_entry.grid(row=1, column=6, padx=6, pady=2, sticky="w")
         self.translation_delta_entry.insert(0, "0.01")
 
+        # spacer
+        tk.Label(self.adjustment_frame, text="").grid(row=2, column=0)
 
+        # --- Orientation row (single row) ---
+        btn = tk.Button(self.adjustment_frame, text="Roll +",
+                        command=lambda: self.adjust_calib_orientation('x', 1.0))
+        btn.grid(row=3, column=0, padx=2, pady=2, sticky="ew")
 
-        # Roll
-        tk.Button(self.adjustment_frame, text="Roll +", command=lambda: self.adjust_calib_orientation('x',1.0), width=6).grid(row=3, column=0)
-        tk.Button(self.adjustment_frame, text="Roll -", command=lambda: self.adjust_calib_orientation('x',-1.0), width=6).grid(row=3, column=1)
+        btn = tk.Button(self.adjustment_frame, text="Roll -",
+                        command=lambda: self.adjust_calib_orientation('x', -1.0))
+        btn.grid(row=3, column=1, padx=2, pady=2, sticky="ew")
 
-        # Pitch
-        tk.Button(self.adjustment_frame, text="Pitch +", command=lambda: self.adjust_calib_orientation('y',1.0), width=6).grid(row=3, column=2)
-        tk.Button(self.adjustment_frame, text="Pitch -", command=lambda: self.adjust_calib_orientation('y',-1.0), width=6).grid(row=3, column=3)
+        btn = tk.Button(self.adjustment_frame, text="Pitch +",
+                        command=lambda: self.adjust_calib_orientation('y', 1.0))
+        btn.grid(row=3, column=2, padx=2, pady=2, sticky="ew")
 
-        # Yaw
-        tk.Button(self.adjustment_frame, text="Yaw +", command=lambda: self.adjust_calib_orientation('z',1.0), width=6).grid(row=3, column=4)
-        tk.Button(self.adjustment_frame, text="Yaw -", command=lambda: self.adjust_calib_orientation('z',-1.0), width=6).grid(row=3, column=5)
+        btn = tk.Button(self.adjustment_frame, text="Pitch -",
+                        command=lambda: self.adjust_calib_orientation('y', -1.0))
+        btn.grid(row=3, column=3, padx=2, pady=2, sticky="ew")
 
-        # Delta Entry
+        btn = tk.Button(self.adjustment_frame, text="Yaw +",
+                        command=lambda: self.adjust_calib_orientation('z', 1.0))
+        btn.grid(row=3, column=4, padx=2, pady=2, sticky="ew")
+
+        btn = tk.Button(self.adjustment_frame, text="Yaw -",
+                        command=lambda: self.adjust_calib_orientation('z', -1.0))
+        btn.grid(row=3, column=5, padx=2, pady=2, sticky="ew")
+
         self.orientation_delta_entry = tk.Entry(self.adjustment_frame, font=("Arial", 12), width=6)
-        self.orientation_delta_entry.grid(row=3, column=6, padx=5)
-        self.orientation_delta_entry.insert(0, "0.01")
+        self.orientation_delta_entry.grid(row=3, column=6, padx=6, pady=2, sticky="w")
+
+
 
     def adjust_calib_translation(self, axis, direction):
         delta = direction * float(self.translation_delta_entry.get())
@@ -585,31 +815,23 @@ class TkinterROS(Node):
 
     # --- GUI Pose Adjustment Controls (to be called inside TkinterROS.__init__()) ---
     def add_pose_adjustment_controls(self):
+        """Place pose controls at the bottom of the Main tab with consistent geometry manager.
+        NOTE: Avoid mixing pack() and grid() on the same parent. Here we grid() all children
+        of pose_ctrl_frame, and only pack() the frame itself into tab_main.
+        """
         self.pose_index = 0
-        pose_ctrl_frame = tk.Frame(self.left_frame)
-        pose_ctrl_frame.pack(pady=10)
 
-        # self.current_pose_display = tk.Text(pose_ctrl_frame, height=3, font=("Courier", 10), width=40)
-        # self.current_pose_display.grid(row=0, column=0, columnspan=6, pady=5)
+        # The frame itself is packed into the tab; inside we will ONLY use grid()
+        pose_ctrl_frame = tk.Frame(self.tab_main)
+        pose_ctrl_frame.pack(pady=10, fill=tk.X)
 
         def move_to_current_pose():
-
             def format_float(f):
                 return f"{f:.4f}".rstrip("0").rstrip(".") if "." in f"{f:.4f}" else f"{f:.4f}"
-
             pos, ori = self.cal_poses[self.pose_index]
-            pose_msg = self.create_pose(pos, ori)
-            
-
-            # Update pose display
-            # self.current_pose_display.configure(state='normal')
-            # self.current_pose_display.delete("1.0", tk.END)
-            # self.current_pose_display.insert(tk.END, f"{pos}\n{ori}")
-            # self.current_pose_display.configure(state='disabled')
-
-            # Also update entry widgets
+            _ = self.create_pose(pos, ori)  # not used directly; just ensures pose validity
+            # Update entry widgets
             self.translation_entry.delete(0, tk.END)
-            #self.translation_entry.insert(0, f"({pos[0]:.4f}, {pos[1]:.4f}, {pos[2]:.4f})")
             self.translation_entry.insert(0, f"({', '.join(format_float(x) for x in pos)})")
             self.rotation_entry.delete(0, tk.END)
             self.rotation_entry.insert(0, f"({', '.join(format_float(x) for x in ori)})")
@@ -627,36 +849,38 @@ class TkinterROS(Node):
                 self.rotation_entry.insert(0, f"({new_ori[0]:.4f}, {new_ori[1]:.4f}, {new_ori[2]:.4f}, {new_ori[3]:.4f})")
                 self.send_pose_from_entries()
             except Exception as e:
-                self.log_with_time('error' ,f"Failed to adjust orientation: {e}")
-
+                self.log_with_time('error', f"Failed to adjust orientation: {e}")
 
         def prev_pose():
             self.pose_index = max(0, self.pose_index - 1)
             self.pos_num_label.configure(text=f"#{self.pose_index}")
-            #self.copy_aruco_pose_to_clipboard()
             move_to_current_pose()
 
         def next_pose():
             if self.pose_index >= len(self.cal_poses) - 1:
-                self.pose_index = 0  # Loop back to the first pose if at the end
-                return
-            self.pose_index = min(len(self.cal_poses) - 1, self.pose_index + 1)
+                self.pose_index = 0
+            else:
+                self.pose_index += 1
             self.pos_num_label.configure(text=f"#{self.pose_index}")
-            #self.copy_aruco_pose_to_clipboard()
             move_to_current_pose()
 
-        tk.Button(pose_ctrl_frame, text="Prev Pose", command=prev_pose).grid(row=1, column=0)
-        tk.Button(pose_ctrl_frame, text="Next Pose", command=next_pose).grid(row=1, column=1)       
-        delta = 0.1
-        tk.Button(pose_ctrl_frame, text="Roll +", command=lambda: adjust_orientation(0, delta)).grid(row=1, column=2)
-        tk.Button(pose_ctrl_frame, text="Roll -", command=lambda: adjust_orientation(0, -delta)).grid(row=1, column=3)
-        tk.Button(pose_ctrl_frame, text="Pitch +", command=lambda: adjust_orientation(1, delta)).grid(row=2, column=2)
-        tk.Button(pose_ctrl_frame, text="Pitch -", command=lambda: adjust_orientation(1, -delta)).grid(row=2, column=3)
-        tk.Button(pose_ctrl_frame, text="Yaw +", command=lambda: adjust_orientation(2, delta)).grid(row=2, column=0)
-        tk.Button(pose_ctrl_frame, text="Yaw -", command=lambda: adjust_orientation(2, -delta)).grid(row=2, column=1)
-      
+        # Row 0: header
+        tk.Label(pose_ctrl_frame, text="Pose Controls", font=("Arial", 12, "bold")).grid(row=0, column=0, columnspan=6, pady=(0,6))
 
-        #self.update_pose_display()
+        # Row 1: Prev/Next and Move-to
+        tk.Button(pose_ctrl_frame, text="Prev Pose", command=prev_pose, width=10).grid(row=1, column=0, padx=4, pady=3)
+        tk.Button(pose_ctrl_frame, text="Next Pose", command=next_pose, width=10).grid(row=1, column=1, padx=4, pady=3)
+        tk.Button(pose_ctrl_frame, text="Move to Current Pose", command=move_to_current_pose, width=20).grid(row=1, column=2, columnspan=2, padx=4, pady=3)
+
+        # Row 2-3: Orientation jogs
+        delta = 0.1
+        tk.Button(pose_ctrl_frame, text="Yaw +", command=lambda: adjust_orientation(2,  delta), width=8).grid(row=2, column=0, padx=3, pady=3)
+        tk.Button(pose_ctrl_frame, text="Yaw -", command=lambda: adjust_orientation(2, -delta), width=8).grid(row=2, column=1, padx=3, pady=3)
+        tk.Button(pose_ctrl_frame, text="Roll +", command=lambda: adjust_orientation(0,  delta), width=8).grid(row=2, column=2, padx=3, pady=3)
+        tk.Button(pose_ctrl_frame, text="Roll -", command=lambda: adjust_orientation(0, -delta), width=8).grid(row=2, column=3, padx=3, pady=3)
+        tk.Button(pose_ctrl_frame, text="Pitch +", command=lambda: adjust_orientation(1,  delta), width=8).grid(row=3, column=2, padx=3, pady=3)
+        tk.Button(pose_ctrl_frame, text="Pitch -", command=lambda: adjust_orientation(1, -delta), width=8).grid(row=3, column=3, padx=3, pady=3)
+
 
     # def update_pose_display(self):
     #     pos, ori = self.cal_poses[self.pose_index]
@@ -755,15 +979,15 @@ class TkinterROS(Node):
                     if self.zero_velocity_positions is None:
                         # Save current positions for comparison later
                         self.zero_velocity_positions = list(msg.position)
-                    else:
+                    # else:
                         # Compare current positions with previously saved positions
-                        for i, (new_pos, ref_pos) in enumerate(zip(msg.position, self.zero_velocity_positions)):
-                            if abs(new_pos - ref_pos) > 0.1:  # Tolerance in radians
-                                self.log_with_time('error' ,
-                                    f"Unintended motion detected on joint {i}: "
-                                    f"saved={ref_pos:.4f}, current={new_pos:.4f}, delta={abs(new_pos - ref_pos):.5f}"
-                                )
-                                messagebox.showinfo("Info", "Encoder error: unintended movement with zero velocity reported.")
+                        # for i, (new_pos, ref_pos) in enumerate(zip(msg.position, self.zero_velocity_positions)):
+                        #     if abs(new_pos - ref_pos) > 0.1:  # Tolerance in radians
+                        #         self.log_with_time('error' ,
+                        #             f"Unintended motion detected on joint {i}: "
+                        #             f"saved={ref_pos:.4f}, current={new_pos:.4f}, delta={abs(new_pos - ref_pos):.5f}"
+                        #         )
+                        #         messagebox.showinfo("Info", "Encoder error: unintended movement with zero velocity reported.")
                 else:
                     # If robot is moving, clear saved reference
                     self.zero_velocity_positions = None
