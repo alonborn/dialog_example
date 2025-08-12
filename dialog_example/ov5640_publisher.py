@@ -39,8 +39,10 @@ class OV5640Publisher(Node):
         self.cap.set(cv2.CAP_PROP_FPS, 5)
 
         if not self.cap.isOpened():
-            self.get_logger().error('Failed to open video device')
-            rclpy.shutdown()
+            self.get_logger().warn('Camera not available — using black frames')
+            self.use_dummy_frame = True
+        else:
+            self.use_dummy_frame = False
 
         self.capture_folder = "captured_images"
         os.makedirs(self.capture_folder, exist_ok=True)
@@ -65,8 +67,9 @@ class OV5640Publisher(Node):
         # Precompute undistortion map
         ret, frame = self.cap.read()
         if not ret or frame is None:
-            self.get_logger().error("Failed to read initial frame")
-            rclpy.shutdown()
+            self.get_logger().warn("No initial frame — using black frame for calibration")
+            height, width = 480, 640
+            frame = np.zeros((height, width, 3), dtype=np.uint8)
 
         h, w = frame.shape[:2]
         self.new_K, _ = cv2.getOptimalNewCameraMatrix(self.K, self.dist, (w, h), 1, (w, h))
@@ -219,8 +222,9 @@ class OV5640Publisher(Node):
     def timer_callback(self):
         ret, frame = self.cap.read()
         if not ret or frame is None:
-            self.get_logger().warn('Failed to read frame')
-            return
+            # Create a black frame matching the calibration map size
+            height, width = self.map1.shape[:2]
+            frame = np.zeros((height, width, 3), dtype=np.uint8)
 
         # Undistort/rectify
         frame = cv2.remap(frame, self.map1, self.map2, interpolation=cv2.INTER_LINEAR)
