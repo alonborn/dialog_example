@@ -15,12 +15,17 @@ from glob import glob
 import numpy as np
 from std_msgs.msg import Float32MultiArray
 from sensor_msgs.msg import JointState  # already available in ROS 2
-
+from ultralytics.utils import LOGGER
+LOGGER.setLevel("ERROR")
 
 class OV5640Publisher(Node):
     def __init__(self):
         super().__init__('ov5640_publisher')
         self.joint_states = None  # Initialize joint states to None
+        self.last_rotated_points = None
+        self.last_center = None
+        self.last_angle = None
+        self.last_prediction_time = None
         # ROS image publisher
         # self.publisher_ = self.create_publisher(Image, 'camera/image_raw', 10)
         # self.pose_pub = self.create_publisher(Pose2D, 'brick_info', 10)
@@ -50,6 +55,7 @@ class OV5640Publisher(Node):
 
         # Load YOLOv8 OBB model
         model_path = "/home/alon/Documents/Projects/top_view_train/runs/obb/train8/weights/best.pt"
+        #model_path = "/home/alon/Documents/Projects/top_view_train/runs/obb/train2/weights/best.pt"
         self.model = YOLO(model_path)
         self.handle_camera_calibration()
 
@@ -122,6 +128,15 @@ class OV5640Publisher(Node):
         except Exception:
             return None, None
 
+    def normalize_angle(self, angle_deg):
+
+        # Normalize to [-90, 90]
+        if angle_deg > 90:
+            angle_deg -= 180
+        elif angle_deg < -90:
+            angle_deg += 180
+        return angle_deg
+
     def calculate_brick_yaw(self,points):
         """
         Calculate the brick yaw angle (long edge orientation) from 4 OBB points.
@@ -148,12 +163,6 @@ class OV5640Publisher(Node):
         # Calculate angle
         angle_rad = np.arctan2(dy_edge, dx_edge)
         angle_deg = float(np.degrees(angle_rad))
-
-        # Normalize to [-90, 90]
-        if angle_deg > 90:
-            angle_deg -= 180
-        elif angle_deg < -90:
-            angle_deg += 180
 
         return angle_deg
 
@@ -222,176 +231,155 @@ class OV5640Publisher(Node):
     def timer_callback(self):
         ret, frame = self.cap.read()
         if not ret or frame is None:
-            # Create a black frame matching the calibration map size
-            height, width = self.map1.shape[:2]
-            frame = np.zeros((height, width, 3), dtype=np.uint8)
+            self.get_logger().warn("Failed to read frame")
+            return
 
-        # Undistort/rectify
-        frame = cv2.remap(frame, self.map1, self.map2, interpolation=cv2.INTER_LINEAR)
 
-        # Shift so optical center becomes image center
-        cx, cy = self.optical_center
-        h, w = frame.shape[:2]
-        target_cx, target_cy = w / 2, h / 2
-        dx, dy = target_cx - cx, target_cy - cy
-        M_translate = np.float32([[1, 0, dx], [0, 1, dy]])
-        frame = cv2.warpAffine(frame, M_translate, (w, h))
-
-        orig_frame = frame.copy()
-
-        # Align camera orientation
+        # Rotate and flip if needed
         frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
         frame = cv2.flip(frame, 1)
 
-        # --- Read joint angles ---
-        j1 = self.get_joint_angle('joint_1')
-        j2 = self.get_joint_angle('joint_2')
-        j3 = self.get_joint_angle('joint_3')
-        j5 = self.get_joint_angle('joint_5')
-        j6 = self.get_joint_angle('joint_6')
-
-        if j1 is None or j6 is None:
-            self.get_logger().warn("Joint angles not available, skipping frame processing")
-            return
-
-        # Total rotation for the image (use J1 + J6)
-        total_angle = j1 + j6
-
-        # Rotate the frame about its center
-        h, w = frame.shape[:2]
-        center = (w // 2, h // 2)
-        M = cv2.getRotationMatrix2D(center, total_angle, 1.0)
-        frame = cv2.warpAffine(frame, M, (w, h))
-
-        # Inference
-        try:
-            results = self.model.predict(frame, imgsz=640, conf=0.8, verbose=False)[0]
-            orig_results = self.model.predict(orig_frame, imgsz=640, conf=0.8, verbose=False)[0]
-        except Exception as e:
-            self.get_logger().error(f"Inference failed: {e}")
-            return
-
-        annotated_frame = results.plot()
-
-        # --- Overlay joint angles (J1, J2, J3, J5, J6) ---
-        # Only print those we actually have
-        y = 30
-        for label, angle in (("J1", j1), ("J2", j2), ("J3", j3), ("J5", j5), ("J6", j6)):
-            if angle is not None:
-                cv2.putText(annotated_frame, f"{label}: {angle:.1f}", (10, y),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                y += 30
 
         frame_h, frame_w = frame.shape[:2]
         center_x, center_y = frame_w / 2, frame_h / 2
 
-        # --- Process oriented bounding boxes (OBB) ---
-        if hasattr(results, "obb") and results.obb is not None and getattr(results.obb, "xyxyxyxy", None) is not None:
-            try:
-                boxes = results.obb.xyxyxyxy
-                orig_boxes = orig_results.obb.xyxyxyxy
-                confs = results.obb.conf.cpu().numpy()
+        annotated_frame = frame.copy()
 
-                for obb, conf, obb_orig in zip(boxes, confs, orig_boxes):
-                    if conf is None or conf < 0.7:
+        # Get joint angles
+        j1 = self.get_joint_angle("joint_1")
+        j6 = self.get_joint_angle("joint_6")
+        if j1 is None or j6 is None:
+            self.get_logger().warn("Joint angles not available")
+            return
+
+        # Run YOLO OBB detection
+        results = self.model(frame)
+        found_prediction = False
+
+        for r in results:
+            if not hasattr(r, "obb") or r.obb is None:
+                continue
+            for obb in r.obb.xyxyxyxy:
+                points = obb.cpu().numpy().reshape(4, 2)
+                if points.shape != (4, 2) or np.isnan(points).any():
+                    continue
+
+                # --- Black area filter ---
+                cx_orig = int(points[:, 0].mean())
+                cy_orig = int(points[:, 1].mean())
+                if 1 <= cx_orig < frame_w - 1 and 1 <= cy_orig < frame_h - 1:
+                    region = frame[cy_orig-1:cy_orig+2, cx_orig-1:cx_orig+2]
+                    if region.size > 0 and region.mean() < 10:
                         continue
 
-                    points = obb.cpu().numpy().reshape(4, 2)
-                    orig_points = obb_orig.cpu().numpy().reshape(4, 2)
-                    if points.shape != (4, 2) or np.isnan(points).any():
-                        continue
+                # --- Aspect ratio filter ---
+                edge_lengths = [
+                    np.linalg.norm(points[1] - points[0]),
+                    np.linalg.norm(points[2] - points[1]),
+                    np.linalg.norm(points[3] - points[2]),
+                    np.linalg.norm(points[0] - points[3])
+                ]
+                length_px = max(edge_lengths)
+                width_px = min(edge_lengths)
+                if width_px == 0:
+                    continue
+                ratio = length_px / width_px
+                expected_ratio = 24.6 / 14.6
+                if abs(ratio - expected_ratio) > 0.15:  # tolerance
+                    continue
 
-                    cx = float(points[:, 0].mean())
-                    cy = float(points[:, 1].mean())
+                # --- Yaw angle ---
+                angle_deg = self.calculate_brick_yaw(points)
+                rotate_angle = -angle_deg
+                
+                angle_deg = self.normalize_angle(angle_deg)
+                if angle_deg is None:
+                    continue
+                
 
-                    # Draw center
-                    cv2.circle(annotated_frame, (int(cx), int(cy)), 4, (0, 255, 255), -1)
+                # Rotate bbox points
+                M_rot = cv2.getRotationMatrix2D((center_x, center_y), rotate_angle, 1.0)
+                rotated_points = np.hstack([points, np.ones((4, 1))]) @ M_rot.T
+                rotated_points = rotated_points.astype(int)
 
-                    angle_deg = self.calculate_brick_yaw(orig_points)
-                    if angle_deg is None:
-                        continue
+                # Rotated bbox center
+                cx_rot = float(rotated_points[:, 0].mean())
+                cy_rot = float(rotated_points[:, 1].mean())
 
-                    cv2.putText(
-                        annotated_frame, f"{angle_deg:.1f}°",
-                        (int(cx) + 30, int(cy) - 30),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA
-                    )
+                # dx, dy in px
+                dx_px = cx_rot - center_x
+                dy_px = cy_rot - center_y
 
-                    # Vector from image center to brick center
-                    cv2.line(annotated_frame, (int(center_x), int(center_y)), (int(cx), int(cy)), (255, 0, 0), 1)
-                    dx_px = cx - center_x
-                    dy_px = cy - center_y
-                    pixel_dist = float(np.hypot(dx_px, dy_px))
+                # Convert px → mm
+                pixel_to_mm = 23.0 / length_px
+                dx_mm = dx_px * pixel_to_mm
+                dy_mm = dy_px * pixel_to_mm
 
-                    # Estimate pixel→mm using long edge of OBB (assume 23mm long side)
-                    edge1 = np.linalg.norm(points[1] - points[0])
-                    edge2 = np.linalg.norm(points[2] - points[1])
-                    pixel_long_edge = max(edge1, edge2)
-                    if pixel_long_edge <= 0:
-                        continue
+                # Convert to base frame
+                dx_base, dy_base = self.offset_cam_to_base(dx_mm, dy_mm, j1, j6)
+                if dx_base is None or dy_base is None:
+                    continue
 
-                    pixel_to_mm = 23.0 / pixel_long_edge
-                    dx_mm = dx_px * pixel_to_mm
-                    dy_mm = dy_px * pixel_to_mm
+                # Distance in mm
+                dist_mm = np.sqrt(dx_base**2 + dy_base**2)
 
-                    # Convert camera-plane offsets to base frame using J1 & J6
-                    dx_base, dy_base = self.offset_cam_to_base(
-                        dx_mm, dy_mm,
-                        j1 if j1 is not None else 0.0,
-                        j6 if j6 is not None else 0.0
-                    )
-                    if dx_base is None or dy_base is None:
-                        continue
+                # Draw center mark & line
+                cv2.circle(annotated_frame, (int(center_x), int(center_y)), 3, (0, 0, 255), -1)
+                cv2.circle(annotated_frame, (int(cx_rot), int(cy_rot)), 4, (0, 255, 255), -1)
+                cv2.line(annotated_frame, (int(center_x), int(center_y)), (int(cx_rot), int(cy_rot)), (255, 0, 0), 2)
+                cv2.polylines(annotated_frame, [rotated_points], isClosed=True, color=(0, 255, 0), thickness=2)
 
-                    # Height estimate
-                    focal_length_px = (frame_w / 2) / np.tan(np.radians(72 / 2))
-                    brick_half = pixel_long_edge / 2
-                    hypotenuse_px = float(np.hypot(brick_half, pixel_dist))
-                    est_height_mm = (focal_length_px * 23.0) / hypotenuse_px if hypotenuse_px > 0 else 0.0
+                # Text overlay
+                text_color = (255,0,0)
+                cv2.putText(annotated_frame, f"J1: {j1:.1f} deg", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 1)
+                cv2.putText(annotated_frame, f"J6: {j6:.1f} deg", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 1)
+                cv2.putText(annotated_frame, f"dx: {dx_base:.1f} mm", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 1)
+                cv2.putText(annotated_frame, f"dy: {dy_base:.1f} mm", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 1)
+                cv2.putText(annotated_frame, f"Dist: {dist_mm:.1f} mm", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 1)
+                cv2.putText(annotated_frame, f"Angle: {angle_deg:.1f} deg", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 1)
 
-                    # Publish info
-                    info_msg = Float32MultiArray()
-                    info_msg.data = [dx_base, dy_base, float(angle_deg), float(est_height_mm)]
-                    self.info_publisher.publish(info_msg)
+                # Publish info
+                info_msg = Float32MultiArray()
+                info_msg.data = [dx_base, dy_base, float(angle_deg), float(dist_mm)]
+                self.info_publisher.publish(info_msg)
 
-                    # Nice overlays
-                    mid_x = int((center_x + cx) / 2)
-                    mid_y = int((center_y + cy) / 2)
-                    dist_mm = float(np.hypot(dx_mm, dy_mm))
-                    dir_angle_deg = float(np.degrees(np.arctan2(dy_mm, dx_mm)))
+                # Save last prediction
+                self.last_rotated_points = rotated_points
+                self.last_bbox_center = (cx_rot, cy_rot)
+                self.last_dx_base = dx_base
+                self.last_dy_base = dy_base
+                self.last_angle_deg = angle_deg
+                self.last_dist_mm = dist_mm
 
-                    cv2.putText(
-                        annotated_frame,
-                        f"{dist_mm:.1f} mm @ {dir_angle_deg:.1f} deg",
-                        (mid_x - 50, mid_y - 50),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1, cv2.LINE_AA
-                    )
-                    cv2.putText(annotated_frame, f"dx_base: {dx_base:.1f}", (10, y),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
-                    cv2.putText(annotated_frame, f"dy_base: {dy_base:.1f}", (10, y + 30),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+                found_prediction = True
+                break  # only one brick
 
-            except Exception as e:
-                self.get_logger().error(f"Error processing OBB: {e}")
+        # If no prediction, use last
+        if not found_prediction and self.last_rotated_points is not None:
+            cx_rot, cy_rot = self.last_bbox_center
+            cv2.circle(annotated_frame, (int(center_x), int(center_y)), 3, (0, 0, 255), -1)
+            cv2.circle(annotated_frame, (int(cx_rot), int(cy_rot)), 4, (0, 255, 255), -1)
+            cv2.line(annotated_frame, (int(center_x), int(center_y)), (int(cx_rot), int(cy_rot)), (255, 0, 0), 2)
+            cv2.polylines(annotated_frame, [self.last_rotated_points], isClosed=True, color=(0, 255, 0), thickness=2)
 
-        # Show window + keys
-        cv2.imshow('YOLOv8 OBB Inference', annotated_frame)
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            self.get_logger().info("Quit requested, shutting down node.")
-            self.destroy_node()
-        elif key == ord('c'):
-            self.capture_count += 1
-            filename = f"frame_{self.capture_count:05d}.jpg"
-            filepath = os.path.join(self.capture_folder, filename)
-            try:
-                cv2.imwrite(filepath, frame)
-                self.get_logger().info(f"Saved: {filepath}")
-            except Exception as e:
-                self.get_logger().error(f"Failed to save frame: {e}")
+            # Text
+            cv2.putText(annotated_frame, f"J1: {j1:.1f} deg", (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            cv2.putText(annotated_frame, f"J6: {j6:.1f} deg", (10, 40), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            cv2.putText(annotated_frame, f"dx: {self.last_dx_base:.1f} mm", (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            cv2.putText(annotated_frame, f"dy: {self.last_dy_base:.1f} mm", (10, 80), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            cv2.putText(annotated_frame, f"Dist: {self.last_dist_mm:.1f} mm", (10, 100), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
+            cv2.putText(annotated_frame, f"Angle: {self.last_angle_deg:.1f} deg", (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 1)
 
+            # Publish last known values
+            info_msg = Float32MultiArray()
+            info_msg.data = [self.last_dx_base, self.last_dy_base, float(self.last_angle_deg), float(self.last_dist_mm)]
+            self.info_publisher.publish(info_msg)
 
+        # Show annotated frame
+        cv2.imshow("Rotated BBox View", annotated_frame)
+        cv2.waitKey(1)
 
+        
     def run_batch_inference(self):
         input_dir = "/home/alon/Documents/Projects/top_view_train/images/val/"
         output_dir = "/home/alon/Documents/Projects/top_view_train/images/val_annotated/"
@@ -408,7 +396,7 @@ class OV5640Publisher(Node):
                 self.get_logger().warn(f"Could not read {path}")
                 continue
 
-            results = self.model.predict(img, imgsz=640, conf=0.25)[0]
+            results = self.model.predict(img, imgsz=640, conf=0.25,verbose=False)[0]
             annotated = results.plot()
 
             if results.obb is not None and results.obb.xywh is not None:
