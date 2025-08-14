@@ -351,7 +351,7 @@ class OV5640Publisher(Node):
 
                     # Publish info
                     info_msg = Float32MultiArray()
-                    info_msg.data = [dx_base, dy_base, float(angle_deg), float(est_height_mm)]
+                    info_msg.data = [-dx_base, -dy_base, float(angle_deg), float(est_height_mm)]
                     self.info_publisher.publish(info_msg)
 
                     # Nice overlays
