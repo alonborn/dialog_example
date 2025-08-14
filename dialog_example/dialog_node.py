@@ -487,9 +487,9 @@ class TkinterROS(Node):
         self.refine_pose_with_ee_camera()
         # self.refine_pose_with_ee_camera()
 
-        # self.move_to_height (0.17)
-        # self.refine_pose_with_ee_camera()
-        # self.move_to_height (0.12)
+        self.move_to_height (0.17)
+        self.refine_pose_with_ee_camera()
+        self.move_to_height (0.12)
 
 
     def _get_hm_step_magnitude(self) -> int:
