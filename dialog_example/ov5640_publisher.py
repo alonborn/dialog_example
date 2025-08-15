@@ -241,7 +241,7 @@ class OV5640Publisher(Node):
 
         # Align camera orientation
         frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-        frame = cv2.flip(frame, 1)
+        frame = cv2.flip(frame, 1)  #was 1
 
         # --- Read joint angles ---
         j1 = self.get_joint_angle('joint_1')
@@ -430,10 +430,10 @@ class OV5640Publisher(Node):
 
 
 def main(args=None):
-    debugpy.listen(("localhost", 5678))  # Port for debugger to connect
-    print("Waiting for debugger to attach...")
-    debugpy.wait_for_client()
-    print("Debugger connected.")
+    # debugpy.listen(("localhost", 5678))  # Port for debugger to connect
+    # print("Waiting for debugger to attach...")
+    # debugpy.wait_for_client()
+    # print("Debugger connected.")
 
 
     rclpy.init(args=args)
