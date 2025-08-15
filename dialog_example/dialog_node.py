@@ -312,11 +312,11 @@ class TkinterROS(Node):
         zgrp = tk.LabelFrame(self.tab_tools, text="Z Height (absolute)")
         zgrp.pack(fill=tk.X, padx=8, pady=6)
 
-        tk.Button(zgrp, text="31 cm", command=lambda: self.move_to_height_cm(31), width=8)\
+        tk.Button(zgrp, text="31 cm", command=lambda: self.move_to_height(0.31), width=8)\
             .pack(side=tk.LEFT, padx=4, pady=5)
-        tk.Button(zgrp, text="17 cm", command=lambda: self.move_to_height_cm(17), width=8)\
+        tk.Button(zgrp, text="17 cm", command=lambda: self.move_to_height(0.17), width=8)\
             .pack(side=tk.LEFT, padx=4, pady=5)
-        tk.Button(zgrp, text="14 cm", command=lambda: self.move_to_height_cm(14), width=8)\
+        tk.Button(zgrp, text="14 cm", command=lambda: self.move_to_height(0.14), width=8)\
             .pack(side=tk.LEFT, padx=4, pady=5)
 
         # Start periodic updates
@@ -485,6 +485,7 @@ class TkinterROS(Node):
 
     def move_to_brick_process(self):
         self.refine_pose_with_ee_camera()
+
         # self.refine_pose_with_ee_camera()
 
         # self.move_to_height (0.17)
@@ -590,7 +591,7 @@ class TkinterROS(Node):
         corrected_pose = Pose()
         corrected_pose.position.x += ee_pose.position.x + dx_cam
         corrected_pose.position.y += ee_pose.position.y + dy_cam
-        corrected_pose.position.z = ee_pose.position.z
+        corrected_pose.position.z = 0.15 #ee_pose.position.z
 
         # Keep roll/pitch, update yaw
         yaw_rad = np.radians(new_yaw_deg)
@@ -1039,17 +1040,19 @@ class TkinterROS(Node):
         if not client.service_is_ready():
             self.log_with_time('error' ,"Service not available")
             return None
-
+        print(f"Calling service {client.srv_name} with request: {request}")
         future = client.call_async(request)
         done_event = threading.Event()
         result_container = {'result': None}
 
         def _on_response(fut):
+            print(f"Service {client.srv_name} response received")
             self.arm_is_moving = False
             self.update_status_label()
             try:
                 result_container['result'] = fut.result()
-                self.log_with_time('info', f"Service call ended, result: {result_container['result']}")
+                # self.log_with_time('info', f"Service call ended, result: {result_container['result']}")
+                print(f"Service call ended, result: {result_container['result']}")
             except Exception as e:
                 self.log_with_time('error' ,f"Service call failed: {e}")
             finally:
@@ -1274,7 +1277,7 @@ class TkinterROS(Node):
         
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         motion_type = "Cartesian" if is_cartesian else "Joint-space"
-        if not (-0.5 <= pose.position.x <= 0.5 and -0.5 <= pose.position.y <= 0.6 and 0.03 <= pose.position.z <= 0.55):
+        if not (-0.5 <= pose.position.x <= 0.5 and -0.54 <= pose.position.y <= 0.6 and 0.03 <= pose.position.z <= 0.55):
             print(f"[{now}] 🚫 Refused Motion: {motion_type} target out of bounds! Target: pos=({pose.position.x:.3f},{pose.position.y:.3f},{pose.position.z:.3f}) ori={pose.orientation}")
             self.arm_is_moving = False
             return False
@@ -1355,7 +1358,7 @@ class TkinterROS(Node):
                 print(f"Error sending pose: {e}")
  
 
-    def move_to_height(self, height: float, is_cartesian: bool = True):
+    def move_to_height(self, height: float, is_cartesian: bool = False):
         """
         Move the robot to a specified height while preserving X, Y, and orientation.
 
