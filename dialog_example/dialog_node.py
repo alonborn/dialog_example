@@ -546,7 +546,8 @@ class TkinterROS(Node):
         self.initial_marker_pose_base = None  # reset for next use
 
     def move_to_brick_process(self):
-        self.refine_pose_with_ee_camera(0.21)
+        self.open_gripper_srv()
+        self.refine_pose_with_ee_camera(0.20)                                        
         # time.sleep(0.5)
         self.refine_pose_with_ee_camera(0.13)
         self.close_gripper_srv()

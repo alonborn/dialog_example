@@ -466,10 +466,6 @@ class OV5640Publisher(Node):
                         (int(mid_x) - 50, int(mid_y) - 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1, cv2.LINE_AA
                     )
-                    cv2.putText(annotated_frame, f"dx_base: {dx_base:.1f}", (10, int(y_text)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
-                    cv2.putText(annotated_frame, f"dy_base: {dy_base:.1f}", (10, int(y_text + 30)),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
             # else: nothing to draw this frame; annotated_frame is still steady base
         except Exception as e:
             self.get_logger().error(f"Error processing OBB: {e}")
