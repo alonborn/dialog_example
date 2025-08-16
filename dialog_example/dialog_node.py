@@ -40,6 +40,7 @@ from tkinter import ttk
 from functools import partial
 from my_robot_interfaces.srv import NudgeJoint
 import threading
+from my_robot_interfaces.srv import MoveServoToAngle
 
 
 class TkinterROS(Node):
@@ -116,6 +117,9 @@ class TkinterROS(Node):
 
         self.open_gripper_client  = self.create_client(Trigger, '/ar4_hardware_interface_node/open_gripper')
         self.close_gripper_client = self.create_client(Trigger, '/ar4_hardware_interface_node/close_gripper')
+        self.move_servo_client = self.create_client(MoveServoToAngle, '/ar4_hardware_interface_node/move_servo_to_angle')
+
+
 
         # Optional: warn if not up yet (won’t block forever)
         for cli, nm in [(self.open_gripper_client,  'open_gripper'),
@@ -144,7 +148,32 @@ class TkinterROS(Node):
         self.init_right_frame()
         # self.periodic_status_check()
         self.aruco_follower_enabled_client = self.create_client(SetBool, '/set_aruco_follower_enabled')
-        
+
+    def move_servo_to_angle(self, angle_deg: float):
+        if not self.move_servo_client.wait_for_service(timeout_sec=1.0):
+            self.log_with_time('error', "move_servo_to_angle service not available")
+            return False
+
+        req = MoveServoToAngle.Request()
+        req.angle_deg = float(angle_deg)
+
+        # Use your existing blocking helper:
+        resp = self.call_service_blocking(self.move_servo_client, req, timeout_sec=5.0)
+        if resp is None:
+            self.log_with_time('error', "move_servo_to_angle timed out / failed")
+            return False
+
+        if getattr(resp, "success", False):
+            self.log_with_time('info', f"Servo moved to {angle_deg:.1f}°")
+            self.status_label.config(text=f"Servo → {angle_deg:.1f}°")
+            return True
+        else:
+            msg = getattr(resp, "message", "(no message)")
+            self.log_with_time('warn', f"move_servo_to_angle failed: {msg}")
+            self.status_label.config(text=f"Servo move failed: {msg}")
+            return False
+
+
     def log_with_time(self, level, message):
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         full_message = f"[{timestamp}] {message}"
@@ -319,6 +348,8 @@ class TkinterROS(Node):
             .pack(side=tk.LEFT, padx=4, pady=5)
         tk.Button(zgrp, text="14 cm", command=lambda: self.move_to_height(0.14), width=8)\
             .pack(side=tk.LEFT, padx=4, pady=5)
+        tk.Button(zgrp, text="13 cm", command=lambda: self.move_to_height(0.13), width=8)\
+            .pack(side=tk.BOTTOM, padx=4, pady=5)
         tk.Button(zgrp, text="12 cm", command=lambda: self.move_to_height(0.12), width=8)\
             .pack(side=tk.LEFT, padx=4, pady=5)
 
@@ -339,16 +370,19 @@ class TkinterROS(Node):
         return bool(res.success)
 
     def close_gripper_srv(self):
-        req = Trigger.Request()
-        res = self.call_service_blocking(self.close_gripper_client, req, timeout_sec=3.0)
-        if res is None:
-            self.log_with_time('error', "close_gripper: no response / timeout")
-            self.gui_queue.put(lambda: self.status_label.config(text="Close gripper failed"))
-            return False
-        self.log_with_time('info', f"close_gripper: {res.message}")
-        self.gui_queue.put(lambda: self.status_label.config(
-            text="Gripper closed" if res.success else f"Close failed: {res.message}"))
-        return bool(res.success)
+
+        self.move_servo_to_angle(50.0)
+
+        # req = Trigger.Request()
+        # res = self.call_service_blocking(self.close_gripper_client, req, timeout_sec=3.0)
+        # if res is None:
+        #     self.log_with_time('error', "close_gripper: no response / timeout")
+        #     self.gui_queue.put(lambda: self.status_label.config(text="Close gripper failed"))
+        #     return False
+        # self.log_with_time('info', f"close_gripper: {res.message}")
+        # self.gui_queue.put(lambda: self.status_label.config(
+        #     text="Gripper closed" if res.success else f"Close failed: {res.message}"))
+        # return bool(res.success)
 
 
     def init_calibration_tab(self):
@@ -514,7 +548,9 @@ class TkinterROS(Node):
     def move_to_brick_process(self):
         self.refine_pose_with_ee_camera(0.21)
         # time.sleep(0.5)
-        self.refine_pose_with_ee_camera(0.15)
+        self.refine_pose_with_ee_camera(0.13)
+        self.close_gripper_srv()
+        self.refine_pose_with_ee_camera(0.30)
 
         # self.refine_pose_with_ee_camera()
 
@@ -1564,10 +1600,10 @@ def ros_spin_executor(executor): # New
 
 
 def main(): 
-    debugpy.listen(("localhost", 5678))  # Port for debugger to connect
-    print("Waiting for debugger to attach...")
-    debugpy.wait_for_client()
-    print("Debugger connected.")
+    # debugpy.listen(("localhost", 5678))  # Port for debugger to connect
+    # print("Waiting for debugger to attach...")
+    # debugpy.wait_for_client()
+    # print("Debugger connected.")
    
     rclpy.init()
 
