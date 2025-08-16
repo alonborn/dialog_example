@@ -263,7 +263,6 @@ class OV5640Publisher(Node):
         M_translate = np.float32([[1, 0, dx], [0, 1, dy]])
         frame = cv2.warpAffine(frame, M_translate, (w, h))
 
-        orig_frame = frame.copy()
 
         # Align camera orientation (keep as before)
         frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
@@ -297,22 +296,18 @@ class OV5640Publisher(Node):
         # --- Inference (normal + fallback) ---
         try:
             results = self.model.predict(frame, imgsz=640, conf=0.8, verbose=False)[0]
-            # orig_results = self.model.predict(orig_frame, imgsz=640, conf=0.8, verbose=False)[0]
         except Exception as e:
             self.get_logger().error(f"Inference failed: {e}")
             return
 
         # >>> NEW: containers used later; always defined to avoid branching differences
         boxes = []          # list[np.ndarray (4,2)] in current-frame coords
-        # orig_boxes = []     # list[np.ndarray (4,2)] in orig_frame coords
         confs = np.array([])
 
         # >>> CHANGED: consistent OBB extraction with fallback, no results.plot()
-        # if self._has_obb(results) and self._has_obb(orig_results):
         if self._has_obb(results):
             # Normal path: take polygons as-is
             boxes = [poly.cpu().numpy().reshape(4, 2) for poly in results.obb.xyxyxyxy]
-            # orig_boxes = [poly.cpu().numpy().reshape(4, 2) for poly in orig_results.obb.xyxyxyxy]
             confs = results.obb.conf.cpu().numpy()
         else:
             # >>> NEW: Fallback—rotate by +20°, detect, back-rotate polygons; keep display steady
@@ -324,16 +319,13 @@ class OV5640Publisher(Node):
 
             try:
                 results_rot = self.model.predict(frame_rot, imgsz=640, conf=0.8, verbose=False)[0]
-                # orig_results_rot = self.model.predict(orig_frame_rot, imgsz=640, conf=0.8, verbose=False)[0]
             except Exception as e:
                 self.get_logger().error(f"Fallback inference failed: {e}")
                 return
 
-            # if self._has_obb(results_rot) and self._has_obb(orig_results_rot):
             if self._has_obb(results_rot):
                 # >>> NEW: expose results so downstream consumers can still inspect them
                 results = results_rot
-                # orig_results = orig_results_rot
 
                 # Back-transform polygons to non-rotated display frame
                 confs = results_rot.obb.conf.cpu().numpy()
@@ -343,10 +335,7 @@ class OV5640Publisher(Node):
                     pts_back = self._apply_affine_points(pts, M_inv)
                     boxes.append(pts_back)
 
-                # for poly in orig_results_rot.obb.xyxyxyxy:
-                #     pts = poly.cpu().numpy().reshape(4, 2)
-                #     pts_back = self._apply_affine_points(pts, M_inv_o)
-                    # orig_boxes.append(pts_back)
+                
             # else: nothing found → boxes remain empty; we still show the steady base
 
         # >>> CHANGED: Always draw OBBs ourselves onto annotated_frame (no results.plot())
@@ -379,10 +368,8 @@ class OV5640Publisher(Node):
         center_x, center_y = frame_w / 2, frame_h / 2
 
         try:
-            # if len(boxes) > 0 and len(orig_boxes) > 0:
             if len(boxes)  > 0:
                 # If counts mismatch (shouldn't, but be robust)
-                # n = min(len(boxes), len(orig_boxes))
                 n = len(boxes)
 
                 conf_thr = 0.7
@@ -393,7 +380,6 @@ class OV5640Publisher(Node):
                         continue
 
                     points = boxes[i]
-                    # orig_points = orig_boxes[i]
 
                     if points.shape != (4, 2) or np.isnan(points).any():
                         continue
