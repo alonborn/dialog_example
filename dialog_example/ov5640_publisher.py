@@ -20,6 +20,7 @@ from sensor_msgs.msg import JointState  # already available in ROS 2
 class OV5640Publisher(Node):
     def __init__(self):
         super().__init__('ov5640_publisher')
+        self.counter = 0
         self.joint_states = None  # Initialize joint states to None
         # ROS image publisher
         # self.publisher_ = self.create_publisher(Image, 'camera/image_raw', 10)
@@ -209,7 +210,7 @@ class OV5640Publisher(Node):
         cv2.putText(
             image,
             "Optical Center",
-            (optical_x + 10, optical_y - 10),
+            (int(optical_x) + 10, int(optical_y) - 10),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.4,
             (0, 0, 255),
@@ -217,9 +218,32 @@ class OV5640Publisher(Node):
             cv2.LINE_AA
         )
 
+    def _rotate_image(self, img, angle_deg):
+        """Rotate image around its center. Returns (rotated_img, M, M_inv)."""
+        h, w = img.shape[:2]
+        center = (w // 2, h // 2)
+        M = cv2.getRotationMatrix2D(center, angle_deg, 1.0)
+        rotated = cv2.warpAffine(img, M, (w, h))
+        M_inv = cv2.invertAffineTransform(M)  # 2x3
+        return rotated, M, M_inv
 
+    def _has_obb(self, yolo_result):
+        """Check if YOLO result has at least one OBB polygon."""
+        return (
+            hasattr(yolo_result, "obb")
+            and yolo_result.obb is not None
+            and getattr(yolo_result.obb, "xyxyxyxy", None) is not None
+            and len(yolo_result.obb.xyxyxyxy) > 0
+        )
+
+    def _apply_affine_points(self, pts4x2, M2x3):
+        """Apply 2x3 affine transform to a (4,2) polygon (numpy)."""
+        pts = np.hstack([pts4x2, np.ones((pts4x2.shape[0], 1))])  # (4,3)
+        out = pts @ M2x3.T  # (4,2)
+        return out
 
     def timer_callback(self):
+        # Grab frame
         ret, frame = self.cap.read()
         if not ret or frame is None:
             # Create a black frame matching the calibration map size
@@ -239,9 +263,9 @@ class OV5640Publisher(Node):
 
         orig_frame = frame.copy()
 
-        # Align camera orientation
+        # Align camera orientation (keep as before)
         frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
-        frame = cv2.flip(frame, 1)  #was 1
+        frame = cv2.flip(frame, 1)
 
         # --- Read joint angles ---
         j1 = self.get_joint_angle('joint_1')
@@ -263,7 +287,11 @@ class OV5640Publisher(Node):
         M = cv2.getRotationMatrix2D(center, total_angle, 1.0)
         frame = cv2.warpAffine(frame, M, (w, h))
 
-        # Inference
+        # >>> CHANGED: use a single stable base for display to avoid “jumps”
+        display_frame = frame.copy()          # base for visualization
+        annotated_frame = display_frame.copy()  # we will draw everything ourselves
+
+        # --- Inference (normal + fallback) ---
         try:
             results = self.model.predict(frame, imgsz=640, conf=0.8, verbose=False)[0]
             orig_results = self.model.predict(orig_frame, imgsz=640, conf=0.8, verbose=False)[0]
@@ -271,42 +299,93 @@ class OV5640Publisher(Node):
             self.get_logger().error(f"Inference failed: {e}")
             return
 
-        annotated_frame = results.plot()
+        # >>> NEW: containers used later; always defined to avoid branching differences
+        boxes = []          # list[np.ndarray (4,2)] in current-frame coords
+        orig_boxes = []     # list[np.ndarray (4,2)] in orig_frame coords
+        confs = np.array([])
 
-        # --- Overlay joint angles (J1, J2, J3, J5, J6) ---
-        # Only print those we actually have
-        y = 30
+        # >>> CHANGED: consistent OBB extraction with fallback, no results.plot()
+        if self._has_obb(results) and self._has_obb(orig_results):
+            # Normal path: take polygons as-is
+            boxes = [poly.cpu().numpy().reshape(4, 2) for poly in results.obb.xyxyxyxy]
+            orig_boxes = [poly.cpu().numpy().reshape(4, 2) for poly in orig_results.obb.xyxyxyxy]
+            confs = results.obb.conf.cpu().numpy()
+        else:
+            # >>> NEW: Fallback—rotate by +20°, detect, back-rotate polygons; keep display steady
+            print(f"{self.counter} No OBBs found, applying fallback rotation")
+            self.counter += 1
+            fallback_angle = 20.0
+            frame_rot, M_fwd, M_inv = self._rotate_image(frame, fallback_angle)
+            orig_frame_rot, M_fwd_o, M_inv_o = self._rotate_image(orig_frame, fallback_angle)
+
+            try:
+                results_rot = self.model.predict(frame_rot, imgsz=640, conf=0.8, verbose=False)[0]
+                orig_results_rot = self.model.predict(orig_frame_rot, imgsz=640, conf=0.8, verbose=False)[0]
+            except Exception as e:
+                self.get_logger().error(f"Fallback inference failed: {e}")
+                return
+
+            if self._has_obb(results_rot) and self._has_obb(orig_results_rot):
+                # >>> NEW: expose results so downstream consumers can still inspect them
+                results = results_rot
+                orig_results = orig_results_rot
+
+                # Back-transform polygons to non-rotated display frame
+                confs = results_rot.obb.conf.cpu().numpy()
+
+                for poly in results_rot.obb.xyxyxyxy:
+                    pts = poly.cpu().numpy().reshape(4, 2)
+                    pts_back = self._apply_affine_points(pts, M_inv)
+                    boxes.append(pts_back)
+
+                for poly in orig_results_rot.obb.xyxyxyxy:
+                    pts = poly.cpu().numpy().reshape(4, 2)
+                    pts_back = self._apply_affine_points(pts, M_inv_o)
+                    orig_boxes.append(pts_back)
+            # else: nothing found → boxes remain empty; we still show the steady base
+
+        # >>> CHANGED: Always draw OBBs ourselves onto annotated_frame (no results.plot())
+        # Overlay joint angles (same as before, but on our annotated_frame)
+        y_text = 30
         for label, angle in (("J1", j1), ("J2", j2), ("J3", j3), ("J5", j5), ("J6", j6)):
             if angle is not None:
-                cv2.putText(annotated_frame, f"{label}: {angle:.1f}", (10, y),
+                cv2.putText(annotated_frame, f"{label}: {angle:.1f}", (10, int(y_text)),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                y += 30
+                y_text += 30
 
         frame_h, frame_w = frame.shape[:2]
         center_x, center_y = frame_w / 2, frame_h / 2
 
-        # --- Process oriented bounding boxes (OBB) ---
-        if hasattr(results, "obb") and results.obb is not None and getattr(results.obb, "xyxyxyxy", None) is not None:
-            try:
-                boxes = results.obb.xyxyxyxy
-                orig_boxes = orig_results.obb.xyxyxyxy
-                confs = results.obb.conf.cpu().numpy()
+        # >>> CHANGED: Draw polygons consistently; then process/publish like before
+        try:
+            if len(boxes) > 0 and len(orig_boxes) > 0:
+                # If counts mismatch (shouldn't, but be robust)
+                n = min(len(boxes), len(orig_boxes))
+                conf_thr = 0.7
 
-                for obb, conf, obb_orig in zip(boxes, confs, orig_boxes):
-                    if conf is None or conf < 0.7:
+                for i in range(n):
+                    if i < len(confs) and confs[i] is not None and confs[i] < conf_thr:
                         continue
 
-                    points = obb.cpu().numpy().reshape(4, 2)
-                    orig_points = obb_orig.cpu().numpy().reshape(4, 2)
+                    points = boxes[i]
+                    orig_points = orig_boxes[i]
+
                     if points.shape != (4, 2) or np.isnan(points).any():
                         continue
 
+                    # Draw polygon + corners
+                    pts_i32 = points.astype(np.int32)
+                    cv2.polylines(annotated_frame, [pts_i32], isClosed=True,
+                                color=(0, 255, 0), thickness=2, lineType=cv2.LINE_AA)
+                    for (px, py) in pts_i32:
+                        cv2.circle(annotated_frame, (int(px), int(py)), 3, (0, 0, 255), -1)
+
+                    # Center of the OBB (in current frame coords)
                     cx = float(points[:, 0].mean())
                     cy = float(points[:, 1].mean())
-
-                    # Draw center
                     cv2.circle(annotated_frame, (int(cx), int(cy)), 4, (0, 255, 255), -1)
 
+                    # Angle from orig_points (your logic)
                     angle_deg = self.calculate_brick_yaw(orig_points)
                     if angle_deg is None:
                         continue
@@ -317,8 +396,11 @@ class OV5640Publisher(Node):
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 0), 1, cv2.LINE_AA
                     )
 
-                    # Vector from image center to brick center
-                    cv2.line(annotated_frame, (int(center_x), int(center_y)), (int(cx), int(cy)), (255, 0, 0), 1)
+                    # Vector from image center to brick center (visual)
+                    cv2.line(annotated_frame, (int(center_x), int(center_y)),
+                            (int(cx), int(cy)), (255, 0, 0), 1)
+
+                    # Distances in px
                     dx_px = cx - center_x
                     dy_px = cy - center_y
                     pixel_dist = float(np.hypot(dx_px, dy_px))
@@ -354,7 +436,7 @@ class OV5640Publisher(Node):
                     info_msg.data = [-dx_base, -dy_base, float(angle_deg), float(est_height_mm)]
                     self.info_publisher.publish(info_msg)
 
-                    # Nice overlays
+                    # Overlays for distance & base-frame dx/dy
                     mid_x = int((center_x + cx) / 2)
                     mid_y = int((center_y + cy) / 2)
                     dist_mm = float(np.hypot(dx_mm, dy_mm))
@@ -363,16 +445,16 @@ class OV5640Publisher(Node):
                     cv2.putText(
                         annotated_frame,
                         f"{dist_mm:.1f} mm @ {dir_angle_deg:.1f} deg",
-                        (mid_x - 50, mid_y - 50),
+                        (int(mid_x) - 50, int(mid_y) - 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1, cv2.LINE_AA
                     )
-                    cv2.putText(annotated_frame, f"dx_base: {dx_base:.1f}", (10, y),
+                    cv2.putText(annotated_frame, f"dx_base: {dx_base:.1f}", (10, int(y_text)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
-                    cv2.putText(annotated_frame, f"dy_base: {dy_base:.1f}", (10, y + 30),
+                    cv2.putText(annotated_frame, f"dy_base: {dy_base:.1f}", (10, int(y_text + 30)),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
-
-            except Exception as e:
-                self.get_logger().error(f"Error processing OBB: {e}")
+            # else: nothing to draw this frame; annotated_frame is still steady base
+        except Exception as e:
+            self.get_logger().error(f"Error processing OBB: {e}")
 
         # Show window + keys
         cv2.imshow('YOLOv8 OBB Inference', annotated_frame)
@@ -385,10 +467,11 @@ class OV5640Publisher(Node):
             filename = f"frame_{self.capture_count:05d}.jpg"
             filepath = os.path.join(self.capture_folder, filename)
             try:
-                cv2.imwrite(filepath, frame)
+                cv2.imwrite(filepath, frame)   # save current processed frame
                 self.get_logger().info(f"Saved: {filepath}")
             except Exception as e:
                 self.get_logger().error(f"Failed to save frame: {e}")
+
 
 
 
@@ -430,10 +513,10 @@ class OV5640Publisher(Node):
 
 
 def main(args=None):
-    # debugpy.listen(("localhost", 5678))  # Port for debugger to connect
-    # print("Waiting for debugger to attach...")
-    # debugpy.wait_for_client()
-    # print("Debugger connected.")
+    debugpy.listen(("localhost", 5678))  # Port for debugger to connect
+    print("Waiting for debugger to attach...")
+    debugpy.wait_for_client()
+    print("Debugger connected.")
 
 
     rclpy.init(args=args)

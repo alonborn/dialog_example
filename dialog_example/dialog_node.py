@@ -312,11 +312,21 @@ class TkinterROS(Node):
         zgrp = tk.LabelFrame(self.tab_tools, text="Z Height (absolute)")
         zgrp.pack(fill=tk.X, padx=8, pady=6)
 
-        tk.Button(zgrp, text="31 cm", command=lambda: self.move_to_height(0.31), width=8)\
+        tk.Button(zgrp, text="40 cm", command=lambda: self.move_to_height(0.40), width=8)\
+            .pack(side=tk.LEFT, padx=4, pady=5)
+        tk.Button(zgrp, text="30 cm", command=lambda: self.move_to_height(0.30), width=8)\
+            .pack(side=tk.LEFT, padx=4, pady=5)
+        tk.Button(zgrp, text="25 cm", command=lambda: self.move_to_height(0.25), width=8)\
+            .pack(side=tk.LEFT, padx=4, pady=5)
+        tk.Button(zgrp, text="21 cm", command=lambda: self.move_to_height(0.21), width=8)\
+            .pack(side=tk.LEFT, padx=4, pady=5)
+        tk.Button(zgrp, text="20 cm", command=lambda: self.move_to_height(0.20), width=8)\
             .pack(side=tk.LEFT, padx=4, pady=5)
         tk.Button(zgrp, text="17 cm", command=lambda: self.move_to_height(0.17), width=8)\
             .pack(side=tk.LEFT, padx=4, pady=5)
         tk.Button(zgrp, text="14 cm", command=lambda: self.move_to_height(0.14), width=8)\
+            .pack(side=tk.LEFT, padx=4, pady=5)
+        tk.Button(zgrp, text="12 cm", command=lambda: self.move_to_height(0.12), width=8)\
             .pack(side=tk.LEFT, padx=4, pady=5)
 
         # Start periodic updates
