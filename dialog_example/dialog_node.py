@@ -114,6 +114,16 @@ class TkinterROS(Node):
         self.log_with_time('info', 'ArucoPoseFollower initialized, listening to /aruco_poses')
 
 
+        self.open_gripper_client  = self.create_client(Trigger, '/ar4_hardware_interface_node/open_gripper')
+        self.close_gripper_client = self.create_client(Trigger, '/ar4_hardware_interface_node/close_gripper')
+
+        # Optional: warn if not up yet (won’t block forever)
+        for cli, nm in [(self.open_gripper_client,  'open_gripper'),
+                        (self.close_gripper_client, 'close_gripper')]:
+            if not cli.wait_for_service(timeout_sec=0.5):
+                self.log_with_time('warn', f"Service '{nm}' not available yet")
+
+
         self.homing_client = self.create_client(Trigger, '/ar4_hardware_interface_node/homing')
         self.move_arm_client = self.create_client(MoveToPose, '/ar_move_to_pose')
         self.refresh_transform_client = self.create_client(Trigger, 'refresh_handeye_transform')
@@ -146,21 +156,6 @@ class TkinterROS(Node):
             self.get_logger().warn(full_message)
         else:
             self.get_logger().debug(full_message)        
-
-    def send_gripper_command(self, command: str):
-        """Send 'open' or 'close' to Arduino via serial."""
-        if self.serial_port and self.serial_port.is_open:
-            try:
-                self.serial_port.write((command + "\n").encode('utf-8'))
-                self.log_with_time('info', f"Sent gripper command: {command}")
-                self.status_label.config(text=f"Gripper {command} command sent")
-            except Exception as e:
-                self.log_with_time('error', f"Failed to send gripper command: {e}")
-                self.status_label.config(text=f"Failed to send {command}")
-        else:
-            self.log_with_time('error', "Serial port not open")
-            self.status_label.config(text="Serial not open")
-
 
 
     def brick_info_callback(self, msg):
@@ -301,12 +296,10 @@ class TkinterROS(Node):
         grip = tk.LabelFrame(self.tab_tools, text="Gripper")
         grip.pack(fill=tk.X, padx=8, pady=6)
 
-        tk.Button(grip, text="Open Gripper",
-                command=lambda: self.send_gripper_command("open"),
-                width=12, height=1).pack(side=tk.LEFT, padx=5, pady=5)
-        tk.Button(grip, text="Close Gripper",
-                command=lambda: self.send_gripper_command("close"),
-                width=12, height=1).pack(side=tk.LEFT, padx=5, pady=5)
+        tk.Button(grip, text="Open Gripper", command=self.open_gripper_srv, width=12)\
+            .pack(side=tk.LEFT, padx=4, pady=5)
+        tk.Button(grip, text="Close Gripper", command=self.close_gripper_srv, width=12)\
+            .pack(side=tk.LEFT, padx=4, pady=5)
 
         # Z quick moves
         zgrp = tk.LabelFrame(self.tab_tools, text="Z Height (absolute)")
@@ -331,6 +324,31 @@ class TkinterROS(Node):
 
         # Start periodic updates
         self.update_position_label()
+
+
+    def open_gripper_srv(self):
+        req = Trigger.Request()
+        res = self.call_service_blocking(self.open_gripper_client, req, timeout_sec=3.0)
+        if res is None:
+            self.log_with_time('error', "open_gripper: no response / timeout")
+            self.gui_queue.put(lambda: self.status_label.config(text="Open gripper failed"))
+            return False
+        self.log_with_time('info', f"open_gripper: {res.message}")
+        self.gui_queue.put(lambda: self.status_label.config(
+            text="Gripper opened" if res.success else f"Open failed: {res.message}"))
+        return bool(res.success)
+
+    def close_gripper_srv(self):
+        req = Trigger.Request()
+        res = self.call_service_blocking(self.close_gripper_client, req, timeout_sec=3.0)
+        if res is None:
+            self.log_with_time('error', "close_gripper: no response / timeout")
+            self.gui_queue.put(lambda: self.status_label.config(text="Close gripper failed"))
+            return False
+        self.log_with_time('info', f"close_gripper: {res.message}")
+        self.gui_queue.put(lambda: self.status_label.config(
+            text="Gripper closed" if res.success else f"Close failed: {res.message}"))
+        return bool(res.success)
 
 
     def init_calibration_tab(self):
@@ -1546,10 +1564,10 @@ def ros_spin_executor(executor): # New
 
 
 def main(): 
-    # debugpy.listen(("localhost", 5678))  # Port for debugger to connect
-    # print("Waiting for debugger to attach...")
-    # debugpy.wait_for_client()
-    # print("Debugger connected.")
+    debugpy.listen(("localhost", 5678))  # Port for debugger to connect
+    print("Waiting for debugger to attach...")
+    debugpy.wait_for_client()
+    print("Debugger connected.")
    
     rclpy.init()
 
