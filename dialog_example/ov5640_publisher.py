@@ -26,6 +26,7 @@ class OV5640Publisher(Node):
         # self.publisher_ = self.create_publisher(Image, 'camera/image_raw', 10)
         # self.pose_pub = self.create_publisher(Pose2D, 'brick_info', 10)
         self.info_publisher = self.create_publisher(Float32MultiArray, 'brick_top_info', 10)
+        self.infos_publisher = self.create_publisher(Float32MultiArray, 'brick_top_infos', 10)  # NEW (batched)
 
         self.joint_positions = [None, None, None, None, None, None]  # store last positions
         self.create_subscription(JointState, '/joint_states', self.joint_state_callback, 10)
@@ -296,21 +297,22 @@ class OV5640Publisher(Node):
         # --- Inference (normal + fallback) ---
         try:
             results = self.model.predict(frame, imgsz=640, conf=0.8, verbose=False)[0]
-            orig_results = self.model.predict(orig_frame, imgsz=640, conf=0.8, verbose=False)[0]
+            # orig_results = self.model.predict(orig_frame, imgsz=640, conf=0.8, verbose=False)[0]
         except Exception as e:
             self.get_logger().error(f"Inference failed: {e}")
             return
 
         # >>> NEW: containers used later; always defined to avoid branching differences
         boxes = []          # list[np.ndarray (4,2)] in current-frame coords
-        orig_boxes = []     # list[np.ndarray (4,2)] in orig_frame coords
+        # orig_boxes = []     # list[np.ndarray (4,2)] in orig_frame coords
         confs = np.array([])
 
         # >>> CHANGED: consistent OBB extraction with fallback, no results.plot()
-        if self._has_obb(results) and self._has_obb(orig_results):
+        # if self._has_obb(results) and self._has_obb(orig_results):
+        if self._has_obb(results):
             # Normal path: take polygons as-is
             boxes = [poly.cpu().numpy().reshape(4, 2) for poly in results.obb.xyxyxyxy]
-            orig_boxes = [poly.cpu().numpy().reshape(4, 2) for poly in orig_results.obb.xyxyxyxy]
+            # orig_boxes = [poly.cpu().numpy().reshape(4, 2) for poly in orig_results.obb.xyxyxyxy]
             confs = results.obb.conf.cpu().numpy()
         else:
             # >>> NEW: Fallback—rotate by +20°, detect, back-rotate polygons; keep display steady
@@ -318,19 +320,20 @@ class OV5640Publisher(Node):
             self.counter += 1
             fallback_angle = 20.0
             frame_rot, M_fwd, M_inv = self._rotate_image(frame, fallback_angle)
-            orig_frame_rot, M_fwd_o, M_inv_o = self._rotate_image(orig_frame, fallback_angle)
+            # orig_frame_rot, M_fwd_o, M_inv_o = self._rotate_image(orig_frame, fallback_angle)
 
             try:
                 results_rot = self.model.predict(frame_rot, imgsz=640, conf=0.8, verbose=False)[0]
-                orig_results_rot = self.model.predict(orig_frame_rot, imgsz=640, conf=0.8, verbose=False)[0]
+                # orig_results_rot = self.model.predict(orig_frame_rot, imgsz=640, conf=0.8, verbose=False)[0]
             except Exception as e:
                 self.get_logger().error(f"Fallback inference failed: {e}")
                 return
 
-            if self._has_obb(results_rot) and self._has_obb(orig_results_rot):
+            # if self._has_obb(results_rot) and self._has_obb(orig_results_rot):
+            if self._has_obb(results_rot):
                 # >>> NEW: expose results so downstream consumers can still inspect them
                 results = results_rot
-                orig_results = orig_results_rot
+                # orig_results = orig_results_rot
 
                 # Back-transform polygons to non-rotated display frame
                 confs = results_rot.obb.conf.cpu().numpy()
@@ -340,10 +343,10 @@ class OV5640Publisher(Node):
                     pts_back = self._apply_affine_points(pts, M_inv)
                     boxes.append(pts_back)
 
-                for poly in orig_results_rot.obb.xyxyxyxy:
-                    pts = poly.cpu().numpy().reshape(4, 2)
-                    pts_back = self._apply_affine_points(pts, M_inv_o)
-                    orig_boxes.append(pts_back)
+                # for poly in orig_results_rot.obb.xyxyxyxy:
+                #     pts = poly.cpu().numpy().reshape(4, 2)
+                #     pts_back = self._apply_affine_points(pts, M_inv_o)
+                    # orig_boxes.append(pts_back)
             # else: nothing found → boxes remain empty; we still show the steady base
 
         # >>> CHANGED: Always draw OBBs ourselves onto annotated_frame (no results.plot())
@@ -359,6 +362,7 @@ class OV5640Publisher(Node):
         for v in (j2, j3, j5):
             if v is not None:
                 sum_joints += v
+              
                 
         # --- add the sum of J2+J3+J5 ---
         cv2.putText(
@@ -374,19 +378,22 @@ class OV5640Publisher(Node):
         frame_h, frame_w = frame.shape[:2]
         center_x, center_y = frame_w / 2, frame_h / 2
 
-        # >>> CHANGED: Draw polygons consistently; then process/publish like before
         try:
-            if len(boxes) > 0 and len(orig_boxes) > 0:
+            # if len(boxes) > 0 and len(orig_boxes) > 0:
+            if len(boxes)  > 0:
                 # If counts mismatch (shouldn't, but be robust)
-                n = min(len(boxes), len(orig_boxes))
+                # n = min(len(boxes), len(orig_boxes))
+                n = len(boxes)
+
                 conf_thr = 0.7
+                all_infos = []  # NEW: will hold [dx_base, dy_base, angle_deg, est_height_mm] per detection
 
                 for i in range(n):
                     if i < len(confs) and confs[i] is not None and confs[i] < conf_thr:
                         continue
 
                     points = boxes[i]
-                    orig_points = orig_boxes[i]
+                    # orig_points = orig_boxes[i]
 
                     if points.shape != (4, 2) or np.isnan(points).any():
                         continue
@@ -404,9 +411,23 @@ class OV5640Publisher(Node):
                     cv2.circle(annotated_frame, (int(cx), int(cy)), 4, (0, 255, 255), -1)
 
                     # Angle from orig_points (your logic)
-                    angle_deg = self.calculate_brick_yaw(orig_points)
-                    if angle_deg is None:
-                        continue
+                    # angle_deg = self.calculate_brick_yaw(orig_points)
+                    # if angle_deg is None:
+                    #     continue
+
+                    angle_deg_from_frame = self.calculate_brick_yaw(points)
+                    angle_deg_from_frame =  self.compensate_angle(angle_deg_from_frame, total_angle)# compensate for J1 + J6
+
+                    angle_deg = angle_deg_from_frame
+
+                    cv2.putText(annotated_frame, f"angle:{angle_deg:.1f}", (10, int(y_text)),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
+                    y_text += 30
+
+                    cv2.putText(annotated_frame, f"frame angle:{angle_deg_from_frame:.1f}", (10, int(y_text)),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
+                    y_text += 30
+
 
                     cv2.putText(
                         annotated_frame, f"{angle_deg:.1f}°",
@@ -442,7 +463,7 @@ class OV5640Publisher(Node):
                     )
                     if dx_base is None or dy_base is None:
                         continue
-
+                    
                     # Height estimate
                     focal_length_px = (frame_w / 2) / np.tan(np.radians(72 / 2))
                     brick_half = pixel_long_edge / 2
@@ -453,6 +474,8 @@ class OV5640Publisher(Node):
                     info_msg = Float32MultiArray()
                     info_msg.data = [-dx_base, -dy_base, float(angle_deg), float(est_height_mm)]
                     self.info_publisher.publish(info_msg)
+                    all_infos.extend([-dx_base, -dy_base, float(angle_deg), float(est_height_mm)])
+
 
                     # Overlays for distance & base-frame dx/dy
                     mid_x = int((center_x + cx) / 2)
@@ -466,6 +489,19 @@ class OV5640Publisher(Node):
                         (int(mid_x) - 50, int(mid_y) - 50),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 0, 0), 1, cv2.LINE_AA
                     )
+                # NEW: publish all detections in one shot (shape: N x 4)
+                if len(all_infos) > 0:
+                    n = len(all_infos) // 4
+                    batched = Float32MultiArray()
+                    # Describe a 2D layout: (objects, fields) = (n, 4)
+                    from std_msgs.msg import MultiArrayDimension, MultiArrayLayout
+                    batched.layout.dim = [
+                        MultiArrayDimension(label='objects', size=n, stride=n*4),
+                        MultiArrayDimension(label='fields', size=4, stride=4),
+                    ]
+                    batched.layout.data_offset = 0
+                    batched.data = all_infos
+                    self.infos_publisher.publish(batched)
             # else: nothing to draw this frame; annotated_frame is still steady base
         except Exception as e:
             self.get_logger().error(f"Error processing OBB: {e}")
@@ -527,10 +563,10 @@ class OV5640Publisher(Node):
 
 
 def main(args=None):
-    # debugpy.listen(("localhost", 5678))  # Port for debugger to connect
-    # print("Waiting for debugger to attach...")
-    # debugpy.wait_for_client()
-    # print("Debugger connected.")
+    debugpy.listen(("localhost", 5678))  # Port for debugger to connect
+    print("Waiting for debugger to attach...")
+    debugpy.wait_for_client()
+    print("Debugger connected.")
 
 
     rclpy.init(args=args)
