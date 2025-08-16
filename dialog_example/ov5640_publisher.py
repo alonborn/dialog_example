@@ -245,6 +245,7 @@ class OV5640Publisher(Node):
     def timer_callback(self):
         # Grab frame
         ret, frame = self.cap.read()
+        text_color = (255,0,0)
         if not ret or frame is None:
             # Create a black frame matching the calibration map size
             height, width = self.map1.shape[:2]
@@ -271,6 +272,7 @@ class OV5640Publisher(Node):
         j1 = self.get_joint_angle('joint_1')
         j2 = self.get_joint_angle('joint_2')
         j3 = self.get_joint_angle('joint_3')
+        j4 = self.get_joint_angle('joint_4')
         j5 = self.get_joint_angle('joint_5')
         j6 = self.get_joint_angle('joint_6')
 
@@ -312,7 +314,7 @@ class OV5640Publisher(Node):
             confs = results.obb.conf.cpu().numpy()
         else:
             # >>> NEW: Fallback—rotate by +20°, detect, back-rotate polygons; keep display steady
-            print(f"{self.counter} No OBBs found, applying fallback rotation")
+            # print(f"{self.counter} No OBBs found, applying fallback rotation")
             self.counter += 1
             fallback_angle = 20.0
             frame_rot, M_fwd, M_inv = self._rotate_image(frame, fallback_angle)
@@ -347,12 +349,28 @@ class OV5640Publisher(Node):
         # >>> CHANGED: Always draw OBBs ourselves onto annotated_frame (no results.plot())
         # Overlay joint angles (same as before, but on our annotated_frame)
         y_text = 30
-        for label, angle in (("J1", j1), ("J2", j2), ("J3", j3), ("J5", j5), ("J6", j6)):
+        for label, angle in (("J1", j1), ("J2", j2), ("J3", j3),("J4", j4), ("J5", j5), ("J6", j6)):
             if angle is not None:
                 cv2.putText(annotated_frame, f"{label}: {angle:.1f}", (10, int(y_text)),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, text_color, 2)
                 y_text += 30
 
+        sum_joints = 0.0
+        for v in (j2, j3, j5):
+            if v is not None:
+                sum_joints += v
+                
+        # --- add the sum of J2+J3+J5 ---
+        cv2.putText(
+            annotated_frame,
+            f"J2,3,5: {sum_joints:.1f}",
+            (10, int(y_text)),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.6,
+            text_color,   # green for visibility
+            2
+        )
+        y_text += 30
         frame_h, frame_w = frame.shape[:2]
         center_x, center_y = frame_w / 2, frame_h / 2
 
@@ -513,10 +531,10 @@ class OV5640Publisher(Node):
 
 
 def main(args=None):
-    debugpy.listen(("localhost", 5678))  # Port for debugger to connect
-    print("Waiting for debugger to attach...")
-    debugpy.wait_for_client()
-    print("Debugger connected.")
+    # debugpy.listen(("localhost", 5678))  # Port for debugger to connect
+    # print("Waiting for debugger to attach...")
+    # debugpy.wait_for_client()
+    # print("Debugger connected.")
 
 
     rclpy.init(args=args)

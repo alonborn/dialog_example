@@ -494,7 +494,9 @@ class TkinterROS(Node):
         self.initial_marker_pose_base = None  # reset for next use
 
     def move_to_brick_process(self):
-        self.refine_pose_with_ee_camera()
+        self.refine_pose_with_ee_camera(0.21)
+        # time.sleep(0.5)
+        self.refine_pose_with_ee_camera(0.15)
 
         # self.refine_pose_with_ee_camera()
 
@@ -558,10 +560,7 @@ class TkinterROS(Node):
 
         future.add_done_callback(_on_done)
 
-
-
-
-    def refine_pose_with_ee_camera(self):
+    def refine_pose_with_ee_camera(self,height = 0.15):
         if None in (self.top_dx_mm, self.top_dy_mm, self.top_angle_deg, self.top_est_height_mm):
             self.log_with_time('warn' ,"No brick info from end-effector camera.")
             return
@@ -583,12 +582,22 @@ class TkinterROS(Node):
             ee_pose.orientation.w,
         ]
         roll, pitch, yaw = tf_transformations.euler_from_quaternion(quat)
+        roll = -np.pi   #face down
+        pitch = 0   #face down
+        
+
         current_yaw_deg = np.degrees(yaw) % 360
 
         # New yaw = current yaw + relative rotation from vision
         new_yaw_deg = (current_yaw_deg + rel_rotation_deg) % 360
 
-        self.log_with_time('info', 
+        # self.log_with_time('info', 
+        #     f"[EE Rotation] Current EE yaw: {current_yaw_deg:.2f}°, "
+        #     f"Relative rotation needed: {rel_rotation_deg:.2f}°, "
+        #     f"Target EE yaw: {new_yaw_deg:.2f}°"
+        # )
+
+        print('info', 
             f"[EE Rotation] Current EE yaw: {current_yaw_deg:.2f}°, "
             f"Relative rotation needed: {rel_rotation_deg:.2f}°, "
             f"Target EE yaw: {new_yaw_deg:.2f}°"
@@ -601,7 +610,7 @@ class TkinterROS(Node):
         corrected_pose = Pose()
         corrected_pose.position.x += ee_pose.position.x + dx_cam
         corrected_pose.position.y += ee_pose.position.y + dy_cam
-        corrected_pose.position.z = 0.15 #ee_pose.position.z
+        corrected_pose.position.z = height #ee_pose.position.z
 
         # Keep roll/pitch, update yaw
         yaw_rad = np.radians(new_yaw_deg)
@@ -622,9 +631,11 @@ class TkinterROS(Node):
                 final_pose.orientation.w,
             ])
             final_yaw_deg = np.degrees(final_yaw) % 360
-            self.log_with_time('info', 
+        
+            print('info', 
                 f"[EE Rotation] Final EE yaw after motion: {final_yaw_deg:.2f}°"
             )
+
             
         if final_pose:
             # Format and update the GUI entries with the final pose
