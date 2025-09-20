@@ -15,6 +15,8 @@ from glob import glob
 import numpy as np
 from std_msgs.msg import Float32MultiArray
 from sensor_msgs.msg import JointState  # already available in ROS 2
+from tf2_ros import Buffer, TransformListener
+from std_msgs.msg import MultiArrayDimension, MultiArrayLayout
 
 
 class OV5640Publisher(Node):
@@ -22,11 +24,14 @@ class OV5640Publisher(Node):
         super().__init__('ov5640_publisher')
         self.counter = 0
         self.joint_states = None  # Initialize joint states to None
-        # ROS image publisher
-        # self.publisher_ = self.create_publisher(Image, 'camera/image_raw', 10)
-        # self.pose_pub = self.create_publisher(Pose2D, 'brick_info', 10)
+
+        self.tf_buffer = Buffer()
+        self.tf_listener = TransformListener(self.tf_buffer, self)
+
         self.info_publisher = self.create_publisher(Float32MultiArray, 'brick_top_info', 10)
         self.infos_publisher = self.create_publisher(Float32MultiArray, 'brick_top_infos', 10)  # NEW (batched)
+
+
 
         self.joint_positions = [None, None, None, None, None, None]  # store last positions
         self.create_subscription(JointState, '/joint_states', self.joint_state_callback, 10)
@@ -55,6 +60,19 @@ class OV5640Publisher(Node):
         self.model = YOLO(model_path)
         self.handle_camera_calibration()
 
+
+    def get_ee_xy(self):
+        try:
+            # base_link <- ee_link transform (now)
+            trans = self.tf_buffer.lookup_transform(
+                'base_link', 'ee_link', rclpy.time.Time())
+            x = float(trans.transform.translation.x)  # meters
+            y = float(trans.transform.translation.y)  # meters
+            return x, y
+        except Exception as e:
+            self.get_logger().warn(f"TF lookup (base_link<-ee_link) failed: {e}")
+            return None, None
+        
     def handle_camera_calibration(self):
         # === Load calibration data ===
         calib_path = "/home/alon/ros_ws/src/dialog_example/dialog_example/camera_calibration.npz"
@@ -260,6 +278,7 @@ class OV5640Publisher(Node):
         h, w = frame.shape[:2]
         target_cx, target_cy = w / 2, h / 2
         dx, dy = target_cx - cx, target_cy - cy
+        dx = dy = 0  # no shift needed, we already aligned optical center
         M_translate = np.float32([[1, 0, dx], [0, 1, dy]])
         frame = cv2.warpAffine(frame, M_translate, (w, h))
 
@@ -292,6 +311,9 @@ class OV5640Publisher(Node):
         # >>> CHANGED: use a single stable base for display to avoid “jumps”
         display_frame = frame.copy()          # base for visualization
         annotated_frame = display_frame.copy()  # we will draw everything ourselves
+
+        ee_x, ee_y = self.get_ee_xy()   # meters; may be (None, None)
+
 
         # --- Inference (normal + fallback) ---
         try:
@@ -450,6 +472,18 @@ class OV5640Publisher(Node):
                     if dx_base is None or dy_base is None:
                         continue
                     
+
+                    dx_pub = -dx_base            # mm
+                    dy_pub = -dy_base            # mm
+
+                    # Convert the published offsets to meters for absolute center:
+                    dx_m = dx_pub / 1000.0       # m
+                    dy_m = dy_pub / 1000.0       # m
+
+                    # Absolute center in base frame (meters). If EE is unknown, publish NaN to keep shape.
+                    cx_m = (ee_x if ee_x is not None else float('nan')) + dx_m
+                    cy_m = (ee_y if ee_y is not None else float('nan')) + dy_m
+
                     # Height estimate
                     focal_length_px = (frame_w / 2) / np.tan(np.radians(72 / 2))
                     brick_half = pixel_long_edge / 2
@@ -460,7 +494,7 @@ class OV5640Publisher(Node):
                     info_msg = Float32MultiArray()
                     info_msg.data = [-dx_base, -dy_base, float(angle_deg), float(est_height_mm)]
                     self.info_publisher.publish(info_msg)
-                    all_infos.extend([-dx_base, -dy_base, float(angle_deg), float(est_height_mm)])
+                    all_infos.extend([dx_pub, dy_pub, float(angle_deg), float(est_height_mm), cx_m, cy_m])
 
 
                     # Overlays for distance & base-frame dx/dy
@@ -477,15 +511,15 @@ class OV5640Publisher(Node):
                     )
                 # NEW: publish all detections in one shot (shape: N x 4)
                 if len(all_infos) > 0:
-                    n = len(all_infos) // 4
+                    n = len(all_infos) // 6  # not 4 anymore
                     batched = Float32MultiArray()
-                    # Describe a 2D layout: (objects, fields) = (n, 4)
-                    from std_msgs.msg import MultiArrayDimension, MultiArrayLayout
-                    batched.layout.dim = [
-                        MultiArrayDimension(label='objects', size=n, stride=n*4),
-                        MultiArrayDimension(label='fields', size=4, stride=4),
-                    ]
-                    batched.layout.data_offset = 0
+                    batched.layout = MultiArrayLayout(
+                        dim=[
+                            MultiArrayDimension(label='objects', size=n,  stride=n*6),
+                            MultiArrayDimension(label='fields',  size=6,  stride=6),
+                        ],
+                        data_offset=0,
+                    )
                     batched.data = all_infos
                     self.infos_publisher.publish(batched)
             # else: nothing to draw this frame; annotated_frame is still steady base
@@ -549,10 +583,10 @@ class OV5640Publisher(Node):
 
 
 def main(args=None):
-    debugpy.listen(("localhost", 5678))  # Port for debugger to connect
-    print("Waiting for debugger to attach...")
-    debugpy.wait_for_client()
-    print("Debugger connected.")
+    # debugpy.listen(("localhost", 5678))  # Port for debugger to connect
+    # print("Waiting for debugger to attach...")
+    # debugpy.wait_for_client()
+    # print("Debugger connected.")
 
 
     rclpy.init(args=args)

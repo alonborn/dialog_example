@@ -41,6 +41,8 @@ from functools import partial
 from my_robot_interfaces.srv import NudgeJoint
 import threading
 from my_robot_interfaces.srv import MoveServoToAngle
+import math
+
 
 
 class TkinterROS(Node):
@@ -85,13 +87,13 @@ class TkinterROS(Node):
         # self.publisher = self.create_publisher(String, '/ar4_hardware_interface_node/homing_string', 10)
         self.create_subscription(PoseArray, '/aruco_poses', self.aruco_pose_callback, 10)
 
-        # Subscriber to aruco_poses topic
-        # self.create_subscription(
-        #     PoseArray,
-        #     '/aruco_poses',
-        #     self.aruco_pose_callback,
-        #     qos_profile_sensor_data,
-        # )
+        self.brick_detections = []  # list of dicts for latest frame
+        self.create_subscription(
+            Float32MultiArray,
+            'brick_top_infos',
+            self.brick_top_infos_callback,
+            10
+        )
 
         self.create_subscription(JointState, '/joint_states', self.joint_states_callback, 10)
         
@@ -149,6 +151,42 @@ class TkinterROS(Node):
         # self.periodic_status_check()
         self.aruco_follower_enabled_client = self.create_client(SetBool, '/set_aruco_follower_enabled')
 
+    def brick_top_infos_callback(self, msg: Float32MultiArray):
+        data = list(msg.data)
+        n = len(data)
+        self.latest_bricks = []
+
+        if n == 0:
+            return
+
+        # prefer 6-tuple per object if available (dx, dy, angle, height, cx, cy)
+        if n % 6 == 0:
+            stride = 6
+        elif n % 4 == 0:
+            stride = 4
+        else:
+            self.log_with_time('warn', f"brick_top_infos unexpected length: {n}")
+            return
+
+        for i in range(0, n, stride):
+            dx_mm   = float(data[i + 0])
+            dy_mm   = float(data[i + 1])
+            angle   = float(data[i + 2])
+            height  = float(data[i + 3])
+            cx_m = cy_m = None
+            if stride == 6:
+                cx_m = float(data[i + 4])
+                cy_m = float(data[i + 5])
+
+            self.latest_bricks.append({
+                "dx_mm": dx_mm,
+                "dy_mm": dy_mm,
+                "angle_deg": angle,
+                "est_height_mm": height,
+                "cx_m": cx_m,
+                "cy_m": cy_m,
+            })
+
     def move_servo_to_angle(self, angle_deg: float):
         if not self.move_servo_client.wait_for_service(timeout_sec=1.0):
             self.log_with_time('error', "move_servo_to_angle service not available")
@@ -178,13 +216,18 @@ class TkinterROS(Node):
         timestamp = datetime.datetime.now().strftime("%H:%M:%S")
         full_message = f"[{timestamp}] {message}"
         if level == 'info':
-            self.get_logger().info(full_message)
+            # self.get_logger().info(full_message)
+            print(full_message)  # For GUI visibility
         elif level == 'error':
-            self.get_logger().error(full_message)
+            # self.get_logger().error(full_message)
+            print(full_message)  # For GUI visibility
         elif level == 'warn':
-            self.get_logger().warn(full_message)
+            # self.get_logger().warn(full_message)
+            print(full_message)  # For GUI visibility
         else:
-            self.get_logger().debug(full_message)        
+            #self.get_logger().debug(full_message)    
+            print(full_message)  # For GUI visibility
+
 
 
     def brick_info_callback(self, msg):
@@ -353,25 +396,236 @@ class TkinterROS(Node):
         tk.Button(zgrp, text="12 cm", command=lambda: self.move_to_height(0.12), width=8)\
             .pack(side=tk.LEFT, padx=4, pady=5)
 
+
+        newgrp = tk.LabelFrame(self.tab_tools, text="Other Controls")
+        newgrp.pack(fill=tk.X, padx=8, pady=6)
+
+        tk.Button(newgrp, text="Start", command=self.start_collection, width=8).pack(side=tk.LEFT, padx=4, pady=5)
+        tk.Button(newgrp, text="Collect", command=self.collect_bricks, width=8).pack(side=tk.LEFT, padx=4, pady=5)
+        tk.Button(newgrp, text="Tower", command=self.stack_all_bricks, width=8).pack(side=tk.LEFT, padx=4, pady=5)
+        tk.Button(newgrp, text="Refine", command=self.refine_pos, width=8).pack(side=tk.LEFT, padx=4, pady=5)
+
         # Start periodic updates
         self.update_position_label()
 
+    def start_collection(self):
+            pose = self.make_pose_xyz_quat(-0.007, -0.328, 0.405,0.000, 1.000, 0.002, 0.000)
+            self.send_move_request(pose, is_cartesian=False)
+
+    def refine_pos(self):
+        self.refine_pose_with_ee_camera (0.0)
+
+    def stack_all_bricks(
+        self,
+        brick_thickness=0.0746,   # 7.46 mm in meters
+        base_policy="farthest",    # "nearest" or "farthest"
+        approach_pick_z=0.20,      # hover above pickup
+        align_pick_z=0.19,         # refine height before grasp
+        grasp_z=0.13,              # close gripper here
+        approach_base_z=0.10,      # exactly 10 cm above base for the *initial* measurement
+        retreat_z=0.30             # rise after pick/place
+    ):
+        """
+        Stack all visible bricks on a chosen base.
+        - Snapshot bricks once (do not use live latest_bricks after moving).
+        - Measure base once at 10 cm (stores precise x,y and yaw).
+        - For each remaining brick: pick with local refine; then place at stored base x,y
+        and increasing Z (brick_thickness per level). No re-observe of base.
+        """
+        # 1) Snapshot bricks (positions are from the start view)
+        bricks = list(getattr(self, "latest_bricks", []))
+        bricks = [b for b in bricks if b.get("cx_m") is not None and b.get("cy_m") is not None]
+        if len(bricks) < 2:
+            self.log_with_time('warn', f"Need >=2 bricks, got {len(bricks)}.")
+            return False
+
+        cur = self.get_current_ee_pose()
+        if not cur:
+            self.log_with_time('error', "Current EE pose unavailable.")
+            return False
+
+        # Choose base: nearest/farthest to current EE
+        def dist_to_ee(b):
+            return ((b["cx_m"] - cur.position.x)**2 + (b["cy_m"] - cur.position.y)**2) ** 0.5
+
+        bricks.sort(key=dist_to_ee)
+        if base_policy == "nearest":
+            base = bricks[0]; movers = bricks[1:]
+        else:
+            base = bricks[-1]; movers = bricks[:-1]
+
+        base_x0, base_y0 = float(base["cx_m"]), float(base["cy_m"])
+        self.log_with_time('info', f"Base brick @ ({base_x0:.3f}, {base_y0:.3f}); stacking {len(movers)} bricks.")
+
+        import numpy as np, tf_transformations
+        # Keep face-down; keep yaw from the *measured* base pose
+        def quat_face_down_with_yaw(yaw_rad):
+            return tf_transformations.quaternion_from_euler(-np.pi, 0.0, yaw_rad)
+
+        # Helper to build poses
+        def pose_xy_z_quat(x, y, z, q):
+            return self.create_pose((float(x), float(y), float(z)),
+                                    (float(q[0]), float(q[1]), float(q[2]), float(q[3])))
+
+        # 2) Measure base precisely ONCE (10 cm above), then freeze that pose
+        #    Uses the refined EE pose to lock base_x/base_y and yaw
+        self.send_move_request(
+            pose_xy_z_quat(base_x0, base_y0, approach_base_z+brick_thickness, quat_face_down_with_yaw(
+                tf_transformations.euler_from_quaternion([cur.orientation.x, cur.orientation.y, cur.orientation.z, cur.orientation.w])[2]
+            )),
+            is_cartesian=False
+        )
+        # refine here is OK (camera clear); it updates EE to the true base center/orientation
+        self.refine_pose_with_ee_camera_dx_dy(base_x0, base_y0, height=approach_base_z+brick_thickness)
+
+        pose_after_refine = self.get_current_ee_pose()
+        if not pose_after_refine:
+            self.log_with_time('error', "Failed to read pose after base refine.")
+            return False
+
+        base_ref_x = float(pose_after_refine.position.x)
+        base_ref_y = float(pose_after_refine.position.y)
+        # freeze yaw from the refined base pose
+        _, _, base_ref_yaw = tf_transformations.euler_from_quaternion([
+            pose_after_refine.orientation.x,
+            pose_after_refine.orientation.y,
+            pose_after_refine.orientation.z,
+            pose_after_refine.orientation.w
+        ])
+        q_down_base = quat_face_down_with_yaw(base_ref_yaw)
+
+        self.log_with_time('info', f"Frozen base @ ({base_ref_x:.3f}, {base_ref_y:.3f}), yaw={np.degrees(base_ref_yaw):.1f}°, z={approach_base_z:.2f} m")
+
+        # 3) Stack: for each other brick → pick (with local refine), then place at frozen base (no re-observe)
+        levels_on_base = 1  # base brick already there
+
+        for i, b in enumerate(movers):
+            bx, by = float(b["cx_m"]), float(b["cy_m"])
+            self.log_with_time('info', f"[{i+1}/{len(movers)}] pick from ({bx:.3f}, {by:.3f})")
+
+            # --- PICK sequence (local refine OK; camera sees the loose brick) ---
+            self.send_move_request(pose_xy_z_quat(bx, by, approach_pick_z, q_down_base), is_cartesian=False)
+            self.open_gripper_srv()
+            self.refine_pose_with_ee_camera_dx_dy(bx, by, height=align_pick_z)
+            self.refine_pose_with_ee_camera_dx_dy(bx, by, height=grasp_z)
+            self.close_gripper_srv()
+            self.move_to_height(retreat_z, is_cartesian=False)
+
+            # --- PLACE sequence (DO NOT re-observe base; camera may be occluded) ---
+            # compute stack-top Z
+            place_z = grasp_z + (levels_on_base) * brick_thickness
+
+            # go above frozen base x,y, then descend to place_z, then open
+            self.send_move_request(pose_xy_z_quat(base_ref_x, base_ref_y, retreat_z, q_down_base), is_cartesian=False)
+            self.send_move_request(pose_xy_z_quat(base_ref_x, base_ref_y, place_z,  q_down_base), is_cartesian=False)
+            self.open_gripper_srv()
+
+            levels_on_base += 1
+
+            # retreat, optionally pre-position over next brick
+            self.move_to_height(retreat_z, is_cartesian=False)
+            if i + 1 < len(movers):
+                nb = movers[i + 1]
+                self.send_move_request(pose_xy_z_quat(float(nb["cx_m"]), float(nb["cy_m"]), retreat_z, q_down_base),
+                                    is_cartesian=False)
+
+        self.log_with_time('info', "stack_all_bricks_precise_frozen_base: done.")
+        return True
+
+
+
+
+    def collect_bricks(self):
+        # Snapshot current bricks (list of dicts with cx_m, cy_m, etc.)
+        bricks = list(getattr(self, "latest_bricks", []))
+        if not bricks:
+            self.log_with_time('warn', "No bricks to collect (snapshot empty).")
+            return
+
+        cur = self.get_current_ee_pose()
+        if not cur:
+            self.log_with_time('error', "Current EE pose unavailable.")
+            return
+
+
+        # Helper: build a face-down pose at (x,y,z) with given yaw
+        def face_down_pose(x, y, z, yaw_rad):
+            q = tf_transformations.quaternion_from_euler(-np.pi, 0.0, yaw_rad)
+            return self.create_pose((x, y, z), (q[0], q[1], q[2], q[3]))
+
+        # Keep current yaw for all “hover”/drop/above-next moves
+        _, _, yaw = tf_transformations.euler_from_quaternion([
+            cur.orientation.x, cur.orientation.y, cur.orientation.z, cur.orientation.w
+        ])
+
+        HOVER_Z = 0.30      # safe travel height
+        PICK_Z1  = 0.21      # approach height used by refine function
+        PICK_Z2  = 0.15      # approach height used by refine function
+        PICK_Z3  = 0.13      # approach height used by refine function
+
+        DROP_Z  = 0.30
+
+        # Bin/drop location (adjust to your setup)
+        drop_xy = (-0.25, -0.30)
+        drop_pose = face_down_pose(drop_xy[0], drop_xy[1], DROP_Z, yaw)
+
+        # Iterate by index so we can look ahead to the “next” brick
+        for i in range(len(bricks)):
+            b = bricks[i]
+            cx = b.get("cx_m")
+            cy = b.get("cy_m")
+            if cx is None or cy is None:
+                self.log_with_time('warn', f"Brick #{i+1}: missing center base coords, skipping.")
+                continue
+
+            self.log_with_time('info', f"Collecting brick #{i+1} at ({cx:.3f}, {cy:.3f})")
+
+            # Open, approach & align, close, lift
+            self.open_gripper_srv()
+            self.refine_pose_with_ee_camera_dx_dy(cx, cy, PICK_Z1)   # aligns to that brick at given height
+            self.refine_pose_with_ee_camera_dx_dy(cx, cy, PICK_Z1)   # aligns to that brick at given height
+            self.move_to_height(PICK_Z3, is_cartesian=False)
+            self.close_gripper_srv()
+            self.move_to_height(DROP_Z, is_cartesian=False)
+
+            # Go to drop pose and release
+            self.send_move_request(drop_pose, is_cartesian=False)
+            self.open_gripper_srv()
+
+            # Move up to travel height
+            self.move_to_height(HOVER_Z, is_cartesian=False)
+
+            # If there is a next brick, go directly above it at hover height
+            if i + 1 < len(bricks):
+                nb = bricks[i+1]
+                n_cx = nb.get("cx_m")
+                n_cy = nb.get("cy_m")
+                if n_cx is not None and n_cy is not None:
+                    above_next = face_down_pose(n_cx, n_cy, HOVER_Z, yaw)
+                    self.log_with_time('info',
+                        f"Moving above next brick #{i+2} at ({n_cx:.3f}, {n_cy:.3f})")
+                    self.send_move_request(above_next, is_cartesian=False)
+
+        self.log_with_time('info', "collect_bricks: done.")
+
 
     def open_gripper_srv(self):
-        req = Trigger.Request()
-        res = self.call_service_blocking(self.open_gripper_client, req, timeout_sec=3.0)
-        if res is None:
-            self.log_with_time('error', "open_gripper: no response / timeout")
-            self.gui_queue.put(lambda: self.status_label.config(text="Open gripper failed"))
-            return False
-        self.log_with_time('info', f"open_gripper: {res.message}")
-        self.gui_queue.put(lambda: self.status_label.config(
-            text="Gripper opened" if res.success else f"Open failed: {res.message}"))
-        return bool(res.success)
+        self.move_servo_to_angle(35.0)
+        # req = Trigger.Request()
+        # res = self.call_service_blocking(self.open_gripper_client, req, timeout_sec=3.0)
+        # if res is None:
+        #     self.log_with_time('error', "open_gripper: no response / timeout")
+        #     self.gui_queue.put(lambda: self.status_label.config(text="Open gripper failed"))
+        #     return False
+        # self.log_with_time('info', f"open_gripper: {res.message}")
+        # self.gui_queue.put(lambda: self.status_label.config(
+        #     text="Gripper opened" if res.success else f"Open failed: {res.message}"))
+        # return bool(res.success)
+
 
     def close_gripper_srv(self):
 
-        self.move_servo_to_angle(50.0)
+        self.move_servo_to_angle(95.0)
 
         # req = Trigger.Request()
         # res = self.call_service_blocking(self.close_gripper_client, req, timeout_sec=3.0)
@@ -615,19 +869,128 @@ class TkinterROS(Node):
 
         future.add_done_callback(_on_done)
 
-    def refine_pose_with_ee_camera(self,height = 0.15):
+    def make_pose_xyz_quat(self,x: float, y: float, z: float,
+                        qx: float, qy: float, qz: float, qw: float) -> Pose:
+        """Create a Pose from numeric xyz and quaternion (qx, qy, qz, qw)."""
+        # (Optional) normalize quaternion to be safe
+        mag = math.sqrt(qx*qx + qy*qy + qz*qz + qw*qw)
+        if mag > 0:
+            qx, qy, qz, qw = (qx/mag, qy/mag, qz/mag, qw/mag)
+
+        p = Pose()
+        p.position.x = float(x)
+        p.position.y = float(y)
+        p.position.z = float(z)
+        p.orientation.x = float(qx)
+        p.orientation.y = float(qy)
+        p.orientation.z = float(qz)
+        p.orientation.w = float(qw)
+        return p
+
+    def refine_pose_with_ee_camera_dx_dy(self, cx: float, cy: float, height: float = 0.15):
+        """
+        Pick the brick whose published center is closest to (cx, cy) [meters, base_link]
+        and move the EE by that brick's (dx, dy) plus orient EE by its angle.
+
+        Requires self.latest_bricks from 'brick_top_infos'.
+        Falls back to computing center from current EE pose if cx/cy per-brick aren't published.
+        """
+        # Need current EE pose
+        ee_pose = self.get_current_ee_pose()
+        if ee_pose is None:
+            self.log_with_time('error', "Cannot read current end-effector pose.")
+            return
+
+        if not self.latest_bricks:
+            self.log_with_time('warn', "No bricks available from 'brick_top_infos'.")
+            return
+
+        # Decide a center for each brick (prefer broker-provided cx/cy, otherwise compute)
+        def brick_center_m(b):
+            if b.get("cx_m") is not None and b.get("cy_m") is not None:
+                return b["cx_m"], b["cy_m"]
+            # fallback: EE + (dx,dy) (mm->m). dx/dy are defined as "how much to move EE"
+            return (ee_pose.position.x + b["dx_mm"] / 1000.0,
+                    ee_pose.position.y + b["dy_mm"] / 1000.0)
+
+        # Pick nearest brick to requested (cx, cy)
+        best = None
+        best_d2 = float("inf")
+        for b in self.latest_bricks:
+            bx, by = brick_center_m(b)
+            if bx is None or by is None:
+                continue
+            d2 = (bx - cx) ** 2 + (by - cy) ** 2
+            if d2 < best_d2:
+                best_d2 = d2
+                best = b
+
+        if best is None:
+            self.log_with_time('warn', "No valid brick centers to compare.")
+            return
+
+        # Convert moves mm -> m
+        dx_m = best["dx_mm"] / 1000.0
+        dy_m = best["dy_mm"] / 1000.0
+        rel_rotation_deg = -float(best["angle_deg"])   # same convention as before
+
+        # Current orientation -> set face-down roll/pitch, adjust yaw by rel rotation
+        quat = [
+            ee_pose.orientation.x,
+            ee_pose.orientation.y,
+            ee_pose.orientation.z,
+            ee_pose.orientation.w,
+        ]
+        roll, pitch, yaw = tf_transformations.euler_from_quaternion(quat)
+        roll = -np.pi    # face down
+        pitch = 0.0
+        current_yaw_deg = float(np.degrees(yaw)) % 360.0
+        new_yaw_deg = (current_yaw_deg + rel_rotation_deg) % 360.0
+
+        # Build corrected pose
+        corrected = Pose()
+        corrected.position.x = ee_pose.position.x + dx_m
+        corrected.position.y = ee_pose.position.y + dy_m
+        corrected.position.z = float(height)
+
+        yaw_rad = np.radians(new_yaw_deg)
+        qf = tf_transformations.quaternion_from_euler(roll, pitch, yaw_rad)
+        corrected.orientation.x = qf[0]
+        corrected.orientation.y = qf[1]
+        corrected.orientation.z = qf[2]
+        corrected.orientation.w = qf[3]
+
+        # Go!
+        self.send_move_request(corrected, is_cartesian=False)
+
+        # Optional: reflect final pose back to GUI
+        final_pose = self.get_current_ee_pose()
+        if final_pose:
+            pos = final_pose.position
+            ori = final_pose.orientation
+            pos_str = f"({pos.x:.3f}, {pos.y:.3f}, {pos.z:.3f})"
+            ori_str = f"({ori.x:.3f}, {ori.y:.3f}, {ori.z:.3f}, {ori.w:.3f})"
+
+            def update_entries():
+                self.translation_entry.delete(0, tk.END)
+                self.translation_entry.insert(0, pos_str)
+                self.rotation_entry.delete(0, tk.END)
+                self.rotation_entry.insert(0, ori_str)
+            self.gui_queue.put(update_entries)
+
+
+    def refine_pose_with_ee_camera(self, height=0.15):
         if None in (self.top_dx_mm, self.top_dy_mm, self.top_angle_deg, self.top_est_height_mm):
-            self.log_with_time('warn' ,"No brick info from end-effector camera.")
+            self.log_with_time('warn', "No brick info from end-effector camera.")
             return
 
         dx_cam = self.top_dx_mm / 1000.0
         dy_cam = self.top_dy_mm / 1000.0
-        est_height_m = self.top_est_height_mm / 1000.0
-        rel_rotation_deg = -self.top_angle_deg  # Directly from vision: rotation to apply to EE
+        rel_rotation_deg = -self.top_angle_deg  # from vision
 
         ee_pose = self.get_current_ee_pose()
         if ee_pose is None:
-            self.log_with_time('error' ,"Cannot read current end-effector pose.")
+            self.log_with_time('error', "Cannot read current end-effector pose.")
             return
 
         quat = [
@@ -637,37 +1000,35 @@ class TkinterROS(Node):
             ee_pose.orientation.w,
         ]
         roll, pitch, yaw = tf_transformations.euler_from_quaternion(quat)
-        roll = -np.pi   #face down
-        pitch = 0   #face down
-        
-
+        roll = -np.pi   # face down
+        pitch = 0       # face down
         current_yaw_deg = np.degrees(yaw) % 360
 
-        # New yaw = current yaw + relative rotation from vision
-        new_yaw_deg = (current_yaw_deg + rel_rotation_deg) % 360
-
-        # self.log_with_time('info', 
-        #     f"[EE Rotation] Current EE yaw: {current_yaw_deg:.2f}°, "
-        #     f"Relative rotation needed: {rel_rotation_deg:.2f}°, "
-        #     f"Target EE yaw: {new_yaw_deg:.2f}°"
-        # )
-
-        print('info', 
-            f"[EE Rotation] Current EE yaw: {current_yaw_deg:.2f}°, "
-            f"Relative rotation needed: {rel_rotation_deg:.2f}°, "
-            f"Target EE yaw: {new_yaw_deg:.2f}°"
-        )
+        # --- Decide behavior based on height ---
+        if height == 0:
+            # Keep yaw and z as-is
+            new_yaw_deg = current_yaw_deg
+            target_z = ee_pose.position.z
+            print('info', f"[EE Refine] Height=0 → Keeping yaw ({current_yaw_deg:.2f}°) and Z ({target_z:.3f} m)")
+        else:
+            # Apply correction both in yaw and Z
+            new_yaw_deg = (current_yaw_deg + rel_rotation_deg) % 360
+            target_z = height
+            print('info',
+                f"[EE Rotation] Current yaw: {current_yaw_deg:.2f}°, "
+                f"Relative: {rel_rotation_deg:.2f}°, "
+                f"Target: {new_yaw_deg:.2f}° | New Z={target_z:.3f} m")
 
         # Transform dx/dy to base frame
         R = tf_transformations.quaternion_matrix(quat)[0:3, 0:3]
         offset_base = R @ np.array([dx_cam, dy_cam, 0.0])
 
         corrected_pose = Pose()
-        corrected_pose.position.x += ee_pose.position.x + dx_cam
-        corrected_pose.position.y += ee_pose.position.y + dy_cam
-        corrected_pose.position.z = height #ee_pose.position.z
+        corrected_pose.position.x = ee_pose.position.x + dx_cam
+        corrected_pose.position.y = ee_pose.position.y + dy_cam
+        corrected_pose.position.z = target_z
 
-        # Keep roll/pitch, update yaw
+        # Orientation
         yaw_rad = np.radians(new_yaw_deg)
         final_quat = tf_transformations.quaternion_from_euler(roll, pitch, yaw_rad)
         corrected_pose.orientation.x = final_quat[0]
@@ -677,6 +1038,7 @@ class TkinterROS(Node):
 
         self.send_move_request(corrected_pose, is_cartesian=False)
 
+        # --- Feedback ---
         final_pose = self.get_current_ee_pose()
         if final_pose:
             _, _, final_yaw = tf_transformations.euler_from_quaternion([
@@ -686,22 +1048,12 @@ class TkinterROS(Node):
                 final_pose.orientation.w,
             ])
             final_yaw_deg = np.degrees(final_yaw) % 360
-        
-            print('info', 
-                f"[EE Rotation] Final EE yaw after motion: {final_yaw_deg:.2f}°"
-            )
+            print('info', f"[EE Rotation] Final yaw: {final_yaw_deg:.2f}°")
 
-            
-        if final_pose:
-            # Format and update the GUI entries with the final pose
-            pos = final_pose.position
-            ori = final_pose.orientation
+            # Update GUI
+            pos_str = f"({final_pose.position.x:.3f}, {final_pose.position.y:.3f}, {final_pose.position.z:.3f})"
+            ori_str = f"({final_pose.orientation.x:.3f}, {final_pose.orientation.y:.3f}, {final_pose.orientation.z:.3f}, {final_pose.orientation.w:.3f})"
 
-            # Format as tuples
-            pos_str = f"({pos.x:.3f}, {pos.y:.3f}, {pos.z:.3f})"
-            ori_str = f"({ori.x:.3f}, {ori.y:.3f}, {ori.z:.3f}, {ori.w:.3f})"
-
-            # Update GUI entries (on the main thread)
             def update_entries():
                 self.translation_entry.delete(0, tk.END)
                 self.translation_entry.insert(0, pos_str)
@@ -709,6 +1061,7 @@ class TkinterROS(Node):
                 self.rotation_entry.insert(0, ori_str)
 
             self.gui_queue.put(update_entries)
+
 
 
     def add_adjustment_frame(self):
@@ -1353,7 +1706,7 @@ class TkinterROS(Node):
         
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         motion_type = "Cartesian" if is_cartesian else "Joint-space"
-        if not (-0.5 <= pose.position.x <= 0.5 and -0.54 <= pose.position.y <= 0.6 and 0.03 <= pose.position.z <= 0.55):
+        if not (-0.5 <= pose.position.x <= 0.5 and -0.54 <= pose.position.y <= 0.6 and 0.11 <= pose.position.z <= 0.55):
             print(f"[{now}] 🚫 Refused Motion: {motion_type} target out of bounds! Target: pos=({pose.position.x:.3f},{pose.position.y:.3f},{pose.position.z:.3f}) ori={pose.orientation}")
             self.arm_is_moving = False
             return False
