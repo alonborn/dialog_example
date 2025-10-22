@@ -18,9 +18,9 @@ def generate_launch_description():
     use_handeye_publisher = LaunchConfiguration("use_handeye_publisher")
 
     aruco_params = os.path.join(
-        get_package_share_directory("ar4_hand_eye_calibration"),
+        get_package_share_directory("ros2_aruco"),
         "config",
-        "aruco_parameters.yaml",
+        "aruco_parameters_ov5640.yaml",
     )
 
     dialog_node = Node(
@@ -51,6 +51,17 @@ def generate_launch_description():
         package="ros2_aruco", executable="aruco_node", parameters=[aruco_params]
     )
 
+
+
+    arm_cam_image_publisher = ExecuteProcess(
+        cmd=[
+            '/home/alon/venv/bin/python',
+            '/home/alon/ros_ws/src/dialog_example/dialog_example/ov5640_image_publisher.py'
+        ],
+        name='ov5640_image_publisher_gui',
+        output='screen'
+    )
+
     hand_eye_tf_publisher = Node(
         package="ar4_hand_eye_calibration",
         executable="handeye_publisher.py",
@@ -75,5 +86,6 @@ def generate_launch_description():
         move_ar_node,
         aruco_node,
         hand_eye_tf_publisher,
+        arm_cam_image_publisher
         # inferences_node
     ])

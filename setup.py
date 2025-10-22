@@ -26,6 +26,8 @@ setup(
         'console_scripts': [
             'dialog_node = dialog_example.dialog_node:main',  # Correct entry point for your script
             'ov5640_publisher = dialog_example.ov5640_publisher:main',
+            'ov5640_image_publisher = scripts.ov5640_image_publisher:main',
+
         ],
 }
 )

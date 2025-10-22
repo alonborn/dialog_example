@@ -2,8 +2,8 @@ import cv2
 import os
 
 # === Configuration ===
-camera_index = 2  # Change to 1, 2, etc., if needed
-output_dir = "calib_images"
+camera_index = 8  # Change to 1, 2, etc., if needed
+output_dir = "chip_table_images"
 os.makedirs(output_dir, exist_ok=True)
 
 # === Initialize camera ===

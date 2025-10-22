@@ -17,8 +17,15 @@ from std_msgs.msg import Float32MultiArray
 from sensor_msgs.msg import JointState  # already available in ROS 2
 from tf2_ros import Buffer, TransformListener
 from std_msgs.msg import MultiArrayDimension, MultiArrayLayout
+import tf_transformations
+from rclpy.qos import qos_profile_sensor_data
+from sensor_msgs.msg import Image
 
 
+from sensor_msgs.msg import Image, JointState
+from std_msgs.msg import Float32MultiArray
+
+CAMERA_INDEX = 8  # Change to 1, 2, etc., if needed
 class OV5640Publisher(Node):
     def __init__(self):
         super().__init__('ov5640_publisher')
@@ -30,7 +37,12 @@ class OV5640Publisher(Node):
 
         self.info_publisher = self.create_publisher(Float32MultiArray, 'brick_top_info', 10)
         self.infos_publisher = self.create_publisher(Float32MultiArray, 'brick_top_infos', 10)  # NEW (batched)
+        
+        self.image_pub = self.create_publisher(Image, "/ov5640_rot_frame", qos_profile_sensor_data)
 
+        self.aruco_pub = self.create_publisher(Float32MultiArray, 'tower_aruco_pos', 10)
+
+        self.setup_aruco()
 
 
         self.joint_positions = [None, None, None, None, None, None]  # store last positions
@@ -39,26 +51,37 @@ class OV5640Publisher(Node):
         self.timer = self.create_timer(0.1, self.timer_callback)  # 10 Hz
 
         self.bridge = CvBridge()
-        self.cap = cv2.VideoCapture(2)
+        self.calibrated = False            
+        self.maps_ready = False            
 
-        self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-        self.cap.set(cv2.CAP_PROP_FPS, 5)
 
-        if not self.cap.isOpened():
-            self.get_logger().warn('Camera not available — using black frames')
-            self.use_dummy_frame = True
-        else:
-            self.use_dummy_frame = False
+        self.latest_frame = None
+        self.create_subscription(
+            Image,
+            '/ov5640/image_raw',   
+            self.image_callback,
+            10)
+
 
         self.capture_folder = "captured_images"
         os.makedirs(self.capture_folder, exist_ok=True)
         self.capture_count = 0
 
         # Load YOLOv8 OBB model
-        model_path = "/home/alon/Documents/Projects/top_view_train/runs/obb/train8/weights/best.pt"
+        # model_path = "/home/alon/Documents/Projects/top_view_train/runs/obb/train8/weights/best.pt"
+        model_path = "/home/alon/Documents/Projects/chip_table_train/runs/obb/train3/weights/best.pt"
         self.model = YOLO(model_path)
         self.handle_camera_calibration()
+
+    def image_callback(self, msg: Image):
+        try:
+            self.latest_frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+            if not hasattr(self, "map1"):  # run calibration only once
+                self.get_logger().info("Running camera calibration with first received frame")
+                self.handle_camera_calibration()
+        except Exception as e:
+            self.get_logger().error(f"Image conversion failed: {e}")
+
 
 
     def get_ee_xy(self):
@@ -74,6 +97,13 @@ class OV5640Publisher(Node):
             return None, None
         
     def handle_camera_calibration(self):
+        # Wait for a frame from subscriber
+        if self.latest_frame is None:
+            self.get_logger().warn("No frame yet for calibration — using black frame")
+            frame = np.zeros((480, 640, 3), dtype=np.uint8)
+        else:
+            frame = self.latest_frame.copy()
+
         # === Load calibration data ===
         calib_path = "/home/alon/ros_ws/src/dialog_example/dialog_example/camera_calibration.npz"
         if not os.path.exists(calib_path):
@@ -85,11 +115,10 @@ class OV5640Publisher(Node):
         self.dist = data["dist"]
 
         # Precompute undistortion map
-        ret, frame = self.cap.read()
-        if not ret or frame is None:
-            self.get_logger().warn("No initial frame — using black frame for calibration")
-            height, width = 480, 640
-            frame = np.zeros((height, width, 3), dtype=np.uint8)
+        if self.latest_frame is None:
+            self.get_logger().warn("No frame received yet")
+            return
+        frame = self.latest_frame.copy()
 
         h, w = frame.shape[:2]
         self.new_K, _ = cv2.getOptimalNewCameraMatrix(self.K, self.dist, (w, h), 1, (w, h))
@@ -261,26 +290,127 @@ class OV5640Publisher(Node):
         out = pts @ M2x3.T  # (4,2)
         return out
 
+
+    # ---------------- ArUco helpers ----------------
+
+    # ---------------- ArUco helpers ----------------
+    def setup_aruco(self):
+        """Initialize the ArUco detector with predefined dictionary and parameters."""
+        self.aruco_dict = cv2.aruco.getPredefinedDictionary(cv2.aruco.DICT_4X4_250)
+        self.aruco_params = cv2.aruco.DetectorParameters()
+        self.aruco_detector = cv2.aruco.ArucoDetector(self.aruco_dict, self.aruco_params)
+
+    def detect_aruco(self, frame):
+        """Detect ArUco markers, trying multiple dictionaries until one matches."""
+
+        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+        # List of dictionaries to try in order
+        dict_names = [
+            "DICT_4X4_50", "DICT_4X4_100", "DICT_4X4_250", "DICT_4X4_1000",
+            "DICT_5X5_50", "DICT_5X5_100", "DICT_5X5_250", "DICT_5X5_1000",
+            "DICT_6X6_50", "DICT_6X6_100", "DICT_6X6_250", "DICT_6X6_1000",
+            "DICT_7X7_50", "DICT_7X7_100", "DICT_7X7_250", "DICT_7X7_1000",
+        ]
+
+        for name in dict_names:
+            try:
+                aruco_dict = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, name))
+                detector = cv2.aruco.ArucoDetector(aruco_dict, cv2.aruco.DetectorParameters())
+                corners, ids, rejected = detector.detectMarkers(gray)
+                if ids is not None and len(ids) > 0:
+                    self.get_logger().info(f"Detected ArUco markers with {name}, IDs={ids.flatten().tolist()}")
+                    return corners, ids, rejected
+            except Exception as e:
+                self.get_logger().warn(f"Dictionary {name} failed: {e}")
+
+        # Nothing found
+        self.get_logger().warn("No ArUco markers found with any dictionary.")
+        return [], None, []
+
+
+    def estimate_pose(self, corners):
+        """Estimate pose from ArUco corners using calibration if available.
+        Returns (tvec, rvec, quat) or (None, None, None)."""
+        obj_points = np.array([
+            [-0.035,  0.035, 0],
+            [ 0.035,  0.035, 0],
+            [ 0.035, -0.035, 0],
+            [-0.035, -0.035, 0]
+        ], dtype=np.float32)
+
+        c = corners.reshape((4, 2)).astype(np.float32)
+
+        if hasattr(self, "K") and self.K is not None:
+            ret, rvec, tvec = cv2.solvePnP(
+                obj_points, c, self.K, self.dist, flags=cv2.SOLVEPNP_IPPE_SQUARE
+            )
+            if ret:
+                R, _ = cv2.Rodrigues(rvec)
+                quat = tf_transformations.quaternion_from_matrix(
+                    np.vstack([np.hstack([R, [[0],[0],[0]]]), [0,0,0,1]])
+                )
+                return tvec, rvec, quat
+        return None, None, None
+
+    def publish_aruco(self, marker_id, tvec, quat, cx, cy):
+        """Publish ArUco info (pose if available, else 2D center)."""
+        msg = Float32MultiArray()
+        if tvec is not None and quat is not None:
+            msg.data = [
+                float(marker_id),
+                float(tvec[0]), float(tvec[1]), float(tvec[2]),
+                float(quat[0]), float(quat[1]), float(quat[2]), float(quat[3])
+            ]
+        else:
+            msg.data = [float(marker_id), float(cx), float(cy)]
+        self.aruco_pub.publish(msg)
+
+    def draw_aruco(self, frame, corners, ids, rvecs, tvecs):
+        """Draw markers, IDs, and axes if calibration available."""
+        cv2.aruco.drawDetectedMarkers(frame, corners, ids)
+        if hasattr(self, "K") and self.K is not None and len(rvecs) == len(tvecs):
+            for (rvec, tvec) in zip(rvecs, tvecs):
+                cv2.drawFrameAxes(frame, self.K, self.dist, rvec, tvec, 0.05)
+
+
+    def publish_image(self, frame, topic_pub, frame_id="ov5640_rot_frame"):
+        msg = self.bridge.cv2_to_imgmsg(frame, encoding="bgr8")  # your frames are BGR
+        msg.header.stamp = self.get_clock().now().to_msg()
+        msg.header.frame_id = frame_id
+        topic_pub.publish(msg)
+
+
     def timer_callback(self):
+
+        if self.latest_frame is None:
+            self.get_logger().warn("No frame received yet")
+            return
+
+        if not hasattr(self, "map1") or not hasattr(self, "map2"):
+            self.get_logger().warn("Calibration maps not ready yet")
+            return
+
         # Grab frame
-        ret, frame = self.cap.read()
-        text_color = (255,0,0)
-        if not ret or frame is None:
-            # Create a black frame matching the calibration map size
-            height, width = self.map1.shape[:2]
-            frame = np.zeros((height, width, 3), dtype=np.uint8)
+        text_color = (255, 0, 0)
+
+        if self.latest_frame is None:
+            self.get_logger().warn("No frame received yet")
+            return
+
+        frame = self.latest_frame.copy()
 
         # Undistort/rectify
         frame = cv2.remap(frame, self.map1, self.map2, interpolation=cv2.INTER_LINEAR)
 
-        # Shift so optical center becomes image center
-        cx, cy = self.optical_center
-        h, w = frame.shape[:2]
-        target_cx, target_cy = w / 2, h / 2
-        dx, dy = target_cx - cx, target_cy - cy
-        dx = dy = 0  # no shift needed, we already aligned optical center
-        M_translate = np.float32([[1, 0, dx], [0, 1, dy]])
-        frame = cv2.warpAffine(frame, M_translate, (w, h))
+        # # Shift so optical center becomes image center
+        # cx, cy = self.optical_center
+        # h, w = frame.shape[:2]
+        # target_cx, target_cy = w / 2, h / 2
+        # dx, dy = target_cx - cx, target_cy - cy
+        # dx = dy = 0  # no shift needed, we already aligned optical center
+        # M_translate = np.float32([[1, 0, dx], [0, 1, dy]])
+        # frame = cv2.warpAffine(frame, M_translate, (w, h))
 
 
         # Align camera orientation (keep as before)
@@ -297,7 +427,8 @@ class OV5640Publisher(Node):
 
         if j1 is None or j6 is None:
             self.get_logger().warn("Joint angles not available, skipping frame processing")
-            return
+            j1 = j2 = j3 = j4 = j5 = j6 = 0.0
+            # return
 
         # Total rotation for the image (use J1 + J6)
         total_angle = j1 + j6
@@ -309,10 +440,16 @@ class OV5640Publisher(Node):
         frame = cv2.warpAffine(frame, M, (w, h))
 
         # >>> CHANGED: use a single stable base for display to avoid “jumps”
-        display_frame = frame.copy()          # base for visualization
-        annotated_frame = display_frame.copy()  # we will draw everything ourselves
+        annotated_frame = frame.copy()          # base for visualization
 
         ee_x, ee_y = self.get_ee_xy()   # meters; may be (None, None)
+
+        # Publish the annotated frame (what you display in the window)
+        try:
+            self.publish_image(frame, self.image_pub)
+        except Exception as e:
+            self.get_logger().error(f"Failed to publish processed frame: {e}")
+
 
 
         # --- Inference (normal + fallback) ---
@@ -405,6 +542,20 @@ class OV5640Publisher(Node):
 
                     if points.shape != (4, 2) or np.isnan(points).any():
                         continue
+
+
+                    # Estimate bounding box size from polygon
+                    x_min, y_min = points.min(axis=0)
+                    x_max, y_max = points.max(axis=0)
+                    w_px = x_max - x_min
+                    h_px = y_max - y_min
+                    area_px = w_px * h_px
+
+                    # Thresholds (tune these!)
+                    if w_px > 400 or h_px > 400 or area_px > 120000:  
+                        # self.get_logger().warn(f"Ignoring too-large OBB: {w_px:.1f}x{h_px:.1f}px (area={area_px:.0f})")
+                        continue
+
 
                     # Draw polygon + corners
                     pts_i32 = points.astype(np.int32)
@@ -526,6 +677,24 @@ class OV5640Publisher(Node):
         except Exception as e:
             self.get_logger().error(f"Error processing OBB: {e}")
 
+
+        # # === ArUco detection ===
+        # corners, ids, _ = self.detect_aruco(frame)
+        # if ids is not None:
+        #     rvecs, tvecs = [], []
+        #     for i, marker_id in enumerate(ids.flatten()):
+        #         c = corners[i]
+        #         cx, cy = c[:, :, 0].mean(), c[:, :, 1].mean()
+
+        #         tvec, rvec, quat = self.estimate_pose(c)
+        #         if tvec is not None and rvec is not None:
+        #             tvecs.append(tvec)
+        #             rvecs.append(rvec)
+        #         self.publish_aruco(marker_id, tvec, quat, cx, cy)
+
+        #     self.draw_aruco(annotated_frame, corners, ids, rvecs, tvecs)
+
+
         # Show window + keys
         cv2.imshow('YOLOv8 OBB Inference', annotated_frame)
         key = cv2.waitKey(1) & 0xFF
@@ -577,7 +746,6 @@ class OV5640Publisher(Node):
             self.get_logger().info(f"Saved annotated: {save_path}")
 
     def destroy_node(self):
-        self.cap.release()
         cv2.destroyAllWindows()
         super().destroy_node()
 

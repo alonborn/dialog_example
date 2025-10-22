@@ -16,6 +16,18 @@ from sensor_msgs.msg import JointState
 import easy_handeye2 as hec
 from easy_handeye2_msgs.srv import TakeSample, SaveCalibration,ComputeCalibration
 from tkinter import messagebox
+from geometry_msgs.msg import Point
+from sensor_msgs.msg import Image
+from cv_bridge import CvBridge
+from rclpy.qos import qos_profile_sensor_data
+import cv2
+from rclpy.qos import qos_profile_sensor_data
+from rclpy.callback_groups import ReentrantCallbackGroup
+from geometry_msgs.msg import PoseArray
+import traceback
+
+
+
 import queue
 import time
 import numpy as np
@@ -85,7 +97,20 @@ class TkinterROS(Node):
         self.calib_dir = pathlib.Path(os.path.expanduser('~/.ros2/easy_handeye2/calibrations'))
         self.calib_path = self.calib_dir / 'ar4_calibration.calib'
         # self.publisher = self.create_publisher(String, '/ar4_hardware_interface_node/homing_string', 10)
-        self.create_subscription(PoseArray, '/aruco_poses', self.aruco_pose_callback, 10)
+        self.cb_group = ReentrantCallbackGroup()
+        self._aruco_count = 0
+
+
+        # KEEP a reference on self:
+        self.aruco_sub = self.create_subscription(
+            PoseArray,
+            '/aruco_poses',
+            self.aruco_pose_callback,                 # <- tiny probe callback aruco_pose_callback
+            qos_profile_sensor_data,
+            callback_group=self.cb_group
+        )
+
+        # heartbeat to show matches & counts
 
         self.brick_detections = []  # list of dicts for latest frame
         self.create_subscription(
@@ -150,6 +175,243 @@ class TkinterROS(Node):
         self.init_right_frame()
         # self.periodic_status_check()
         self.aruco_follower_enabled_client = self.create_client(SetBool, '/set_aruco_follower_enabled')
+
+        self.bridge = CvBridge()
+        self.latest_frame = None
+
+        self.image_sub = self.create_subscription(
+            Image,
+            '/ov5640_rot_frame',  # must match your publisher topic
+            self.image_callback,
+            qos_profile_sensor_data
+        )
+
+        # Add a timer to periodically show frames
+        self.create_timer(0.03, self.display_frame)  # ~30 FPS
+
+
+    def _aruco_probe_cb(self, msg: PoseArray):
+        try:
+            self._aruco_count += 1
+            # DO NOT touch anything else here yet. Just prove delivery:
+            print(f"[ARUCO PROBE] #{self._aruco_count} poses={len(msg.poses)}")
+        except Exception as e:
+            print("[ARUCO PROBE] Exception:", e)
+            print(traceback.format_exc())
+
+    def image_callback(self, msg: Image):
+        try:
+            self.latest_frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
+        except Exception as e:
+            self.get_logger().error(f"Image conversion failed: {e}")
+
+    def display_frame(self):
+        if self.latest_frame is None:
+            return
+        cv2.imshow("Processed Frame (from /processed_frame)", self.latest_frame)
+        key = cv2.waitKey(0) & 0xFF
+
+    def destroy_node(self):
+        cv2.destroyAllWindows()
+        super().destroy_node()
+
+
+    def _fmt_xy(self, p):
+        return f"{p[0]:.3f}, {p[1]:.3f}"
+
+    def _parse_xy_entry(self, entry: tk.Entry):
+        txt = entry.get().strip().replace(",", " ")
+        parts = [t for t in txt.split() if t]
+        if len(parts) < 2:
+            raise ValueError("XY entry must be 'x, y' or 'x y'")
+        return (float(parts[0]), float(parts[1]))
+
+    def _set_xy_entry(self, entry: tk.Entry, xy):
+        entry.delete(0, tk.END)
+        entry.insert(0, self._fmt_xy(xy))
+
+    def _get_board_dir_xy_from_marker(self):
+        """Fallback: board direction from marker +Y axis (green), projected to XY."""
+        pose_b = self.get_marker_pose_in_base()
+        q = [pose_b.orientation.x, pose_b.orientation.y, pose_b.orientation.z, pose_b.orientation.w]
+        R = tf_transformations.quaternion_matrix(q)[0:3, 0:3]
+        y_axis = R[:, 1]  # marker +Y (green)
+        dir_xy = np.array([y_axis[0], y_axis[1]])
+        n = np.linalg.norm(dir_xy)
+        if n < 1e-6:
+            return np.array([1.0, 0.0])
+        return dir_xy / n
+
+    def _recompute_board_dir_xy(self):
+        """Define board direction from the two points; if same XY, use marker +Y."""
+        p1 = np.array(self.drop_p1_xy) if getattr(self, "drop_p1_xy", None) else None
+        p2 = np.array(self.drop_p2_xy) if getattr(self, "drop_p2_xy", None) else None
+        if p1 is None or p2 is None:
+            self.board_dir_xy = self._get_board_dir_xy_from_marker()
+            return
+        d = p2 - p1
+        n = np.linalg.norm(d)
+        if n < 1e-6:
+            self.board_dir_xy = self._get_board_dir_xy_from_marker()
+        else:
+            self.board_dir_xy = d / n
+
+    def _board_normal_xy(self):
+        """Perpendicular (left/right) = rotate board_dir by +90° in XY."""
+        t = getattr(self, "board_dir_xy", np.array([1.0, 0.0]))
+        return np.array([-t[1], t[0]])
+
+    def move_relative_xy(self, dx: float, dy: float):
+        """Move EE by a small offset in XY, preserving Z and orientation."""
+        cur = self.get_current_ee_pose()
+        if cur is None:
+            self.log_with_time('error', "Current EE pose unavailable.")
+            return
+        pose = self.create_pose(
+            (cur.position.x + float(dx), cur.position.y + float(dy), cur.position.z),
+            (cur.orientation.x, cur.orientation.y, cur.orientation.z, cur.orientation.w)
+        )
+        self.send_move_request(pose, is_cartesian=False)
+
+
+    def get_marker_pose_in_base(self) -> Pose:
+        """
+        Return the latest marker pose expressed in base_link.
+        Raises RuntimeError if unavailable.
+        """
+        if self.pose_in_camera is None:
+            raise RuntimeError("No ArUco pose from camera yet (self.pose_in_camera is None).")
+
+        return self._transform_pose(
+            self.pose_in_camera,
+            source_frame="camera_color_optical_frame",
+            target_frame="base_link"
+        )
+
+    def compute_board_edges_from_marker(
+        self,
+        col_spacing_m: float = 0.040,     # center-to-center spacing
+        num_cols: int = 7,
+        axis_along_columns: str = "x",    # marker axis that runs along the board columns
+        axis_sign: int = +1,
+        board_clearance_m: float = 0.030, # from marker center toward the board face
+        axis_board_normal: str = "y",     # marker axis that points from marker toward the board
+        normal_sign: int = +1,
+        z_mode: str = "keep_ee"           # "keep_ee" | "marker_z" | float(z_value)
+    ):
+        """
+        Returns two edge points (left, right) in base_link.
+        All stepping is done in the XY plane so image/camera tilt does not distort XY.
+        """
+        pose_b = self.get_marker_pose_in_base()
+
+        # Rotation: columns are columns of R (marker axes in base)
+        q = [pose_b.orientation.x, pose_b.orientation.y, pose_b.orientation.z, pose_b.orientation.w]
+        R = tf_transformations.quaternion_matrix(q)[0:3, 0:3]
+
+        # Helpers: project a 3D vector to XY and normalize there
+        def proj_xy(v):
+            vx, vy = float(v[0]), float(v[1])
+            n = (vx*vx + vy*vy) ** 0.5
+            if n < 1e-12:
+                return np.array([1.0, 0.0])  # fallback
+            return np.array([vx/n, vy/n])
+
+        # Column direction (in XY)
+        idx = {"x": 0, "y": 1, "z": 2}[axis_along_columns.lower()]
+        col_dir_xy = proj_xy(axis_sign * R[:, idx])
+
+        # Normal toward the board (in XY) – just to nudge from the marker to the board face
+        nidx = {"x": 0, "y": 1, "z": 2}[axis_board_normal.lower()]
+        n_dir_xy = proj_xy(normal_sign * R[:, nidx])
+
+        # Center on board face (XY only)
+        c = np.array([pose_b.position.x, pose_b.position.y], dtype=float)
+        center_xy = c + board_clearance_m * n_dir_xy
+
+        # Half span in XY
+        half_span = ((num_cols - 1) * col_spacing_m) / 2.0
+        left_xy  = center_xy - half_span * col_dir_xy   # col 0
+        right_xy = center_xy + half_span * col_dir_xy   # col N-1
+
+        # Choose Z
+        if z_mode == "keep_ee":
+            ee = self.get_current_ee_pose()
+            z_val = float(ee.position.z) if ee is not None else float(pose_b.position.z)
+        elif z_mode == "marker_z":
+            z_val = float(pose_b.position.z)
+        else:
+            # z_mode is a numeric value
+            try:
+                z_val = float(z_mode)
+            except Exception:
+                z_val = float(pose_b.position.z)
+
+        edge_left  = Point(x=float(left_xy[0]),  y=float(left_xy[1]),  z=z_val)
+        edge_right = Point(x=float(right_xy[0]), y=float(right_xy[1]), z=z_val)
+        return edge_left, edge_right
+
+
+
+    def on_compute_drop_points(self):
+        try:
+            p_up, p_down = self.compute_board_edges_from_marker()  # returns geometry_msgs/Point
+            # store only XY for “board line” UI
+            self.drop_p1_xy = (float(p_up.x), float(p_up.y))
+            self.drop_p2_xy = (float(p_down.x), float(p_down.y))
+
+            # If both XY are identical (e.g., your function only changed Z), we still
+            # compute a usable board direction from marker +Y axis.
+            self._recompute_board_dir_xy()
+
+            # reflect in entries
+            self._set_xy_entry(self.drop_p1_entry, self.drop_p1_xy)
+            self._set_xy_entry(self.drop_p2_entry, self.drop_p2_xy)
+
+            self.log_with_time('info',
+                f"Drop points set: P1=({self.drop_p1_xy[0]:.3f},{self.drop_p1_xy[1]:.3f}), "
+                f"P2=({self.drop_p2_xy[0]:.3f},{self.drop_p2_xy[1]:.3f})")
+        except Exception as e:
+            self.log_with_time('error', f"compute_drop_points failed: {e}")
+
+    def on_board_nudge(self, which: str):
+        # step meters from entry (default 1 cm)
+        try:
+            step = float(self.board_step_entry.get().strip())
+        except Exception:
+            step = 0.01
+
+        self._recompute_board_dir_xy()
+        t = self.board_dir_xy
+        n = self._board_normal_xy()
+
+        if which == "up":
+            d =  t * step
+        elif which == "down":
+            d = -t * step
+        elif which == "left":
+            d =  n * step
+        elif which == "right":
+            d = -n * step
+        else:
+            return
+
+        self.move_relative_xy(d[0], d[1])
+
+    def on_set_point(self, idx: int):
+        cur = self.get_current_ee_pose()
+        if cur is None:
+            self.log_with_time('error', "Current EE pose unavailable.")
+            return
+        xy = (float(cur.position.x), float(cur.position.y))
+        if idx == 1:
+            self.drop_p1_xy = xy
+            self._set_xy_entry(self.drop_p1_entry, xy)
+        else:
+            self.drop_p2_xy = xy
+            self._set_xy_entry(self.drop_p2_entry, xy)
+        self._recompute_board_dir_xy()
+
 
     def brick_top_infos_callback(self, msg: Float32MultiArray):
         data = list(msg.data)
@@ -405,8 +667,171 @@ class TkinterROS(Node):
         tk.Button(newgrp, text="Tower", command=self.stack_all_bricks, width=8).pack(side=tk.LEFT, padx=4, pady=5)
         tk.Button(newgrp, text="Refine", command=self.refine_pos, width=8).pack(side=tk.LEFT, padx=4, pady=5)
 
+
+        chip_grp = tk.LabelFrame(self.tab_tools, text="Chip Controls")
+        chip_grp.pack(fill=tk.X, padx=8, pady=6)
+        tk.Button(chip_grp, text="Collect Chip", command=self.collect_chip, width=8).pack(side=tk.LEFT, padx=4, pady=5)
+
+
+        # --- Board / Drop line helpers ---
+        box = tk.Frame(chip_grp)
+        for c in range(3):
+            box.grid_columnconfigure(c, weight=1)
+        box.pack(fill=tk.X, padx=4, pady=6)
+
+        # Row 0: compute + step size
+        tk.Button(box, text="Compute Drop Points", command=self.on_compute_drop_points, width=18)\
+            .grid(row=0, column=0, padx=4, pady=2, sticky="w")
+
+        tk.Label(box, text="Step (m):").grid(row=0, column=1, padx=(16,4), pady=2, sticky="e")
+        self.board_step_entry = tk.Entry(box, width=8)
+        self.board_step_entry.grid(row=0, column=2, padx=4, pady=2, sticky="w")
+        self.board_step_entry.insert(0, "0.01")  # default 1 cm
+
+        # Row 1: point boxes
+        tk.Label(box, text="Point 1 (x,y):").grid(row=1, column=0, padx=4, pady=2, sticky="e")
+        self.drop_p1_entry = tk.Entry(box, width=26)
+        self.drop_p1_entry.grid(row=1, column=1, columnspan=2, padx=4, pady=2, sticky="w")
+
+        tk.Label(box, text="Point 2 (x,y):").grid(row=2, column=0, padx=4, pady=2, sticky="e")
+        self.drop_p2_entry = tk.Entry(box, width=26)
+        self.drop_p2_entry.grid(row=2, column=1, columnspan=2, padx=4, pady=2, sticky="w")
+
+        # Row 3: nudge buttons (aligned to board)
+        nudges = tk.Frame(box)
+        nudges.grid(row=3, column=0, columnspan=3, padx=4, pady=(6,2), sticky="w")
+        tk.Button(nudges, text="Up",    width=7, command=lambda: self.on_board_nudge("up")).pack(side=tk.LEFT, padx=2)
+        tk.Button(nudges, text="Down",  width=7, command=lambda: self.on_board_nudge("down")).pack(side=tk.LEFT, padx=2)
+        tk.Button(nudges, text="Left",  width=7, command=lambda: self.on_board_nudge("left")).pack(side=tk.LEFT, padx=2)
+        tk.Button(nudges, text="Right", width=7, command=lambda: self.on_board_nudge("right")).pack(side=tk.LEFT, padx=2)
+
+        # Row 4: set points from current EE XY
+        setrow = tk.Frame(box)
+        setrow.grid(row=4, column=0, columnspan=3, padx=4, pady=(4,6), sticky="w")
+        tk.Button(setrow, text="Set 1st point", width=12, command=lambda: self.on_set_point(1)).pack(side=tk.LEFT, padx=2)
+        tk.Button(setrow, text="Set 2nd point", width=12, command=lambda: self.on_set_point(2)).pack(side=tk.LEFT, padx=2)
+
+        # Row 5: go-to buttons (own row, spans all columns)
+        gotorow = tk.Frame(box)
+        gotorow.grid(row=5, column=0, columnspan=3, padx=4, pady=(2,6), sticky="w")
+        tk.Button(gotorow, text="Go to 1st point", width=14,
+                command=lambda: self.on_goto_point(1)).pack(side=tk.LEFT, padx=2)
+        tk.Button(gotorow, text="Go to 2nd point", width=14,
+                command=lambda: self.on_goto_point(2)).pack(side=tk.LEFT, padx=2)
+
+        # Row 6: align marker buttons (own row, spans all columns)
+        alignrow = tk.Frame(box)
+        alignrow.grid(row=6, column=0, columnspan=3, padx=4, pady=(2,6), sticky="w")
+        tk.Button(alignrow, text="Align marker (horiz.)",
+                command=lambda: self.align_marker_with_image(axis_in_marker="x", target="horizontal")
+        ).pack(side=tk.LEFT, padx=2)
+        tk.Button(alignrow, text="Align marker (vert.)",
+                command=lambda: self.align_marker_with_image(axis_in_marker="x", target="vertical")
+        ).pack(side=tk.LEFT, padx=2)
+
+
         # Start periodic updates
         self.update_position_label()
+
+    def move_to_xy(self, x: float, y: float, is_cartesian: bool = False):
+        """Move EE to (x,y) keeping current Z and orientation."""
+        cur = self.get_current_ee_pose()
+        if cur is None:
+            self.log_with_time('error', "Cannot read current end-effector pose.")
+            return
+        pose = self.create_pose(
+            (float(x), float(y), float(cur.position.z)),
+            (cur.orientation.x, cur.orientation.y, cur.orientation.z, cur.orientation.w)
+        )
+        self.send_move_request(pose, is_cartesian=is_cartesian)
+
+    def on_goto_point(self, idx: int):
+        """Goto 1st/2nd saved point; prefer UI entry if user edited it."""
+        try:
+            if idx == 1:
+                xy = self._parse_xy_entry(self.drop_p1_entry)
+            else:
+                xy = self._parse_xy_entry(self.drop_p2_entry)
+        except Exception:
+            # fallback to last stored values
+            xy = getattr(self, "drop_p1_xy" if idx == 1 else "drop_p2_xy", None)
+            if xy is None:
+                self.log_with_time('warn', f"No point #{idx} set yet.")
+                return
+        self.move_to_xy(xy[0], xy[1], is_cartesian=False)
+
+
+
+    def collect_chip(self):
+        """
+        Continuously collect chips one by one until no more are available.
+        After each collection + drop, return to the start pose (same as start_collection).
+        """
+        while True:
+            bricks = list(getattr(self, "latest_bricks", []))
+            if not bricks:
+                self.log_with_time('info', "No more chips available to collect.")
+                return False
+
+            cur = self.get_current_ee_pose()
+            if not cur:
+                self.log_with_time('error', "Current EE pose unavailable.")
+                return False
+
+            # --- Find closest chip ---
+            def dist_to_ee(b):
+                if b.get("cx_m") is None or b.get("cy_m") is None:
+                    return float("inf")
+                return ((b["cx_m"] - cur.position.x) ** 2 +
+                        (b["cy_m"] - cur.position.y) ** 2) ** 0.5
+
+            target = min(bricks, key=dist_to_ee)
+            if target.get("cx_m") is None or target.get("cy_m") is None:
+                self.log_with_time('warn', "Closest chip missing coordinates.")
+                return False
+
+            cx, cy = float(target["cx_m"]), float(target["cy_m"])
+            self.log_with_time('info', f"Collecting chip at ({cx:.3f}, {cy:.3f})")
+
+            # --- Pose helpers ---
+            _, _, yaw = tf_transformations.euler_from_quaternion([
+                cur.orientation.x, cur.orientation.y,
+                cur.orientation.z, cur.orientation.w
+            ])
+            def face_down_pose(x, y, z, yaw_rad):
+                q = tf_transformations.quaternion_from_euler(-np.pi, 0.0, yaw_rad)
+                return self.create_pose((x, y, z), (q[0], q[1], q[2], q[3]))
+
+            # --- Parameters ---
+            HOVER_Z = 0.30
+            PICK_Z1 = 0.20
+            PICK_Z2 = 0.08
+            DROP_Z  = 0.15
+            drop_xy = (0.15, -0.30)  # bin location
+
+            # --- Pick sequence ---
+            self.open_gripper_srv()
+            self.send_move_request(face_down_pose(cx, cy, HOVER_Z, yaw), is_cartesian=False)
+            self.refine_pose_with_ee_camera_dx_dy(cx, cy, PICK_Z1)
+            self.refine_pose_with_ee_camera_dx_dy(cx, cy, PICK_Z2)
+            self.close_gripper_srv(132)
+            self.move_to_height(DROP_Z, is_cartesian=False)
+
+            # --- Drop sequence ---
+            self.send_move_request(face_down_pose(drop_xy[0], drop_xy[1], DROP_Z, yaw), is_cartesian=False)
+            self.open_gripper_srv()
+            self.move_to_height(HOVER_Z, is_cartesian=False)
+
+            # --- Return to start pose (same as start_collection) ---
+            start_pose = self.make_pose_xyz_quat(-0.007, -0.328, 0.405,
+                                                0.000, 1.000, 0.002, 0.000)
+            self.send_move_request(start_pose, is_cartesian=False)
+
+            self.log_with_time('info', "One chip collected and placed in bin. Returning to start...")
+
+            # Loop will re-check latest_bricks
+
+    
 
     def start_collection(self):
             pose = self.make_pose_xyz_quat(-0.007, -0.328, 0.405,0.000, 1.000, 0.002, 0.000)
@@ -623,9 +1048,9 @@ class TkinterROS(Node):
         # return bool(res.success)
 
 
-    def close_gripper_srv(self):
+    def close_gripper_srv(self,angle = 95):
 
-        self.move_servo_to_angle(95.0)
+        self.move_servo_to_angle(angle)
 
         # req = Trigger.Request()
         # res = self.call_service_blocking(self.close_gripper_client, req, timeout_sec=3.0)
@@ -1608,7 +2033,107 @@ class TkinterROS(Node):
 
         self.move_to_marker_pose(self.pose_in_camera)
 
-    
+    def align_marker_with_image(
+        self,
+        axis_in_marker: str = "x",   # "x" or "y" — which marker axis to align in the image
+        target: str = "horizontal",  # "horizontal" or "vertical" final orientation in the image
+        sign_correction: int = +1    # flip to -1 if rotation goes the wrong way on your rig
+    ):
+        """
+        Rotate the end-effector (camera) about its viewing axis so the chosen marker axis
+        appears perfectly horizontal/vertical in the camera image.
+
+        Frames (ROS optical): +X right, +Y down, +Z forward (into the scene).
+
+        Steps:
+        1) Use marker pose in the camera frame (self.pose_in_camera).
+        2) Project the chosen marker axis onto the image plane (X–Y of camera frame).
+        3) Compute its angle in the image.
+        4) Rotate the EE around the viewing axis (approx. a pure yaw update) by -angle
+            (or to ±90° for vertical) and keep XYZ fixed.
+
+        Notes:
+        * If the rotation direction is inverted for your camera mounting, set sign_correction=-1.
+        * This assumes the camera is rigidly fixed to the EE; a yaw about the EE roughly
+            equals a roll about the camera Z (optical axis).
+        """
+        # --- 0) sanity ---
+        if self.pose_in_camera is None:
+            self.log_with_time('warn', "No ArUco pose in camera frame yet.")
+            return
+
+        # --- 1) marker pose in camera frame ---
+        pose_c = self.pose_in_camera
+
+        # --- 2) rotation matrix of marker in camera frame ---
+        q = [pose_c.orientation.x, pose_c.orientation.y, pose_c.orientation.z, pose_c.orientation.w]
+        R = tf_transformations.quaternion_matrix(q)[0:3, 0:3]  # marker axes expressed in camera frame
+
+        idx = {"x": 0, "y": 1, "z": 2}[axis_in_marker.lower()]
+        a_cam = R[:, idx]           # chosen marker axis, in camera coords
+
+        # Project to the image plane: use (X_right, Y_down), drop Z
+        ax, ay = float(a_cam[0]), float(a_cam[1])
+
+        # If the axis is nearly perpendicular to the image plane, bail
+        if ax*ax + ay*ay < 1e-8:
+            self.log_with_time('warn', "Marker axis nearly along camera Z; angle undefined.")
+            return
+
+        # --- 3) current angle of that axis in the image (radians).
+        # angle 0 = pointing to the right (horizontal), positive = clockwise (since Y is down).
+        angle = math.atan2(ay, ax)  # [-pi, pi]
+
+        # Desired angle in the image:
+        if target.lower() == "horizontal":
+            angle_target = 0.0
+        elif target.lower() == "vertical":
+            # vertical means pointing straight down (or up). In ROS optical, +Y is DOWN,
+            # so choose +90° (down) as canonical. If you want up, use -90°.
+            angle_target = math.pi / 2.0
+        else:
+            self.log_with_time('warn', f"Unknown target '{target}', use 'horizontal' or 'vertical'.")
+            return
+
+        # The delta to apply to the camera about its viewing axis (image rotation)
+        delta_img = (angle_target - angle)
+
+        # Optional: wrap to [-pi, pi] for minimal rotation
+        while delta_img > math.pi:
+            delta_img -= 2*math.pi
+        while delta_img < -math.pi:
+            delta_img += 2*math.pi
+
+        delta_img *= float(sign_correction)
+
+        # --- 4) apply that as a yaw change to the EE pose in base_link ---
+        cur = self.get_current_ee_pose()
+        if cur is None:
+            self.log_with_time('error', "Current EE pose unavailable.")
+            return
+
+        # Keep position, keep roll/pitch face-down if you like, only adjust yaw.
+        roll, pitch, yaw = tf_transformations.euler_from_quaternion([
+            cur.orientation.x, cur.orientation.y, cur.orientation.z, cur.orientation.w
+        ])
+
+        # If your tool is face-down (-pi roll) and camera optical Z aligns with EE -Z,
+        # a change in camera image rotation typically maps to a change in EE yaw by the same sign.
+        new_yaw = yaw + delta_img
+
+        q_new = tf_transformations.quaternion_from_euler(roll, pitch, new_yaw)
+        pose = self.create_pose(
+            (cur.position.x, cur.position.y, cur.position.z),
+            (q_new[0], q_new[1], q_new[2], q_new[3])
+        )
+        self.send_move_request(pose, is_cartesian=False)
+
+        self.log_with_time(
+            'info',
+            f"Aligned marker to {target} via Δyaw={math.degrees(delta_img):+.1f}° (img angle {math.degrees(angle):+.1f}°)."
+        )
+
+
 
     def _transform_pose(self, pose: Pose, source_frame: str, target_frame: str) -> Pose:
         """
@@ -1706,7 +2231,7 @@ class TkinterROS(Node):
         
         now = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         motion_type = "Cartesian" if is_cartesian else "Joint-space"
-        if not (-0.5 <= pose.position.x <= 0.5 and -0.54 <= pose.position.y <= 0.6 and 0.11 <= pose.position.z <= 0.55):
+        if not (-0.5 <= pose.position.x <= 0.5 and -0.54 <= pose.position.y <= 0.6 and 0.06 <= pose.position.z <= 0.55):
             print(f"[{now}] 🚫 Refused Motion: {motion_type} target out of bounds! Target: pos=({pose.position.x:.3f},{pose.position.y:.3f},{pose.position.z:.3f}) ori={pose.orientation}")
             self.arm_is_moving = False
             return False
@@ -1954,10 +2479,10 @@ def ros_spin_executor(executor): # New
 
 
 def main(): 
-    # debugpy.listen(("localhost", 5678))  # Port for debugger to connect
-    # print("Waiting for debugger to attach...")
-    # debugpy.wait_for_client()
-    # print("Debugger connected.")
+    debugpy.listen(("localhost", 5678))  # Port for debugger to connect
+    print("Waiting for debugger to attach...")
+    debugpy.wait_for_client()
+    print("Debugger connected.")
    
     rclpy.init()
 
