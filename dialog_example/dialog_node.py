@@ -25,6 +25,7 @@ from rclpy.qos import qos_profile_sensor_data
 from rclpy.callback_groups import ReentrantCallbackGroup
 from geometry_msgs.msg import PoseArray
 import traceback
+import json, os, time  # top of file if not already imported
 
 
 
@@ -63,17 +64,6 @@ class TkinterROS(Node):
     def __init__(self):
         super().__init__('tkinter_ros_node')
 
-
-        # --- Serial connection to Arduino ---
-        # Change '/dev/ttyUSB0' and baudrate to match your setup
-        try:
-            self.serial_port = serial.Serial('/dev/ttyUSB0', 9600, timeout=1)
-            self.log_with_time('info', "Serial port opened successfully")
-        except Exception as e:
-            self.serial_port = None
-            self.log_with_time('error', f"Failed to open serial port: {e}")
-
-            
         self.gui_queue = queue.Queue()
         self.tf_buffer = Buffer()
         self.tf_listener = TransformListener(self.tf_buffer, self)
@@ -88,6 +78,7 @@ class TkinterROS(Node):
         self.top_dy_mm = None
         self.top_angle_deg = None
         self.top_est_height_mm = None
+        self.active_drop_idx = None  # 1 or 2 after a goto
 
         self.last_joint_update_time = self.get_clock().now()
         self.marker_index = 0
@@ -98,8 +89,6 @@ class TkinterROS(Node):
         self.calib_path = self.calib_dir / 'ar4_calibration.calib'
         # self.publisher = self.create_publisher(String, '/ar4_hardware_interface_node/homing_string', 10)
         self.cb_group = ReentrantCallbackGroup()
-        self._aruco_count = 0
-
 
         # KEEP a reference on self:
         self.aruco_sub = self.create_subscription(
@@ -110,8 +99,6 @@ class TkinterROS(Node):
             callback_group=self.cb_group
         )
 
-        # heartbeat to show matches & counts
-
         self.brick_detections = []  # list of dicts for latest frame
         self.create_subscription(
             Float32MultiArray,
@@ -119,6 +106,21 @@ class TkinterROS(Node):
             self.brick_top_infos_callback,
             10
         )
+
+        # ... inside __init__ after entries exist ...
+        self._state_path = os.path.expanduser("~/.ov5640_board_state.json")
+    
+        self.board_end_points_sub = self.create_subscription(
+            Float32MultiArray,
+            'board_end_points',
+            self.board_end_points_callback,
+            qos_profile_sensor_data,
+            callback_group=self.cb_group
+        )
+        self.board_dx1_mm = None
+        self.board_dy1_mm = None
+        self.board_dx2_mm = None
+        self.board_dy2_mm = None
 
         self.create_subscription(JointState, '/joint_states', self.joint_states_callback, 10)
         
@@ -140,20 +142,19 @@ class TkinterROS(Node):
 
 
         self.log_with_time('info', 'ArucoPoseFollower initialized, listening to /aruco_poses')
+        self.total_columns = 7
+        self.current_column_idx = -1  # will become 0 on first press
 
 
         self.open_gripper_client  = self.create_client(Trigger, '/ar4_hardware_interface_node/open_gripper')
         self.close_gripper_client = self.create_client(Trigger, '/ar4_hardware_interface_node/close_gripper')
         self.move_servo_client = self.create_client(MoveServoToAngle, '/ar4_hardware_interface_node/move_servo_to_angle')
 
-
-
         # Optional: warn if not up yet (won’t block forever)
         for cli, nm in [(self.open_gripper_client,  'open_gripper'),
                         (self.close_gripper_client, 'close_gripper')]:
             if not cli.wait_for_service(timeout_sec=0.5):
                 self.log_with_time('warn', f"Service '{nm}' not available yet")
-
 
         self.homing_client = self.create_client(Trigger, '/ar4_hardware_interface_node/homing')
         self.move_arm_client = self.create_client(MoveToPose, '/ar_move_to_pose')
@@ -185,20 +186,235 @@ class TkinterROS(Node):
             self.image_callback,
             qos_profile_sensor_data
         )
+        self._load_board_state()  # populate entries/vars if a state file exists
 
         # Add a timer to periodically show frames
         self.create_timer(0.03, self.display_frame)  # ~30 FPS
 
-
-    def _aruco_probe_cb(self, msg: PoseArray):
+    def _load_board_state(self):
+        """Load step and endpoints from JSON and reflect in UI + memory."""
         try:
-            self._aruco_count += 1
-            # DO NOT touch anything else here yet. Just prove delivery:
-            print(f"[ARUCO PROBE] #{self._aruco_count} poses={len(msg.poses)}")
-        except Exception as e:
-            print("[ARUCO PROBE] Exception:", e)
-            print(traceback.format_exc())
+            if not os.path.exists(self._state_path):
+                return
+            with open(self._state_path, "r") as f:
+                data = json.load(f)
 
+            # step
+            step = data.get("step_m")
+            if isinstance(step, (int, float)) and self.board_step_entry:
+                self.board_step_entry.delete(0, tk.END)
+                self.board_step_entry.insert(0, f"{step:.3f}")
+
+            # endpoints
+            p1 = data.get("drop_p1_xy")
+            p2 = data.get("drop_p2_xy")
+
+            if isinstance(p1, (list, tuple)) and len(p1) == 2:
+                self.drop_p1_xy = (float(p1[0]), float(p1[1]))
+                self._set_xy_entry(self.drop_p1_entry, self.drop_p1_xy)
+
+            if isinstance(p2, (list, tuple)) and len(p2) == 2:
+                self.drop_p2_xy = (float(p2[0]), float(p2[1]))
+                self._set_xy_entry(self.drop_p2_entry, self.drop_p2_xy)
+
+            # keep direction vector in sync when both exist
+            self._recompute_board_dir_xy()
+
+            self.log_with_time('info', f"Loaded board state from {self._state_path}")
+        except Exception as e:
+            self.log_with_time('warn', f"Could not load board state: {e}")
+
+    def _save_board_state(self):
+        """Save step and endpoints to JSON."""
+        try:
+            # read step directly from entry (fallback to 0.01 if bad)
+            try:
+                step_m = float(self.board_step_entry.get().strip())
+            except Exception:
+                step_m = 0.01
+
+            data = {
+                "step_m": step_m,
+                "drop_p1_xy": list(self.drop_p1_xy) if getattr(self, "drop_p1_xy", None) else None,
+                "drop_p2_xy": list(self.drop_p2_xy) if getattr(self, "drop_p2_xy", None) else None,
+                "saved_at": time.time(),
+            }
+            with open(self._state_path, "w") as f:
+                json.dump(data, f, indent=2)
+            # optional: log quietly to avoid spam
+            # self.log_with_time('info', f"Saved board state to {self._state_path}")
+        except Exception as e:
+            self.log_with_time('warn', f"Could not save board state: {e}")
+
+
+    def compute_board_column_xy(self, col_idx: int):
+        """
+        Return (x,y) of Connect-4 column center for col_idx in [0..6], using stored endpoints.
+        Convention: col 0 is at drop_p1_xy, col 6 is at drop_p2_xy, and centers are linearly spaced.
+        """
+        if not (0 <= col_idx <= 6):
+            raise ValueError("col_idx must be in [0..6]")
+
+        p1 = getattr(self, "drop_p1_xy", None)
+        p2 = getattr(self, "drop_p2_xy", None)
+        if p1 is None or p2 is None:
+            self.log_with_time('warn', "Board endpoints not set; compute drop points first.")
+            return None
+
+        p1 = np.asarray(p1, dtype=float)
+        p2 = np.asarray(p2, dtype=float)
+        d  = p2 - p1
+        n  = np.linalg.norm(d)
+        if n < 1e-9:
+            self.log_with_time('warn', "Board endpoints are identical; cannot compute columns.")
+            return None
+
+        t = col_idx / 6.0  # 0..1 across the board
+        p = p1 + t * d
+        return float(p[0]), float(p[1])
+
+
+    def _wrap_to_pi(self, a: float) -> float:
+        return (a + np.pi) % (2*np.pi) - np.pi
+
+    def move_to_xy_align_board(self, x: float, y: float, z: float = None, is_cartesian: bool = False):
+        """
+        Move to (x,y, z=current if None) with orientation guaranteed parallel to ground:
+        roll = -pi (face-down), pitch = 0, yaw = ⟂ to board (closest 180°-equivalent).
+        """
+        # 1) Board yaw (parallel)
+        yaw_board = self._compute_board_yaw_rad()
+        if yaw_board is None:
+            return False
+
+        # 2) Desired yaw is perpendicular to board (+90°). Wrap to (-pi, pi]
+        yaw_perp = self._wrap_to_pi(yaw_board + np.pi/2)
+
+        # 3) Read current yaw ONLY for "closest" choice; ignore current roll/pitch entirely
+        pose = self.get_current_ee_pose()
+        if pose is None:
+            self.log_with_time('error', "Cannot read current EE pose.")
+            return False
+        q_curr = [pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w]
+        _, _, yaw_curr = tf_transformations.euler_from_quaternion(q_curr)
+        yaw_curr = self._wrap_to_pi(yaw_curr)
+
+        # 4) Tool is symmetric: choose closest 180°-equivalent yaw
+        cands = [yaw_perp,
+                self._wrap_to_pi(yaw_perp + np.pi),
+                self._wrap_to_pi(yaw_perp - np.pi)]
+        yaw_target = min(cands, key=lambda a: abs(self._wrap_to_pi(a - yaw_curr)))
+
+        # 5) Build target pose with roll=-pi, pitch=0 (always parallel to ground)
+        target = Pose()
+        target.position.x = float(x)
+        target.position.y = float(y)
+        target.position.z = float(pose.position.z) if z is None else float(z)
+
+        roll = -np.pi
+        pitch = 0.0
+        qx, qy, qz, qw = tf_transformations.quaternion_from_euler(roll, pitch, yaw_target)
+        target.orientation.x = qx
+        target.orientation.y = qy
+        target.orientation.z = qz
+        target.orientation.w = qw
+
+        self.log_with_time('info',
+            f"EE yaw ⟂ board | yaw_curr={np.degrees(yaw_curr):.1f}°, "
+            f"yaw_target={np.degrees(yaw_target):.1f}° | face-down enforced")
+        self.log_with_time('info', f"Moving to ({x:.3f}, {y:.3f}, {target.position.z:.3f})...")
+        ok = self.send_move_request(target, is_cartesian=is_cartesian)
+        self.log_with_time('info', f"Move to ({x:.3f}, {y:.3f}, {target.position.z:.3f}) done: {ok}")
+        # 6) (Optional) post-move guard: re-enforce face-down if small drift creeps in
+        if ok:
+            self.log_with_time('info', 'Verifying post-move EE orientation...')
+            final = self.get_current_ee_pose()
+            self.log_with_time('info', f"Post-move EE pose: pos=({final.position.x:.3f}, {final.position.y:.3f}, {final.position.z:.3f})")
+            if final:
+                qf = [final.orientation.x, final.orientation.y, final.orientation.z, final.orientation.w]
+                rf, pf, yf = tf_transformations.euler_from_quaternion(qf)
+                # If roll/pitch drifted, snap them back and keep the same yaw
+                if abs(rf + np.pi) > np.degrees(2e-2) or abs(pf) > np.degrees(2e-2):  # ~0.02 rad ≈ 1.1°
+                    qx, qy, qz, qw = tf_transformations.quaternion_from_euler(-np.pi, 0.0, yf)
+                    target2 = Pose()
+                    target2.position = final.position
+                    target2.orientation.x = qx
+                    target2.orientation.y = qy
+                    target2.orientation.z = qz
+                    target2.orientation.w = qw
+                    self.send_move_request(target2, is_cartesian=is_cartesian)
+
+        return ok
+
+
+
+
+    def _compute_board_yaw_rad(self):
+        """
+        Yaw (radians) parallel to the board, computed from drop_p1_xy -> drop_p2_xy.
+        Returns None if endpoints are missing/degenerate.
+        """
+        p1 = getattr(self, "drop_p1_xy", None)
+        p2 = getattr(self, "drop_p2_xy", None)
+        if p1 is None or p2 is None:
+            self.log_with_time('warn', "Board endpoints not set; cannot compute board yaw.")
+            return None
+
+        dx = float(p2[0]) - float(p1[0])
+        dy = float(p2[1]) - float(p1[1])
+        n  = (dx*dx + dy*dy) ** 0.5
+        if n < 1e-9:
+            self.log_with_time('warn', "Board endpoints identical; cannot compute board yaw.")
+            return None
+        return np.arctan2(dy, dx)  # radians
+
+    def on_next_board_column(self):
+        self.current_column_idx = (self.current_column_idx + 1) % self.total_columns
+        self.goto_board_column(self.current_column_idx)
+
+    def goto_board_column(self, col_idx: int):
+        """Move EE to the center of a board column with yaw parallel to board."""
+        xy = self.compute_board_column_xy(col_idx)
+        if xy is None:
+            return
+        x, y = xy
+        self.log_with_time('info', f"Going to board column {col_idx}: ({x:.3f}, {y:.3f}) (yaw aligned)")
+        # Do not set active_drop_idx here; columns are not endpoints.
+        self.move_to_xy_align_board(x, y, is_cartesian=False)
+
+
+
+    def board_end_points_callback(self, msg: Float32MultiArray):
+        """
+        Callback for receiving board endpoints [dx1_mm, dy1_mm, dx2_mm, dy2_mm].
+        These represent the 2 end points of the Connect-4 board relative to the ArUco marker.
+        """
+        data = list(msg.data)
+        if len(data) != 4:
+            self.log_with_time('warn', f"board_end_points message unexpected length: {len(data)}")
+            return
+
+        self.board_dx1_mm, self.board_dy1_mm, self.board_dx2_mm, self.board_dy2_mm = data
+
+        # self.log_with_time(
+        #     'info',
+        #     f"Board endpoints received: "
+        #     f"P1=({self.board_dx1_mm:.1f}, {self.board_dy1_mm:.1f}) mm, "
+        #     f"P2=({self.board_dx2_mm:.1f}, {self.board_dy2_mm:.1f}) mm"
+        # )
+
+
+    def get_joint_angle(self, joint_name: str):
+        """Return the angle (in degrees) for a given joint name, or None if not found."""
+        if not self.joint_states:
+            return None
+        try:
+            idx = self.joint_states.name.index(joint_name)
+            return np.degrees(self.joint_states.position[idx])
+        except ValueError:
+            self.get_logger().warn(f"{joint_name} not found in joint states")
+            return None
+    
     def image_callback(self, msg: Image):
         try:
             self.latest_frame = self.bridge.imgmsg_to_cv2(msg, desired_encoding='bgr8')
@@ -243,18 +459,32 @@ class TkinterROS(Node):
         return dir_xy / n
 
     def _recompute_board_dir_xy(self):
-        """Define board direction from the two points; if same XY, use marker +Y."""
-        p1 = np.array(self.drop_p1_xy) if getattr(self, "drop_p1_xy", None) else None
-        p2 = np.array(self.drop_p2_xy) if getattr(self, "drop_p2_xy", None) else None
-        if p1 is None or p2 is None:
-            self.board_dir_xy = self._get_board_dir_xy_from_marker()
+        """
+        Define board direction from the two stored endpoints (drop_p1_xy, drop_p2_xy).
+        No fallback to marker; if unavailable/degenerate, keep previous direction.
+        """
+        p1 = getattr(self, "drop_p1_xy", None)
+        p2 = getattr(self, "drop_p2_xy", None)
+
+        if not p1 or not p2:
+            self.log_with_time('warn', "Board endpoints not set yet; board_dir_xy unchanged.")
             return
+
+        p1 = np.asarray(p1, dtype=float)
+        p2 = np.asarray(p2, dtype=float)
         d = p2 - p1
         n = np.linalg.norm(d)
+
         if n < 1e-6:
-            self.board_dir_xy = self._get_board_dir_xy_from_marker()
-        else:
-            self.board_dir_xy = d / n
+            self.log_with_time('warn', "Board endpoints are identical; board_dir_xy unchanged.")
+            return
+
+        u = d / n
+        # store as ndarray or tuple—pick what you use elsewhere; ndarray is handy for math
+        self.board_dir_xy = u
+        # (Optional) also store the perpendicular if you use it:
+        # self.board_perp_xy = np.array([-u[1], u[0]], dtype=float)
+
 
     def _board_normal_xy(self):
         """Perpendicular (left/right) = rotate board_dir by +90° in XY."""
@@ -273,6 +503,13 @@ class TkinterROS(Node):
         )
         self.send_move_request(pose, is_cartesian=False)
 
+    def move_to_board_end(self, which="left"):
+        if None in (self.board_dx1_mm, self.board_dy1_mm, self.board_dx2_mm, self.board_dy2_mm):
+            self.log_with_time('warn', "Board endpoints not yet received.")
+            return
+        dx_mm, dy_mm = (self.board_dx1_mm, self.board_dy1_mm) if which == "left" else (self.board_dx2_mm, self.board_dy2_mm)
+        dx_m, dy_m = -dx_mm / 1000.0, -dy_mm / 1000.0
+        self.move_relative_xy(dx_m, dy_m)
 
     def get_marker_pose_in_base(self) -> Pose:
         """
@@ -287,6 +524,34 @@ class TkinterROS(Node):
             source_frame="camera_color_optical_frame",
             target_frame="base_link"
         )
+
+    def correct_marker_pose_for_joints(self,pose_b: Pose, j0_angle: float, j5_angle: float) -> Pose:
+        """
+        Rotates the marker pose around base Z by (J0 + J5) radians.
+        Use when camera_link is fixed to base_link instead of being downstream of the wrist.
+        """
+
+        # 1) Build rotation matrix about Z
+        total_angle = j0_angle + j5_angle
+        R_corr = tf_transformations.rotation_matrix(total_angle, (0, 0, 1))[0:3, 0:3]
+
+        # 2) Pose → matrix
+        q = [pose_b.orientation.x, pose_b.orientation.y, pose_b.orientation.z, pose_b.orientation.w]
+        R_pose = tf_transformations.quaternion_matrix(q)[0:3, 0:3]
+        p = np.array([pose_b.position.x, pose_b.position.y, pose_b.position.z])
+
+        # 3) Apply rotation about base Z to both R and p
+        p_corr = R_corr.dot(p)
+        R_corr_total = R_corr.dot(R_pose)
+
+        # 4) Back to Pose
+        q_corr = tf_transformations.quaternion_from_matrix(
+            np.vstack([np.hstack([R_corr_total, np.zeros((3,1))]), [0,0,0,1]])
+        )
+        pose_out = Pose()
+        pose_out.position.x, pose_out.position.y, pose_out.position.z = p_corr
+        pose_out.orientation.x, pose_out.orientation.y, pose_out.orientation.z, pose_out.orientation.w = q_corr
+        return pose_out
 
     def compute_board_edges_from_marker(
         self,
@@ -303,7 +568,12 @@ class TkinterROS(Node):
         Returns two edge points (left, right) in base_link.
         All stepping is done in the XY plane so image/camera tilt does not distort XY.
         """
+
+        j0_angle = self.get_joint_angle("joint_1") or 0.0
+        j5_angle = self.get_joint_angle("joint_6") or 0.0
+
         pose_b = self.get_marker_pose_in_base()
+        pose_b = self.correct_marker_pose_for_joints(pose_b, j0_angle, j5_angle)
 
         # Rotation: columns are columns of R (marker axes in base)
         q = [pose_b.orientation.x, pose_b.orientation.y, pose_b.orientation.z, pose_b.orientation.w]
@@ -351,35 +621,181 @@ class TkinterROS(Node):
         edge_right = Point(x=float(right_xy[0]), y=float(right_xy[1]), z=z_val)
         return edge_left, edge_right
 
-
-
     def on_compute_drop_points(self):
-        try:
-            p_up, p_down = self.compute_board_edges_from_marker()  # returns geometry_msgs/Point
-            # store only XY for “board line” UI
-            self.drop_p1_xy = (float(p_up.x), float(p_up.y))
-            self.drop_p2_xy = (float(p_down.x), float(p_down.y))
+        """
+        Compute and save board endpoints into the GUI fields **only** from the
+        `board_end_points` topic values. No marker fallback.
 
-            # If both XY are identical (e.g., your function only changed Z), we still
-            # compute a usable board direction from marker +Y axis.
+        Expects the subscriber to have populated:
+        self.board_dx1_mm, self.board_dy1_mm,
+        self.board_dx2_mm, self.board_dy2_mm
+        """
+        try:
+            # 1) Ensure we have topic data
+            if any(v is None for v in (
+                getattr(self, 'board_dx1_mm', None),
+                getattr(self, 'board_dy1_mm', None),
+                getattr(self, 'board_dx2_mm', None),
+                getattr(self, 'board_dy2_mm', None),
+            )):
+                self.log_with_time('warn', "No board_end_points topic data yet. Press again after a message arrives.")
+                return
+
+            # 2) Need current EE pose for absolute XY in base_link
+            ee = self.get_current_ee_pose()
+            if ee is None:
+                self.log_with_time('error', "Cannot read current EE pose.")
+                return
+
+            # 3) Convert mm→m using SAME sign convention you use when moving by dx/dy:
+            #    move_to_board_end() uses (-dx_mm, -dy_mm) in base XY.
+            p1_xy = (float(ee.position.x) - float(self.board_dx1_mm)/1000.0,
+                    float(ee.position.y) - float(self.board_dy1_mm)/1000.0)
+            p2_xy = (float(ee.position.x) - float(self.board_dx2_mm)/1000.0,
+                    float(ee.position.y) - float(self.board_dy2_mm)/1000.0)
+
+            # 4) Save to state & GUI (same fields your UI already uses)
+            self.drop_p1_xy = p1_xy
+            self.drop_p2_xy = p2_xy
+            self._set_xy_entry(self.drop_p1_entry, p1_xy)
+            self._set_xy_entry(self.drop_p2_entry, p2_xy)
+
+            # 5) Recompute direction used by the nudge buttons
             self._recompute_board_dir_xy()
 
-            # reflect in entries
-            self._set_xy_entry(self.drop_p1_entry, self.drop_p1_xy)
-            self._set_xy_entry(self.drop_p2_entry, self.drop_p2_xy)
+            self.log_with_time(
+                'info',
+                f"Board endpoints (from topic): "
+                f"P1=({p1_xy[0]:.3f},{p1_xy[1]:.3f}), "
+                f"P2=({p2_xy[0]:.3f},{p2_xy[1]:.3f})"
+            )
 
-            self.log_with_time('info',
-                f"Drop points set: P1=({self.drop_p1_xy[0]:.3f},{self.drop_p1_xy[1]:.3f}), "
-                f"P2=({self.drop_p2_xy[0]:.3f},{self.drop_p2_xy[1]:.3f})")
         except Exception as e:
-            self.log_with_time('error', f"compute_drop_points failed: {e}")
+            self.log_with_time('error', f"compute_drop_points (topic) failed: {e}")
+
+        self._save_board_state()
+
+    def move_to_marker_towards_bottom_edge(self, distance_m: float = 0.04, z_mode: str = "keep_ee", sign_correction: int = +1):
+        """
+        Move the EE to a point that is `distance_m` (default 4 cm) from the ArUco
+        marker center, *toward the bottom/red edge* (perpendicular to that edge).
+        
+        Assumptions:
+        - The 'red line' is the edge whose midpoint has the largest image Y
+            (bottom edge in the processed image).
+        - That direction corresponds to the camera/marker +Y image direction.
+        - We map that to base_link by using the marker's +Y axis (column 1 of R)
+            and projecting to the base XY plane. If your rig’s sign ends up inverted,
+            set sign_correction = -1.
+
+        Args:
+        distance_m: how far from the center to move (default 0.04 m).
+        z_mode: "keep_ee" | "marker_z" | float (numeric Z). Same semantics as compute_board_edges_from_marker.
+        sign_correction: +1 or -1 to flip direction if needed on your setup.
+        """
+        try:
+            # 1) Marker pose in base (with your joint correction)
+            pose_b = self.get_current_ee_pose()
+
+            # 2) Rotation matrix (marker -> base), take marker +Y axis, project to base XY
+            q = [pose_b.orientation.x, pose_b.orientation.y, pose_b.orientation.z, pose_b.orientation.w]
+            R = tf_transformations.quaternion_matrix(q)[0:3, 0:3]
+            y_axis = R[:, 1]  # marker +Y expressed in base
+
+            # Project to XY plane & normalize
+            dir_xy = np.array([float(y_axis[0]), float(y_axis[1])], dtype=float)
+            n = np.linalg.norm(dir_xy)
+            if n < 1e-9:
+                self.log_with_time('warn', "Marker +Y nearly vertical; fallback to base +X.")
+                dir_xy = np.array([1.0, 0.0], dtype=float)
+            else:
+                dir_xy /= n
+
+            # We want "toward the red/bottom edge" → along image +Y.
+            # If your physical mapping is flipped, invert with sign_correction.
+            dir_xy *= float(sign_correction)
+
+            # 3) Target XY = marker center + distance * dir_xy
+            cx = float(pose_b.position.x) + distance_m * dir_xy[0]
+            cy = float(pose_b.position.y) + distance_m * dir_xy[1]
+
+            # 4) Choose Z
+            if z_mode == "keep_ee":
+                cur = self.get_current_ee_pose()
+                if cur is None:
+                    self.log_with_time('error', "Current EE pose unavailable.")
+                    return
+                z_val = float(cur.position.z)
+                yaw_src = cur  # keep current yaw
+            elif z_mode == "marker_z":
+                z_val = float(pose_b.position.z)
+                yaw_src = self.get_current_ee_pose() or pose_b
+            else:
+                try:
+                    z_val = float(z_mode)
+                except Exception:
+                    z_val = float(pose_b.position.z)
+                yaw_src = self.get_current_ee_pose() or pose_b
+
+            # 5) Keep face-down orientation but preserve yaw from current EE
+            roll, pitch, yaw = tf_transformations.euler_from_quaternion([
+                yaw_src.orientation.x, yaw_src.orientation.y, yaw_src.orientation.z, yaw_src.orientation.w
+            ])
+            q_down = tf_transformations.quaternion_from_euler(-np.pi, 0.0, yaw)
+
+            # 6) Build pose & move
+            target = self.create_pose(
+                (cx, cy, z_val),
+                (q_down[0], q_down[1], q_down[2], q_down[3])
+            )
+            self.log_with_time('info', f"Moving toward marker bottom edge by {distance_m*100:.0f} mm → ({cx:.3f}, {cy:.3f}, {z_val:.3f})")
+            self.send_move_request(target, is_cartesian=False)
+
+        except Exception as e:
+            self.log_with_time('error', f"move_to_marker_towards_bottom_edge failed: {e}")
+
+
+    def on_board_middle(self):
+        self.refine_pose_with_ee_camera (0.0)
+        self.move_to_marker_towards_bottom_edge(distance_m=0.0, z_mode="keep_ee", sign_correction=+1)
+
+
+    def _update_active_point_from_current_pose(self):
+        """
+        After a motion completes, read the current EE pose and write its (x,y)
+        into the active stored endpoint (drop_p1_xy or drop_p2_xy). Also updates UI.
+        """
+        if getattr(self, "active_drop_idx", None) not in (1, 2):
+            self.log_with_time('warn', "No active drop point to update (press 'Goto 1st/2nd point' first).")
+            return
+
+        pose = self.get_current_ee_pose()
+        if pose is None:
+            self.log_with_time('error', "Cannot read current EE pose to update endpoint.")
+            return
+
+        new_xy = (float(pose.position.x), float(pose.position.y))
+        attr = "drop_p1_xy" if self.active_drop_idx == 1 else "drop_p2_xy"
+        setattr(self, attr, new_xy)
+
+        # reflect in UI
+        entry = self.drop_p1_entry if self.active_drop_idx == 1 else self.drop_p2_entry
+        self._set_xy_entry(entry, new_xy)
+
+        # keep direction vector in sync when both points exist
+        self._recompute_board_dir_xy()
+
+        self.log_with_time('info',
+            f"Updated point #{self.active_drop_idx} from EE pose → ({new_xy[0]:.3f}, {new_xy[1]:.3f})")
+        self._save_board_state()
+
 
     def on_board_nudge(self, which: str):
         # step meters from entry (default 1 cm)
         try:
             step = float(self.board_step_entry.get().strip())
         except Exception:
-            step = 0.01
+            step = 0.005
 
         self._recompute_board_dir_xy()
         t = self.board_dir_xy
@@ -397,21 +813,7 @@ class TkinterROS(Node):
             return
 
         self.move_relative_xy(d[0], d[1])
-
-    def on_set_point(self, idx: int):
-        cur = self.get_current_ee_pose()
-        if cur is None:
-            self.log_with_time('error', "Current EE pose unavailable.")
-            return
-        xy = (float(cur.position.x), float(cur.position.y))
-        if idx == 1:
-            self.drop_p1_xy = xy
-            self._set_xy_entry(self.drop_p1_entry, xy)
-        else:
-            self.drop_p2_xy = xy
-            self._set_xy_entry(self.drop_p2_entry, xy)
-        self._recompute_board_dir_xy()
-
+        self._update_active_point_from_current_pose()
 
     def brick_top_infos_callback(self, msg: Float32MultiArray):
         data = list(msg.data)
@@ -688,6 +1090,18 @@ class TkinterROS(Node):
         self.board_step_entry.grid(row=0, column=2, padx=4, pady=2, sticky="w")
         self.board_step_entry.insert(0, "0.01")  # default 1 cm
 
+        # Row 0 (continued): quick-set buttons
+        step_buttons = tk.Frame(box)
+        step_buttons.grid(row=0, column=3, padx=(8,4), pady=2, sticky="w")
+
+        for val in [0.01, 0.005, 0.002]:
+            tk.Button(step_buttons,
+                    text=f"{val:.3f}",
+                    width=5,
+                    command=lambda v=val: self.board_step_entry.delete(0, tk.END) or self.board_step_entry.insert(0, f"{v:.3f}")
+                    ).pack(side=tk.LEFT, padx=1)
+
+
         # Row 1: point boxes
         tk.Label(box, text="Point 1 (x,y):").grid(row=1, column=0, padx=4, pady=2, sticky="e")
         self.drop_p1_entry = tk.Entry(box, width=26)
@@ -704,12 +1118,12 @@ class TkinterROS(Node):
         tk.Button(nudges, text="Down",  width=7, command=lambda: self.on_board_nudge("down")).pack(side=tk.LEFT, padx=2)
         tk.Button(nudges, text="Left",  width=7, command=lambda: self.on_board_nudge("left")).pack(side=tk.LEFT, padx=2)
         tk.Button(nudges, text="Right", width=7, command=lambda: self.on_board_nudge("right")).pack(side=tk.LEFT, padx=2)
+        tk.Button(nudges, text="Middle", width=7, command=lambda: self.on_board_middle()).pack(side=tk.LEFT, padx=2)
+        tk.Button(nudges, text="Next Column", width=12,command=self.on_next_board_column).pack(side=tk.LEFT, padx=8)
 
         # Row 4: set points from current EE XY
         setrow = tk.Frame(box)
         setrow.grid(row=4, column=0, columnspan=3, padx=4, pady=(4,6), sticky="w")
-        tk.Button(setrow, text="Set 1st point", width=12, command=lambda: self.on_set_point(1)).pack(side=tk.LEFT, padx=2)
-        tk.Button(setrow, text="Set 2nd point", width=12, command=lambda: self.on_set_point(2)).pack(side=tk.LEFT, padx=2)
 
         # Row 5: go-to buttons (own row, spans all columns)
         gotorow = tk.Frame(box)
@@ -733,6 +1147,11 @@ class TkinterROS(Node):
         # Start periodic updates
         self.update_position_label()
 
+    def on_next_board_column(self):
+        """Cycle 0→6 and move to that column."""
+        self.current_column_idx = (self.current_column_idx + 1) % self.total_columns
+        self.goto_board_column(self.current_column_idx)
+
     def move_to_xy(self, x: float, y: float, is_cartesian: bool = False):
         """Move EE to (x,y) keeping current Z and orientation."""
         cur = self.get_current_ee_pose()
@@ -746,19 +1165,23 @@ class TkinterROS(Node):
         self.send_move_request(pose, is_cartesian=is_cartesian)
 
     def on_goto_point(self, idx: int):
-        """Goto 1st/2nd saved point; prefer UI entry if user edited it."""
+        """Move to one of the two stored drop points, always using stored values."""
+        # Select the correct stored tuple
+        xy = getattr(self, "drop_p1_xy" if idx == 1 else "drop_p2_xy", None)
+
+        if xy is None:
+            self.log_with_time('warn', f"No stored point #{idx} available.")
+            return
+        self.active_drop_idx = idx  # <-- remember which one is active now
+
         try:
-            if idx == 1:
-                xy = self._parse_xy_entry(self.drop_p1_entry)
-            else:
-                xy = self._parse_xy_entry(self.drop_p2_entry)
-        except Exception:
-            # fallback to last stored values
-            xy = getattr(self, "drop_p1_xy" if idx == 1 else "drop_p2_xy", None)
-            if xy is None:
-                self.log_with_time('warn', f"No point #{idx} set yet.")
-                return
-        self.move_to_xy(xy[0], xy[1], is_cartesian=False)
+            x, y = float(xy[0]), float(xy[1])
+        except Exception as e:
+            self.log_with_time('error', f"Invalid stored point #{idx}: {e}")
+            return
+
+        self.log_with_time('info', f"Going to stored point #{idx}: ({x:.3f}, {y:.3f})")
+        self.move_to_xy_align_board(float(xy[0]), float(xy[1]), is_cartesian=False)
 
 
 
@@ -1827,6 +2250,7 @@ class TkinterROS(Node):
             self._last_joint_update_gui = now
 
             try:
+                self.joint_states = msg
                 # Check if all joint velocities are near zero
                 all_zero_velocities = all(abs(v) < 1e-5 for v in msg.velocity)
 
@@ -1862,8 +2286,6 @@ class TkinterROS(Node):
         self.joint_states_entry.insert(tk.END, text)
         self.joint_states_entry.configure(state='disabled')
 
-
-
     def update_joint_states_gui(self, joint_info):
         if self.last_joint_info == joint_info:
             return
@@ -1875,20 +2297,10 @@ class TkinterROS(Node):
 
 
     def init_cal_poses(self):
-        # self.cal_poses =    [[(0.03, -0.38, 0.39), (0.31, -0.56, 0.64, -0.43)],
-        #                     [(0.03, -0.39, 0.39), (0.26, -0.48, 0.70, -0.46)],
-        #                     [(0.03, -0.38, 0.39), (0.34, -0.43, 0.77, -0.34)],
-        #                     [(0.03, -0.38, 0.39), (0.36, -0.48, 0.73, -0.31)],
-        #                     [(0.03, -0.38, 0.39), (0.39, -0.47, 0.72, -0.33)],
-        #                     [(0.03, -0.38, 0.39), (0.31, -0.52, 0.66, -0.44)]]
-    
-        from ament_index_python.packages import get_package_share_directory
         path = "/home/alon/ros_ws/src/dialog_example/dialog_example/cal_poses.jsonc"
 
         self.cal_poses = self.load_calibration_poses(path)
 
-
-    
     def call_service_blocking(self, client, request, timeout_sec=10.0):
         
         if not client.service_is_ready():
@@ -1924,9 +2336,6 @@ class TkinterROS(Node):
         self.update_gui_once()
         
         return result_container['result']
-
-
-        
                         
     def update_position_label(self):
         pose = self.get_current_ee_pose()
@@ -1975,7 +2384,11 @@ class TkinterROS(Node):
             )
 
             pose = Pose()
-            pose.position = trans.transform.translation
+            pose.position = Point(
+                x=float(trans.transform.translation.x),
+                y=float(trans.transform.translation.y),
+                z=float(trans.transform.translation.z),
+            )
             pose.orientation = trans.transform.rotation
             return pose
 
@@ -2166,13 +2579,8 @@ class TkinterROS(Node):
                 now,
                 timeout=rclpy.duration.Duration(seconds=1.0)
             )
-            # self.log_with_time('info', f"------------------------(4)Transform: {transform}")
             # Transform the pose into target_frame
             transformed_pose = do_transform_pose(stamped_pose_in.pose, transform)
-            # self.log_with_time('info', f"------------------------(5)Transformed pose: {transformed_pose}")  
-            # Optional: publish for visualization if you defined publishers
-            # if hasattr(self, 'pose_pub'):
-            #     self.pose_pub.publish(transformed_stamped)
 
             return transformed_pose
 
@@ -2408,7 +2816,18 @@ class TkinterROS(Node):
     def on_shutdown(self):
         self.root.quit()
 
-     
+
+    def get_joint_angle(self, joint_name: str):
+        """Return the angle (in degrees) for a given joint name, or None if not found."""
+        if not self.joint_states:
+            return None
+        try:
+            idx = self.joint_states.name.index(joint_name)
+            return np.degrees(self.joint_states.position[idx])
+        except ValueError:
+            self.get_logger().warn(f"{joint_name} not found in joint states")
+            return None
+
     def read_calibration_file(self,filepath):
         """
         Reads the calibration file and returns the translation and rotation.

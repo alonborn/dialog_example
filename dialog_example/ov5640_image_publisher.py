@@ -124,11 +124,11 @@ class OV5640ImagePublisher(Node):
         self.info_pub.publish(cam_info)
 
         # Show image locally
-        cv2.imshow("OV5640 Undistorted", frame)
-        key = cv2.waitKey(1) & 0xFF
-        if key == ord('q'):
-            self.get_logger().info("Quit requested, shutting down node.")
-            rclpy.shutdown()
+        # cv2.imshow("OV5640 Undistorted", frame)
+        # key = cv2.waitKey(1) & 0xFF
+        # if key == ord('q'):
+        #     self.get_logger().info("Quit requested, shutting down node.")
+        #     rclpy.shutdown()
 
     def destroy_node(self):
         if not self.use_dummy:
