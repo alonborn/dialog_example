@@ -26,9 +26,7 @@ from rclpy.callback_groups import ReentrantCallbackGroup
 from geometry_msgs.msg import PoseArray
 import traceback
 import json, os, time  # top of file if not already imported
-
-
-
+import time
 import queue
 import time
 import numpy as np
@@ -245,6 +243,48 @@ class TkinterROS(Node):
             # self.log_with_time('info', f"Saved board state to {self._state_path}")
         except Exception as e:
             self.log_with_time('warn', f"Could not save board state: {e}")
+
+
+    def place_one_chip_in_connect4(self):
+        """
+        Pick one chip (reuse collect_chip_with_params), lift to 0.35 m,
+        move to Connect-4 column 0 (yaw ⟂ board, face-down), and open gripper.
+        """
+        # Ensure endpoints exist to compute columns
+        if getattr(self, "drop_p1_xy", None) is None or getattr(self, "drop_p2_xy", None) is None:
+            self.log_with_time('warn', "[Connect4] Board endpoints not set; press 'Compute Drop Points' first.")
+            return False
+
+        LIFT_Z = 0.35
+
+        # 1) Reuse your picker; skip drop & return here
+        ok = self.collect_chip_with_params(
+            lift_z=LIFT_Z,
+            perform_drop=False,
+            return_to_start=False
+        )
+        if not ok:
+            self.log_with_time('warn', "[Connect4] Could not pick a chip.")
+            return False
+
+        # # 2) Go to column 0 at the same lift height
+        # col_xy = self.compute_board_column_xy(1)
+        # if col_xy is None:
+        #     self.log_with_time('warn', "[Connect4] Cannot compute column 0 position.")
+        #     return False
+
+        # x0, y0 = col_xy
+        # self.log_with_time('info', f"[Connect4] Moving to column 0 @ ({x0:.3f}, {y0:.3f}, {LIFT_Z:.3f})")
+        # ok = self.move_to_xy_align_board(x0, y0, z=LIFT_Z, is_cartesian=False)
+        # if not ok:
+        #     self.log_with_time('error', "[Connect4] Move to column 0 failed.")
+        #     return False
+
+        # # 3) Release into the column
+        # self.open_gripper_srv()
+        # self.log_with_time('info', "[Connect4] Chip released in column 0.")
+        return True
+
 
 
     def compute_board_column_xy(self, col_idx: int):
@@ -861,6 +901,7 @@ class TkinterROS(Node):
 
         # Use your existing blocking helper:
         resp = self.call_service_blocking(self.move_servo_client, req, timeout_sec=5.0)
+        time.sleep(1)
         if resp is None:
             self.log_with_time('error', "move_servo_to_angle timed out / failed")
             return False
@@ -921,6 +962,11 @@ class TkinterROS(Node):
         #     self.log_with_time('info', "✅ Brick is centered within 5 mm!")
 
 
+    def move_to_chip_start(self):
+        x, y, z = 0.17, -0.328, 0.40
+        self.log_with_time("info", f"Moving to chip start: ({x:.3f}, {y:.3f}, {z:.3f})")
+        ok = self.move_to_xy_align_board(x, y, z)
+        self.log_with_time("info", f"Chip start move result: {ok}")
 
     def process_gui_queue(self):
         while not self.gui_queue.empty():
@@ -1041,6 +1087,8 @@ class TkinterROS(Node):
         zgrp = tk.LabelFrame(self.tab_tools, text="Z Height (absolute)")
         zgrp.pack(fill=tk.X, padx=8, pady=6)
 
+        tk.Button(zgrp, text="45 cm", command=lambda: self.move_to_height(0.45), width=8)\
+            .pack(side=tk.LEFT, padx=4, pady=5)
         tk.Button(zgrp, text="40 cm", command=lambda: self.move_to_height(0.40), width=8)\
             .pack(side=tk.LEFT, padx=4, pady=5)
         tk.Button(zgrp, text="30 cm", command=lambda: self.move_to_height(0.30), width=8)\
@@ -1064,8 +1112,10 @@ class TkinterROS(Node):
         newgrp = tk.LabelFrame(self.tab_tools, text="Other Controls")
         newgrp.pack(fill=tk.X, padx=8, pady=6)
 
+        tk.Button(newgrp, text="Chip Start", command=self.move_to_chip_start, width=8).pack(side=tk.LEFT, padx=4, pady=5)
         tk.Button(newgrp, text="Start", command=self.start_collection, width=8).pack(side=tk.LEFT, padx=4, pady=5)
-        tk.Button(newgrp, text="Collect", command=self.collect_bricks, width=8).pack(side=tk.LEFT, padx=4, pady=5)
+        # tk.Button(newgrp, text="Collect", command=self.collect_bricks, width=8).pack(side=tk.LEFT, padx=4, pady=5)
+        tk.Button(newgrp, text="Collect", command=self.place_one_chip_in_connect4, width=8).pack(side=tk.LEFT, padx=4, pady=5)
         tk.Button(newgrp, text="Tower", command=self.stack_all_bricks, width=8).pack(side=tk.LEFT, padx=4, pady=5)
         tk.Button(newgrp, text="Refine", command=self.refine_pos, width=8).pack(side=tk.LEFT, padx=4, pady=5)
 
@@ -1185,77 +1235,84 @@ class TkinterROS(Node):
 
 
 
-    def collect_chip(self):
+
+    def collect_chip_with_params(self, lift_z: float,
+                                hover_z: float = 0.30,
+                                pick_z1: float = 0.15,
+                                pick_z2: float = 0.066,
+                                drop_xy = (0.15, -0.30),
+                                grip_force: int = 132,
+                                perform_drop: bool = True,
+                                return_to_start: bool = True):
         """
-        Continuously collect chips one by one until no more are available.
-        After each collection + drop, return to the start pose (same as start_collection).
+        Pick the closest visible chip and lift to `lift_z`.
+        Optionally drop it at `drop_xy` and/or return to the start pose.
         """
-        while True:
-            bricks = list(getattr(self, "latest_bricks", []))
-            if not bricks:
-                self.log_with_time('info', "No more chips available to collect.")
-                return False
+        # 1) Snapshot detections & current pose
+        bricks = list(getattr(self, "latest_bricks", []))
+        if not bricks:
+            self.log_with_time('info', "No chips available to collect.")
+            return False
 
-            cur = self.get_current_ee_pose()
-            if not cur:
-                self.log_with_time('error', "Current EE pose unavailable.")
-                return False
+        cur = self.get_current_ee_pose()
+        if not cur:
+            self.log_with_time('error', "Current EE pose unavailable.")
+            return False
 
-            # --- Find closest chip ---
-            def dist_to_ee(b):
-                if b.get("cx_m") is None or b.get("cy_m") is None:
-                    return float("inf")
-                return ((b["cx_m"] - cur.position.x) ** 2 +
-                        (b["cy_m"] - cur.position.y) ** 2) ** 0.5
+        # 2) Choose closest chip to EE
+        def dist_to_ee(b):
+            if b.get("cx_m") is None or b.get("cy_m") is None:
+                return float("inf")
+            return ((b["cx_m"] - cur.position.x) ** 2 +
+                    (b["cy_m"] - cur.position.y) ** 2) ** 0.5
 
-            target = min(bricks, key=dist_to_ee)
-            if target.get("cx_m") is None or target.get("cy_m") is None:
-                self.log_with_time('warn', "Closest chip missing coordinates.")
-                return False
+        target = min(bricks, key=dist_to_ee)
+        if target.get("cx_m") is None or target.get("cy_m") is None:
+            self.log_with_time('warn', "Closest chip missing coordinates.")
+            return False
 
-            cx, cy = float(target["cx_m"]), float(target["cy_m"])
-            self.log_with_time('info', f"Collecting chip at ({cx:.3f}, {cy:.3f})")
+        cx, cy = float(target["cx_m"]), float(target["cy_m"])
+        self.log_with_time('info', f"Collecting chip at ({cx:.3f}, {cy:.3f})")
 
-            # --- Pose helpers ---
-            _, _, yaw = tf_transformations.euler_from_quaternion([
-                cur.orientation.x, cur.orientation.y,
-                cur.orientation.z, cur.orientation.w
-            ])
-            def face_down_pose(x, y, z, yaw_rad):
-                q = tf_transformations.quaternion_from_euler(-np.pi, 0.0, yaw_rad)
-                return self.create_pose((x, y, z), (q[0], q[1], q[2], q[3]))
+        # 3) Helpers (face-down, keep current yaw; keep tool parallel to ground)
+        _, _, yaw = tf_transformations.euler_from_quaternion([
+            cur.orientation.x, cur.orientation.y, cur.orientation.z, cur.orientation.w
+        ])
+        def face_down_pose(x, y, z, yaw_rad):
+            q = tf_transformations.quaternion_from_euler(-np.pi, 0.0, yaw_rad)
+            return self.create_pose((float(x), float(y), float(z)),
+                                    (q[0], q[1], q[2], q[3]))
 
-            # --- Parameters ---
-            HOVER_Z = 0.30
-            PICK_Z1 = 0.20
-            PICK_Z2 = 0.08
-            DROP_Z  = 0.15
-            drop_xy = (0.15, -0.30)  # bin location
+        # 4) Pick sequence (reuse your refine helpers)
+        self.open_gripper_srv()
+        self.send_move_request(face_down_pose(cx, cy, float(hover_z), yaw), is_cartesian=False)
+        self.refine_pose_with_ee_camera_dx_dy(cx, cy, float(pick_z1))
+        self.refine_pose_with_ee_camera_dx_dy(cx, cy, float(pick_z2))
+        self.close_gripper_srv(int(grip_force))
+        self.move_to_height(float(lift_z), is_cartesian=False)
 
-            # --- Pick sequence ---
+        # 5) Optional drop
+        if perform_drop:
+            self.send_move_request(face_down_pose(drop_xy[0], drop_xy[1], float(lift_z), yaw), is_cartesian=False)
             self.open_gripper_srv()
-            self.send_move_request(face_down_pose(cx, cy, HOVER_Z, yaw), is_cartesian=False)
-            self.refine_pose_with_ee_camera_dx_dy(cx, cy, PICK_Z1)
-            self.refine_pose_with_ee_camera_dx_dy(cx, cy, PICK_Z2)
-            self.close_gripper_srv(132)
-            self.move_to_height(DROP_Z, is_cartesian=False)
+            self.move_to_height(float(hover_z), is_cartesian=False)
 
-            # --- Drop sequence ---
-            self.send_move_request(face_down_pose(drop_xy[0], drop_xy[1], DROP_Z, yaw), is_cartesian=False)
-            self.open_gripper_srv()
-            self.move_to_height(HOVER_Z, is_cartesian=False)
-
-            # --- Return to start pose (same as start_collection) ---
-            start_pose = self.make_pose_xyz_quat(-0.007, -0.328, 0.405,
-                                                0.000, 1.000, 0.002, 0.000)
+        # 6) Optional return to start
+        if return_to_start:
+            start_pose = self.make_pose_xyz_quat(-0.007, -0.328, 0.405, 0.000, 1.000, 0.002, 0.000)
             self.send_move_request(start_pose, is_cartesian=False)
 
-            self.log_with_time('info', "One chip collected and placed in bin. Returning to start...")
+        self.log_with_time('info',
+            f"Chip collected, lifted to {float(lift_z):.3f} m"
+            + (" and dropped" if perform_drop else "")
+            + (" and returned to start." if return_to_start else ".")
+        )
+        return True
 
-            # Loop will re-check latest_bricks
 
+    def collect_chip(self):
+        self.collect_chip_with_params(lift_z=0.35)
     
-
     def start_collection(self):
             pose = self.make_pose_xyz_quat(-0.007, -0.328, 0.405,0.000, 1.000, 0.002, 0.000)
             self.send_move_request(pose, is_cartesian=False)
@@ -1382,6 +1439,10 @@ class TkinterROS(Node):
 
 
 
+    # Helper: build a face-down pose at (x,y,z) with given yaw
+    def face_down_pose(self,x, y, z, yaw_rad):
+            q = tf_transformations.quaternion_from_euler(-np.pi, 0.0, yaw_rad)
+            return self.create_pose((x, y, z), (q[0], q[1], q[2], q[3]))
 
     def collect_bricks(self):
         # Snapshot current bricks (list of dicts with cx_m, cy_m, etc.)
@@ -1396,10 +1457,6 @@ class TkinterROS(Node):
             return
 
 
-        # Helper: build a face-down pose at (x,y,z) with given yaw
-        def face_down_pose(x, y, z, yaw_rad):
-            q = tf_transformations.quaternion_from_euler(-np.pi, 0.0, yaw_rad)
-            return self.create_pose((x, y, z), (q[0], q[1], q[2], q[3]))
 
         # Keep current yaw for all “hover”/drop/above-next moves
         _, _, yaw = tf_transformations.euler_from_quaternion([
@@ -1415,7 +1472,7 @@ class TkinterROS(Node):
 
         # Bin/drop location (adjust to your setup)
         drop_xy = (-0.25, -0.30)
-        drop_pose = face_down_pose(drop_xy[0], drop_xy[1], DROP_Z, yaw)
+        drop_pose = self.face_down_pose(drop_xy[0], drop_xy[1], DROP_Z, yaw)
 
         # Iterate by index so we can look ahead to the “next” brick
         for i in range(len(bricks)):
@@ -1449,7 +1506,7 @@ class TkinterROS(Node):
                 n_cx = nb.get("cx_m")
                 n_cy = nb.get("cy_m")
                 if n_cx is not None and n_cy is not None:
-                    above_next = face_down_pose(n_cx, n_cy, HOVER_Z, yaw)
+                    above_next = self.face_down_pose(n_cx, n_cy, HOVER_Z, yaw)
                     self.log_with_time('info',
                         f"Moving above next brick #{i+2} at ({n_cx:.3f}, {n_cy:.3f})")
                     self.send_move_request(above_next, is_cartesian=False)
@@ -1459,6 +1516,7 @@ class TkinterROS(Node):
 
     def open_gripper_srv(self):
         self.move_servo_to_angle(35.0)
+        
         # req = Trigger.Request()
         # res = self.call_service_blocking(self.open_gripper_client, req, timeout_sec=3.0)
         # if res is None:
@@ -2774,9 +2832,7 @@ class TkinterROS(Node):
                 print(f"sample no. {self.num_valid_samples} taken - pose " + str(pose[0]) + " - " + str(pose[1])) 
             else:
                 print(f"move request failed for pose " + str(pose[0]) + " - " + str(pose[1])) 
-                
            
-
         #self.compute_calibration()
         print("calibration computed")
         self.save_calibration()
