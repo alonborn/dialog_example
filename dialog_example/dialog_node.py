@@ -417,10 +417,10 @@ class TkinterROS(Node):
         xy = self.compute_board_column_xy(col_idx)
         if xy is None:
             return
-        x, y = xy
+        x, y = xy 
         self.log_with_time('info', f"Going to board column {col_idx}: ({x:.3f}, {y:.3f}) (yaw aligned)")
         # Do not set active_drop_idx here; columns are not endpoints.
-        self.move_to_xy_align_board(x, y, is_cartesian=False)
+        self.move_to_xy_align_board(x, y, z=0.28,is_cartesian=False)
 
 
 
@@ -1170,6 +1170,7 @@ class TkinterROS(Node):
         tk.Button(nudges, text="Right", width=7, command=lambda: self.on_board_nudge("right")).pack(side=tk.LEFT, padx=2)
         tk.Button(nudges, text="Middle", width=7, command=lambda: self.on_board_middle()).pack(side=tk.LEFT, padx=2)
         tk.Button(nudges, text="Next Column", width=12,command=self.on_next_board_column).pack(side=tk.LEFT, padx=8)
+        tk.Button(nudges, text="place one chip", width=12,command=self.place_one_chip_sequence).pack(side=tk.LEFT, padx=8)
 
         # Row 4: set points from current EE XY
         setrow = tk.Frame(box)
@@ -1234,14 +1235,45 @@ class TkinterROS(Node):
         self.move_to_xy_align_board(float(xy[0]), float(xy[1]), is_cartesian=False)
 
 
+    def place_one_chip_sequence(self):
+        """
+        Full automatic sequence:
+        1) Move to chip start
+        2) Collect one chip       (same as pressing 'Collect Chip')
+        3) Move to the NEXT Connect-4 column
+        4) Drop the chip
+        """
+        self.log_with_time("info", "=== PLACE ONE CHIP SEQUENCE START ===")
+
+        # 1) Move to chip start
+        self.move_to_chip_start()   # already exists :contentReference[oaicite:1]{index=1}
+
+        # 2) Collect chip (same function called from the Collect Chip button)
+
+
+        ok = self.collect_chip_with_params(0.35,perform_drop = False,return_to_start = False)
+
+        if not ok:
+            self.log_with_time("error", "Failed to collect chip")
+            return False
+
+        # 3) Move to next column (uses your existing logic)
+        self.on_next_board_column()  # already exists :contentReference[oaicite:3]{index=3}
+
+        # 4) Drop the chip (open gripper)
+        self.open_gripper_srv()      # already exists :contentReference[oaicite:4]{index=4}
+        self.log_with_time("info", "✅ Chip dropped!")
+
+        self.log_with_time("info", "=== PLACE ONE CHIP SEQUENCE DONE ===")
+        return True
 
 
     def collect_chip_with_params(self, lift_z: float,
                                 hover_z: float = 0.30,
-                                pick_z1: float = 0.15,
-                                pick_z2: float = 0.066,
+                                pick_z1: float = 0.2,
+                                pick_z2: float = 0.08,
                                 drop_xy = (0.15, -0.30),
-                                grip_force: int = 132,
+                                grip_force: int = 134,
                                 perform_drop: bool = True,
                                 return_to_start: bool = True):
         """
@@ -1286,10 +1318,11 @@ class TkinterROS(Node):
         # 4) Pick sequence (reuse your refine helpers)
         self.open_gripper_srv()
         self.send_move_request(face_down_pose(cx, cy, float(hover_z), yaw), is_cartesian=False)
-        self.refine_pose_with_ee_camera_dx_dy(cx, cy, float(pick_z1))
+        for _ in range(3):
+            self.refine_pose_with_ee_camera_dx_dy(cx, cy, float(pick_z1))
         self.refine_pose_with_ee_camera_dx_dy(cx, cy, float(pick_z2))
         self.close_gripper_srv(int(grip_force))
-        self.move_to_height(float(lift_z), is_cartesian=False)
+        self.move_to_height(float(lift_z), is_cartesian=True)
 
         # 5) Optional drop
         if perform_drop:

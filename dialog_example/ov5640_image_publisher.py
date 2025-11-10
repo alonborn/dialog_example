@@ -11,7 +11,7 @@ from rclpy.node import Node
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, CameraInfo
 
-CAMERA_INDEX = 8  # adjust if needed
+CAMERA_INDEX = 2  # adjust if needed
 CALIB_FILE = "/home/alon/ros_ws/src/dialog_example/dialog_example/camera_calibration.npz"
 
 class OV5640ImagePublisher(Node):
