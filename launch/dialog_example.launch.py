@@ -30,6 +30,13 @@ def generate_launch_description():
         output='screen'
     )
 
+    connect4_detector = Node(
+        package="detector",
+        executable="connect_4_detector",
+        name="connect4_detector",
+        output="screen",
+    )  
+
     # Run ov5640_publisher with venv Python
     arm_cam_publisher = ExecuteProcess(
         cmd=[
@@ -79,6 +86,15 @@ def generate_launch_description():
         output='screen'
     )
 
+    connect4_ai_node = Node(
+        package="connect4_ai_pkg",
+        executable="connect4_ai_pkg",
+        name="connect4_ai_node",
+        output="screen",
+    )
+
+
+
     return LaunchDescription([
         use_handeye_publisher_arg,
         dialog_node,
@@ -86,6 +102,8 @@ def generate_launch_description():
         move_ar_node,
         aruco_node,
         hand_eye_tf_publisher,
-        arm_cam_image_publisher
+        arm_cam_image_publisher,
+        connect4_detector,
+        connect4_ai_node,
         # inferences_node
     ])
