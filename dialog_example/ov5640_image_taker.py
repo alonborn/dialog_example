@@ -1,3 +1,6 @@
+#!/home/alon/venv/bin/python
+
+
 import cv2
 import os
 
@@ -16,7 +19,7 @@ if not cap.isOpened():
 print("📷 Press SPACE to capture, ESC to exit.")
 
 img_count = len(os.listdir(output_dir))  # Continue from existing files
-
+img_count = 100
 while True:
     ret, frame = cap.read()
     if not ret:

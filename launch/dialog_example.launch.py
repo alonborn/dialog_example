@@ -35,6 +35,8 @@ def generate_launch_description():
         executable="connect_4_detector",
         name="connect4_detector",
         output="screen",
+        prefix=["/home/alon/venv/bin/python3"],
+
     )  
 
     # Run ov5640_publisher with venv Python
@@ -103,7 +105,7 @@ def generate_launch_description():
         aruco_node,
         hand_eye_tf_publisher,
         arm_cam_image_publisher,
-        connect4_detector,
-        connect4_ai_node,
+        # connect4_detector,
+        # connect4_ai_node,
         # inferences_node
     ])

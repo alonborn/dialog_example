@@ -62,7 +62,7 @@ class OV5640Publisher(Node):
 
         # Load YOLOv8 OBB model
         # model_path = "/home/alon/Documents/Projects/top_view_train/runs/obb/train8/weights/best.pt"
-        model_path = "/home/alon/Documents/Projects/chip_table_train/runs/obb/train3/weights/best.pt"
+        model_path = "/home/alon/Documents/Projects/chip_table_train/runs/obb/train8/weights/best.pt"
         self.model = YOLO(model_path)
         self.handle_camera_calibration()
 
@@ -713,7 +713,6 @@ class OV5640Publisher(Node):
 
         # >>> CHANGED: use a single stable base for display to avoid “jumps”
         annotated_frame = frame.copy()          # base for visualization
-
         ee_x, ee_y = self.get_ee_xy()   # meters; may be (None, None)
 
         # --- Inference (normal + fallback) ---
@@ -788,7 +787,6 @@ class OV5640Publisher(Node):
         y_text += 30
         frame_h, frame_w = frame.shape[:2]
         center_x, center_y = frame_w / 2, frame_h / 2
-
         try:
             if len(boxes)  > 0:
                 # If counts mismatch (shouldn't, but be robust)

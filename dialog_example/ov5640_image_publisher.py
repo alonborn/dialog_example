@@ -11,8 +11,13 @@ from rclpy.node import Node
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, CameraInfo
 
-CAMERA_INDEX = 2  # adjust if needed
+CAMERA_INDEX = 8  # adjust if needed
 CALIB_FILE = "/home/alon/ros_ws/src/dialog_example/dialog_example/camera_calibration.npz"
+
+OUTPUT_DIR = "/home/alon/chip_table_images"
+os.makedirs(OUTPUT_DIR, exist_ok=True)
+
+
 
 class OV5640ImagePublisher(Node):
     def __init__(self):
@@ -28,6 +33,7 @@ class OV5640ImagePublisher(Node):
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         self.cap.set(cv2.CAP_PROP_FPS, 10)
+        self.img_count = len(os.listdir(OUTPUT_DIR))
 
         if not self.cap.isOpened():
             self.get_logger().error("Failed to open OV5640 camera")
@@ -79,10 +85,23 @@ class OV5640ImagePublisher(Node):
         # Undistort if calibration is available
         if self.map1 is not None and self.map2 is not None:
             frame = cv2.remap(frame, self.map1, self.map2, interpolation=cv2.INTER_LINEAR)
-
+        
         # Publish image
         msg = self.bridge.cv2_to_imgmsg(frame, encoding="bgr8")
         self.image_pub.publish(msg)
+        cv2.imshow("OV5640 Undistorted", frame)
+        key = cv2.waitKey(1) & 0xFF
+
+        if key == 32:  # SPACE pressed
+            filename = f"img_{self.img_count:03d}.jpg"
+            path = os.path.join(OUTPUT_DIR, filename)
+            cv2.imwrite(path, frame)
+            self.get_logger().info(f"✅ Saved: {path}")
+            self.img_count += 1
+
+        elif key == 27:  # ESC pressed
+            self.get_logger().info("👋 Exit requested, shutting down.")
+            rclpy.shutdown()
 
         # Publish CameraInfo
         cam_info = CameraInfo()

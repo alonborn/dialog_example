@@ -53,6 +53,7 @@ from my_robot_interfaces.srv import NudgeJoint
 import threading
 from my_robot_interfaces.srv import MoveServoToAngle
 import math
+from my_robot_interfaces.srv import SetSpeedScale
 
 
 
@@ -105,7 +106,12 @@ class TkinterROS(Node):
             10
         )
 
-        # ... inside __init__ after entries exist ...
+        self.set_speed_scale_client = self.node.create_client(
+            SetSpeedScale,
+            "/ar4_hardware_interface/set_speed_scale"   
+        )
+        self.set_speed_scale_srv_type = SetSpeedScale
+
         self._state_path = os.path.expanduser("~/.ov5640_board_state.json")
     
         self.board_end_points_sub = self.create_subscription(
@@ -169,7 +175,7 @@ class TkinterROS(Node):
         self.take_sample_client = self.create_client(TakeSample, hec.TAKE_SAMPLE_TOPIC)
         self.compute_calibration_client = self.create_client(ComputeCalibration, hec.COMPUTE_CALIBRATION_TOPIC)
         self.log_with_time('info', 'take_sample service registered')
-
+        self.GRIP_FORCE_CLOSE = 136
         # self.init_moveit()
         self.init_right_frame()
         # self.periodic_status_check()
@@ -221,6 +227,41 @@ class TkinterROS(Node):
             self.log_with_time('info', f"Loaded board state from {self._state_path}")
         except Exception as e:
             self.log_with_time('warn', f"Could not load board state: {e}")
+
+    def set_speed_scale(self, scale: float):
+        client = self.set_speed_scale_client
+
+        if client is None:
+            self.log_with_time('error', "SpeedScale client not initialized")
+            return
+        
+        try:
+            if not client.wait_for_service(timeout_sec=0.5):
+                self.log_with_time('warn', "SetSpeedScale service not available")
+                return
+        except Exception as e:
+            self.log_with_time('error', f"Waiting for SetSpeedScale service failed: {e}")
+            return
+
+        req = self.set_speed_scale_srv_type.Request()
+        req.scale = float(scale)
+
+        self.log_with_time('info', f"Sending speed scale: {req.scale}")
+
+        future = client.call_async(req)
+
+        def _on_done(fut):
+            try:
+                resp = fut.result()
+                if getattr(resp, "success", False):
+                    self.log_with_time('info', f"Speed scale set to {req.scale}")
+                else:
+                    msg = getattr(resp, "message", "(no message)")
+                    self.log_with_time('warn', f"SpeedScale failed: {msg}")
+            except Exception as e:
+                self.log_with_time('error', f"SpeedScale call exception: {e}")
+
+        future.add_done_callback(_on_done)
 
     def _save_board_state(self):
         """Save step and endpoints to JSON."""
@@ -1268,30 +1309,21 @@ class TkinterROS(Node):
         return True
 
 
-    def collect_chip_with_params(self, lift_z: float,
-                                hover_z: float = 0.30,
-                                pick_z1: float = 0.2,
-                                pick_z2: float = 0.08,
-                                drop_xy = (0.15, -0.30),
-                                grip_force: int = 134,
-                                perform_drop: bool = True,
-                                return_to_start: bool = True):
+    def _get_closest_chip_to_ee(self):
         """
-        Pick the closest visible chip and lift to `lift_z`.
-        Optionally drop it at `drop_xy` and/or return to the start pose.
+        Return (cx, cy) [meters] of the brick currently closest to the end effector,
+        or None if none are available.
         """
-        # 1) Snapshot detections & current pose
         bricks = list(getattr(self, "latest_bricks", []))
         if not bricks:
-            self.log_with_time('info', "No chips available to collect.")
-            return False
+            self.log_with_time('warn', "No chips available to collect.")
+            return None
 
         cur = self.get_current_ee_pose()
         if not cur:
             self.log_with_time('error', "Current EE pose unavailable.")
-            return False
+            return None
 
-        # 2) Choose closest chip to EE
         def dist_to_ee(b):
             if b.get("cx_m") is None or b.get("cy_m") is None:
                 return float("inf")
@@ -1301,12 +1333,39 @@ class TkinterROS(Node):
         target = min(bricks, key=dist_to_ee)
         if target.get("cx_m") is None or target.get("cy_m") is None:
             self.log_with_time('warn', "Closest chip missing coordinates.")
-            return False
+            return None
 
         cx, cy = float(target["cx_m"]), float(target["cy_m"])
-        self.log_with_time('info', f"Collecting chip at ({cx:.3f}, {cy:.3f})")
+        self.log_with_time('info', f"Closest chip at ({cx:.3f}, {cy:.3f})")
+        return cx, cy
 
-        # 3) Helpers (face-down, keep current yaw; keep tool parallel to ground)
+
+    def collect_chip_with_params(self, lift_z: float,
+                                hover_z: float = 0.30,
+                                pick_z1: float = 0.24,
+                                pick_z2: float = 0.17,
+                                pick_z3: float = 0.132,
+                                drop_xy=(0.15, -0.30),
+                                perform_drop: bool = True,
+                                return_to_start: bool = True):
+        """
+        Pick the closest visible chip and lift to `lift_z`.
+        Optionally drop it at `drop_xy` and/or return to the start pose.
+        """
+        cur = self.get_current_ee_pose()
+        if not cur:
+            self.log_with_time('error', "Current EE pose unavailable.")
+            return False
+
+        first_target = self._get_closest_chip_to_ee()
+        if not first_target:
+            self.log_with_time('info', "No chips available to collect.")
+            return False
+
+        cx, cy = first_target
+        self.log_with_time('info', f"Starting collection for chip near ({cx:.3f}, {cy:.3f})")
+
+        # --- Helper for creating a face-down pose ---
         _, _, yaw = tf_transformations.euler_from_quaternion([
             cur.orientation.x, cur.orientation.y, cur.orientation.z, cur.orientation.w
         ])
@@ -1315,22 +1374,46 @@ class TkinterROS(Node):
             return self.create_pose((float(x), float(y), float(z)),
                                     (q[0], q[1], q[2], q[3]))
 
-        # 4) Pick sequence (reuse your refine helpers)
+        # --- Move above target and open gripper ---
         self.open_gripper_srv()
         self.send_move_request(face_down_pose(cx, cy, float(hover_z), yaw), is_cartesian=False)
-        for _ in range(3):
-            self.refine_pose_with_ee_camera_dx_dy(cx, cy, float(pick_z1))
-        self.refine_pose_with_ee_camera_dx_dy(cx, cy, float(pick_z2))
-        self.close_gripper_srv(int(grip_force))
-        self.move_to_height(float(lift_z), is_cartesian=True)
 
-        # 5) Optional drop
+        # --- Iteratively refine position using updated chip locations ---
+        for _ in range(2):
+            latest_target = self._get_closest_chip_to_ee()
+            if not latest_target:
+                break
+            cx, cy = latest_target
+            self.refine_pose_with_ee_camera_dx_dy(cx, cy, float(pick_z1))
+
+        for _ in range(3):
+            latest_target = self._get_closest_chip_to_ee()
+            if latest_target is not None:
+                cx, cy = latest_target
+                self.refine_pose_with_ee_camera_dx_dy(cx, cy, float(pick_z2))
+
+
+        # Final refinement closer to the board
+        latest_target = self._get_closest_chip_to_ee()
+        if latest_target:
+            cx, cy = latest_target
+            self.refine_pose_with_ee_camera_dx_dy(cx, cy, float(pick_z3))
+
+        # --- Grab and lift ---
+        self.close_gripper_srv()
+
+
+        self.set_speed_scale(float(0.5))
+
+        self.move_to_height(float(lift_z), is_cartesian=True)
+        self.set_speed_scale(float(1.0))
+        # --- Optional drop ---
         if perform_drop:
             self.send_move_request(face_down_pose(drop_xy[0], drop_xy[1], float(lift_z), yaw), is_cartesian=False)
             self.open_gripper_srv()
             self.move_to_height(float(hover_z), is_cartesian=False)
 
-        # 6) Optional return to start
+        # --- Optional return ---
         if return_to_start:
             start_pose = self.make_pose_xyz_quat(-0.007, -0.328, 0.405, 0.000, 1.000, 0.002, 0.000)
             self.send_move_request(start_pose, is_cartesian=False)
@@ -1562,9 +1645,9 @@ class TkinterROS(Node):
         # return bool(res.success)
 
 
-    def close_gripper_srv(self,angle = 95):
+    def close_gripper_srv(self):
 
-        self.move_servo_to_angle(angle)
+        self.move_servo_to_angle(self.GRIP_FORCE_CLOSE)
 
         # req = Trigger.Request()
         # res = self.call_service_blocking(self.close_gripper_client, req, timeout_sec=3.0)
