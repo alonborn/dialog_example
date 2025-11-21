@@ -1,0 +1,25 @@
+{
+    "chip_pick": {
+        "lift_z": 0.35,
+        "hover_z": 0.30,
+        "pick_z1": 0.24,
+        "pick_z2": 0.17,
+        "pick_z3": 0.127,
+        "drop_xy": [0.15, -0.30]
+    },
+
+    "gripper": {
+        "GRIP_FORCE_OPEN": 35,
+        "GRIP_FORCE_CLOSE": 108
+    },
+
+    "chip_start": {
+        "x": 0.17,
+        "y": -0.328,
+        "z": 0.40
+    },
+
+    "board": {
+    "column_z": 0.28
+}
+}

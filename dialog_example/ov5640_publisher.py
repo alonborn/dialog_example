@@ -18,6 +18,8 @@ from sensor_msgs.msg import JointState  # already available in ROS 2
 from tf2_ros import Buffer, TransformListener
 from std_msgs.msg import MultiArrayDimension, MultiArrayLayout
 import tf_transformations
+import torch
+import numpy as np
 
 from sensor_msgs.msg import Image, JointState
 from std_msgs.msg import Float32MultiArray
@@ -60,10 +62,9 @@ class OV5640Publisher(Node):
         os.makedirs(self.capture_folder, exist_ok=True)
         self.capture_count = 0
 
-        # Load YOLOv8 OBB model
-        # model_path = "/home/alon/Documents/Projects/top_view_train/runs/obb/train8/weights/best.pt"
-        model_path = "/home/alon/Documents/Projects/chip_table_train/runs/obb/train8/weights/best.pt"
-        self.model = YOLO(model_path)
+        self.model_chip = YOLO("/home/alon/Documents/Projects/rchip_table_train/runs/obb/train6/weights/best.pt")
+        self.model_board = YOLO("/home/alon/Documents/Projects/board_top_train/runs/obb/train4/weights/best.pt")
+
         self.handle_camera_calibration()
 
     def image_callback(self, msg: Image):
@@ -652,6 +653,67 @@ class OV5640Publisher(Node):
         return (float(p_left[0]), float(p_left[1])), (float(p_right[0]), float(p_right[1]))
 
 
+    def merge_obb_results(self, r1, r2):
+        """
+        Merge two YOLO OBB results objects into a single synthetic result object.
+        Polygons, classes, and confidences are concatenated safely.
+        """
+
+        # --- 1) Extract polygons ---
+        polys1 = r1.obb.xyxyxyxy if hasattr(r1.obb, "xyxyxyxy") else []
+        polys2 = r2.obb.xyxyxyxy if hasattr(r2.obb, "xyxyxyxy") else []
+
+        # convert to list of numpy arrays (4x2)
+        polys1 = [p.cpu().numpy().reshape(4, 2) for p in polys1]
+        polys2 = [p.cpu().numpy().reshape(4, 2) for p in polys2]
+
+        merged_polys = polys1 + polys2
+
+        # --- 2) Extract classes ---
+        cls1 = r1.obb.cls if hasattr(r1.obb, "cls") else None
+        cls2 = r2.obb.cls if hasattr(r2.obb, "cls") else None
+
+        if cls1 is None or len(cls1) == 0:
+            cls1 = torch.tensor([], dtype=torch.float32)
+        if cls2 is None or len(cls2) == 0:
+            cls2 = torch.tensor([], dtype=torch.float32)
+
+        merged_cls = torch.cat([cls1.cpu(), cls2.cpu()]) if len(cls1) + len(cls2) > 0 else torch.tensor([])
+
+        # --- 3) Extract confidences ---
+        conf1 = r1.obb.conf if hasattr(r1.obb, "conf") else None
+        conf2 = r2.obb.conf if hasattr(r2.obb, "conf") else None
+
+        if conf1 is None or len(conf1) == 0:
+            conf1 = torch.tensor([], dtype=torch.float32)
+        if conf2 is None or len(conf2) == 0:
+            conf2 = torch.tensor([], dtype=torch.float32)
+
+        merged_conf = torch.cat([conf1.cpu(), conf2.cpu()]) if len(conf1) + len(conf2) > 0 else torch.tensor([])
+
+        # --- 4) Create a new synthetic “results-like” object ---
+        class SyntheticOBB:
+            pass
+
+        merged = SyntheticOBB()
+        merged.obb = SyntheticOBB()
+
+        # Convert merged polys to tensors shaped like YOLO expects
+        if len(merged_polys) > 0:
+            polys_tensor = torch.tensor(np.array(merged_polys)).reshape(-1, 4, 2)
+        else:
+            polys_tensor = torch.zeros((0, 4, 2), dtype=torch.float32)
+
+        merged.obb.xyxyxyxy = polys_tensor
+        merged.obb.cls = merged_cls
+        merged.obb.conf = merged_conf
+
+        return merged
+
+
+
+
+
     def timer_callback(self):
 
         if self.latest_frame is None:
@@ -717,7 +779,22 @@ class OV5640Publisher(Node):
 
         # --- Inference (normal + fallback) ---
         try:
-            results = self.model.predict(frame, imgsz=640, conf=0.8, verbose=False)[0]
+            # results = self.model.predict(frame, imgsz=640, conf=0.8, verbose=False)[0]
+            results_chip  = self.model_chip.predict(frame, imgsz=640, conf=0.8, verbose=False)[0]
+            # results_board = self.model_board.predict(frame, imgsz=640, conf=0.8, verbose=False)[0]
+
+            results_board = self.model_board(
+                frame,
+                imgsz=640,
+                conf=0.5,
+                task="obb",
+                verbose=False
+            )[0]
+            cv2.imshow("Frame", frame)
+            # MERGE BOTH MODELS
+            results = self.merge_obb_results(results_chip, results_board)
+
+
         except Exception as e:
             self.get_logger().error(f"Inference failed: {e}")
             return
@@ -739,7 +816,23 @@ class OV5640Publisher(Node):
             # orig_frame_rot, M_fwd_o, M_inv_o = self._rotate_image(orig_frame, fallback_angle)
 
             try:
-                results_rot = self.model.predict(frame_rot, imgsz=640, conf=0.8, verbose=False)[0]
+
+
+                # results = self.model.predict(frame, imgsz=640, conf=0.8, verbose=False)[0]
+                results_chip  = self.model_chip.predict(frame_rot, imgsz=640, conf=0.8, verbose=False)[0]
+                # results_board = self.model_board.predict(frame, imgsz=640, conf=0.8, verbose=False)[0]
+
+                results_board = self.model_board(
+                    frame_rot,
+                    imgsz=640,
+                    conf=0.8,
+                    task="obb",
+                    verbose=False
+                )[0]
+
+                # MERGE BOTH MODELS
+                results_rot = self.merge_obb_results(results_chip, results_board)
+
             except Exception as e:
                 self.get_logger().error(f"Fallback inference failed: {e}")
                 return
@@ -973,39 +1066,6 @@ class OV5640Publisher(Node):
             except Exception as e:
                 self.get_logger().error(f"Failed to save frame: {e}")
 
-
-
-
-    def run_batch_inference(self):
-        input_dir = "/home/alon/Documents/Projects/top_view_train/images/val/"
-        output_dir = "/home/alon/Documents/Projects/top_view_train/images/val_annotated/"
-        os.makedirs(output_dir, exist_ok=True)
-
-        image_paths = sorted(glob(os.path.join(input_dir, "*.jpg")))
-        if not image_paths:
-            self.get_logger().warn(f"No images found in {input_dir}")
-            return
-
-        for path in image_paths:
-            img = cv2.imread(path)
-            if img is None:
-                self.get_logger().warn(f"Could not read {path}")
-                continue
-
-            results = self.model.predict(img, imgsz=640, conf=0.25)[0]
-            annotated = results.plot()
-
-            if results.obb is not None and results.obb.xywh is not None:
-                for obb in results.obb.xywh:
-                    x_center, y_center, w, h, angle_deg = obb.tolist()
-                    if h > w:
-                        angle_deg += 90
-                        w, h = h, w
-                    self.get_logger().info(f"[{os.path.basename(path)}] Center: ({x_center:.1f}, {y_center:.1f}), Angle: {angle_deg:.1f}°")
-
-            save_path = os.path.join(output_dir, os.path.basename(path))
-            cv2.imwrite(save_path, annotated)
-            self.get_logger().info(f"Saved annotated: {save_path}")
 
     def destroy_node(self):
         cv2.destroyAllWindows()

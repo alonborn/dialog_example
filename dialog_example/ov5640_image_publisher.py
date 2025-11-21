@@ -10,14 +10,18 @@ import rclpy
 from rclpy.node import Node
 from cv_bridge import CvBridge
 from sensor_msgs.msg import Image, CameraInfo
+import subprocess
+import re
+import glob
+import debugpy
+
+
 
 CAMERA_INDEX = 8  # adjust if needed
 CALIB_FILE = "/home/alon/ros_ws/src/dialog_example/dialog_example/camera_calibration.npz"
 
 OUTPUT_DIR = "/home/alon/chip_table_images"
 os.makedirs(OUTPUT_DIR, exist_ok=True)
-
-
 
 class OV5640ImagePublisher(Node):
     def __init__(self):
@@ -27,9 +31,9 @@ class OV5640ImagePublisher(Node):
         self.image_pub = self.create_publisher(Image, '/ov5640/image_raw', 10)
         self.info_pub = self.create_publisher(CameraInfo, '/ov5640/camera_info', 10)
         self.bridge = CvBridge()
-
+        cam_index = self.find_ov5640_camera()
         # Open the camera
-        self.cap = cv2.VideoCapture(CAMERA_INDEX)
+        self.cap = cv2.VideoCapture(cam_index)
         self.cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
         self.cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         self.cap.set(cv2.CAP_PROP_FPS, 10)
@@ -72,6 +76,44 @@ class OV5640ImagePublisher(Node):
 
         # Run at ~10Hz
         self.timer = self.create_timer(0.1, self.timer_callback)
+
+
+
+    def find_ov5640_camera(self):
+        """
+        Scans all /dev/video* devices, finds those matching 'usb cam',
+        and returns the lowest index.
+        """
+
+        video_devices = sorted(glob.glob("/dev/video*"))
+        matches = []
+
+        for dev in video_devices:
+            try:
+                result = subprocess.run(
+                    ["v4l2-ctl", "--device", dev, "--info"],
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True
+                )
+                info = result.stdout.lower()
+
+                if "usb cam" in info:
+                    idx = int(dev.replace("/dev/video", ""))
+                    matches.append(idx)
+
+            except Exception:
+                pass
+
+        if not matches:
+            print("No USB Cam devices found")
+            return None
+
+        lowest = min(matches)
+        print(f"USB Cam detected at /dev/video{lowest} (all matches: {matches})")
+        return lowest
+
+
 
     def timer_callback(self):
         if self.use_dummy:
@@ -157,6 +199,13 @@ class OV5640ImagePublisher(Node):
 
 
 def main(args=None):
+
+    # debugpy.listen(("localhost", 5678))  # Port for debugger to connect
+    # print("Waiting for debugger to attach...")
+    # debugpy.wait_for_client()  # Ensures the debugger connects before continuing
+    # print("Debugger connected.")
+    
+        
     rclpy.init(args=args)
     node = OV5640ImagePublisher()
     try:

@@ -54,6 +54,7 @@ import threading
 from my_robot_interfaces.srv import MoveServoToAngle
 import math
 from my_robot_interfaces.srv import SetSpeedScale
+import os, json
 
 
 
@@ -62,6 +63,7 @@ class TkinterROS(Node):
 
     def __init__(self):
         super().__init__('tkinter_ros_node')
+        self.load_robot_params()
 
         self.gui_queue = queue.Queue()
         self.tf_buffer = Buffer()
@@ -72,7 +74,8 @@ class TkinterROS(Node):
         self.arm_is_moving = False
         self.init_cal_poses()
         self.initial_marker_pose_base = None
-
+        self.editing_endpoint = None   # can be None, 1, or 2
+        self.num_board_columns = 7
         self.top_dx_mm = None
         self.top_dy_mm = None
         self.top_angle_deg = None
@@ -106,9 +109,9 @@ class TkinterROS(Node):
             10
         )
 
-        self.set_speed_scale_client = self.node.create_client(
+        self.set_speed_scale_client = self.create_client(
             SetSpeedScale,
-            "/ar4_hardware_interface/set_speed_scale"   
+            "/ar4_hardware_interface_node/set_speed_scale"   
         )
         self.set_speed_scale_srv_type = SetSpeedScale
 
@@ -175,7 +178,6 @@ class TkinterROS(Node):
         self.take_sample_client = self.create_client(TakeSample, hec.TAKE_SAMPLE_TOPIC)
         self.compute_calibration_client = self.create_client(ComputeCalibration, hec.COMPUTE_CALIBRATION_TOPIC)
         self.log_with_time('info', 'take_sample service registered')
-        self.GRIP_FORCE_CLOSE = 136
         # self.init_moveit()
         self.init_right_frame()
         # self.periodic_status_check()
@@ -194,6 +196,93 @@ class TkinterROS(Node):
 
         # Add a timer to periodically show frames
         self.create_timer(0.03, self.display_frame)  # ~30 FPS
+
+
+    def load_robot_params(self):
+
+        self.lift_z = 0.35
+        self.hover_z = 0.30
+        self.pick_z1 = 0.24
+        self.pick_z2 = 0.17
+        self.pick_z3 = 0.127
+        self.drop_xy = (0.15, -0.30)
+
+        self.GRIP_FORCE_OPEN = 35
+        self.GRIP_FORCE_CLOSE = 90
+
+        self.chip_start_x = 0.17
+        self.chip_start_y = -0.328
+        self.chip_start_z = 0.40
+        self.board_column_z = 0.28
+
+
+        folder = os.path.dirname(os.path.abspath(__file__))
+        json_path = os.path.join(folder, "robot_params.json")
+
+        if not os.path.exists(json_path):
+            self.get_logger().warn(f"No robot_params.json found at {json_path}, using defaults")
+            return
+
+        with open(json_path, "r") as f:
+            params = json.load(f)
+
+        # --- A. Chip picking parameters ---
+        chip_pick = params.get("chip_pick", {})
+        self.lift_z  = chip_pick.get("lift_z", getattr(self, "lift_z", None))
+        self.hover_z = chip_pick.get("hover_z", getattr(self, "hover_z", None))
+        self.pick_z1 = chip_pick.get("pick_z1", getattr(self, "pick_z1", None))
+        self.pick_z2 = chip_pick.get("pick_z2", getattr(self, "pick_z2", None))
+        self.pick_z3 = chip_pick.get("pick_z3", getattr(self, "pick_z3", None))
+        self.drop_xy = tuple(chip_pick.get("drop_xy", getattr(self, "drop_xy", (None, None))))
+
+        # --- B. Gripper parameters ---
+        grip = params.get("gripper", {})
+        self.GRIP_FORCE_OPEN  = grip.get("GRIP_FORCE_OPEN", getattr(self, "GRIP_FORCE_OPEN", None))
+        self.GRIP_FORCE_CLOSE = grip.get("GRIP_FORCE_CLOSE", getattr(self, "GRIP_FORCE_CLOSE", None))
+
+        # --- C. Chip-start pose ---
+        chip_start = params.get("chip_start", {})
+        self.chip_start_x = chip_start.get("x", getattr(self, "chip_start_x", None))
+        self.chip_start_y = chip_start.get("y", getattr(self, "chip_start_y", None))
+        self.chip_start_z = chip_start.get("z", getattr(self, "chip_start_z", None))
+
+        # --- D. Board column height ---
+        board = params.get("board", {})
+        self.board_column_z = board.get("column_z", getattr(self, "board_column_z", None))
+
+
+
+        self.get_logger().info(f"Loaded robot parameters from {json_path}")
+
+
+    def nudge_joint6(self, delta_deg: float):
+        try:
+            cli = self.create_client(NudgeJoint, '/ar4_hardware_interface_node/nudge_joint')
+            if not cli.wait_for_service(timeout_sec=0.5):
+                self.log_with_time('warn', "NudgeJoint service not available")
+                return
+
+            req = NudgeJoint.Request()
+            req.joint_name = "joint_6"
+            req.delta_deg = float(delta_deg)
+
+            future = cli.call_async(req)
+
+            def _cb(fut):
+                try:
+                    resp = fut.result()
+                    if resp.success:
+                        self.log_with_time('info', f"Joint 6 nudged by {delta_deg}°")
+                    else:
+                        self.log_with_time('warn', f"Nudge failed: {resp.message}")
+                except Exception as e:
+                    self.log_with_time('error', f"NudgeJoint exception: {e}")
+
+            future.add_done_callback(_cb)
+
+        except Exception as e:
+            self.log_with_time('error', f"Error calling NudgeJoint: {e}")
+
 
     def _load_board_state(self):
         """Load step and endpoints from JSON and reflect in UI + memory."""
@@ -262,7 +351,7 @@ class TkinterROS(Node):
                 self.log_with_time('error', f"SpeedScale call exception: {e}")
 
         future.add_done_callback(_on_done)
-
+        time.sleep(0.1)  # slight delay to avoid overwhelming the service
     def _save_board_state(self):
         """Save step and endpoints to JSON."""
         try:
@@ -296,11 +385,9 @@ class TkinterROS(Node):
             self.log_with_time('warn', "[Connect4] Board endpoints not set; press 'Compute Drop Points' first.")
             return False
 
-        LIFT_Z = 0.35
-
         # 1) Reuse your picker; skip drop & return here
         ok = self.collect_chip_with_params(
-            lift_z=LIFT_Z,
+            lift_z=self.lift_z,
             perform_drop=False,
             return_to_start=False
         )
@@ -308,22 +395,6 @@ class TkinterROS(Node):
             self.log_with_time('warn', "[Connect4] Could not pick a chip.")
             return False
 
-        # # 2) Go to column 0 at the same lift height
-        # col_xy = self.compute_board_column_xy(1)
-        # if col_xy is None:
-        #     self.log_with_time('warn', "[Connect4] Cannot compute column 0 position.")
-        #     return False
-
-        # x0, y0 = col_xy
-        # self.log_with_time('info', f"[Connect4] Moving to column 0 @ ({x0:.3f}, {y0:.3f}, {LIFT_Z:.3f})")
-        # ok = self.move_to_xy_align_board(x0, y0, z=LIFT_Z, is_cartesian=False)
-        # if not ok:
-        #     self.log_with_time('error', "[Connect4] Move to column 0 failed.")
-        #     return False
-
-        # # 3) Release into the column
-        # self.open_gripper_srv()
-        # self.log_with_time('info', "[Connect4] Chip released in column 0.")
         return True
 
 
@@ -454,6 +525,7 @@ class TkinterROS(Node):
         self.goto_board_column(self.current_column_idx)
 
     def goto_board_column(self, col_idx: int):
+        self.load_robot_params()
         """Move EE to the center of a board column with yaw parallel to board."""
         xy = self.compute_board_column_xy(col_idx)
         if xy is None:
@@ -461,7 +533,9 @@ class TkinterROS(Node):
         x, y = xy 
         self.log_with_time('info', f"Going to board column {col_idx}: ({x:.3f}, {y:.3f}) (yaw aligned)")
         # Do not set active_drop_idx here; columns are not endpoints.
-        self.move_to_xy_align_board(x, y, z=0.28,is_cartesian=False)
+        z=self.board_column_z
+
+        self.move_to_xy_align_board(x, y, z,is_cartesian=False)
 
 
 
@@ -878,23 +952,30 @@ class TkinterROS(Node):
         except Exception:
             step = 0.005
 
+        # compute directions
         self._recompute_board_dir_xy()
         t = self.board_dir_xy
         n = self._board_normal_xy()
 
+        # choose direction
         if which == "up":
-            d =  t * step
+            d = t * step
         elif which == "down":
             d = -t * step
         elif which == "left":
-            d =  n * step
+            d = n * step
         elif which == "right":
             d = -n * step
         else:
             return
 
+        # move EE
         self.move_relative_xy(d[0], d[1])
-        self._update_active_point_from_current_pose()
+
+        # --- NEW LOGIC: update endpoints only when editing ---
+        if self.editing_endpoint in (1,2):
+            self._update_active_point_from_current_pose()
+    
 
     def brick_top_infos_callback(self, msg: Float32MultiArray):
         data = list(msg.data)
@@ -1004,7 +1085,11 @@ class TkinterROS(Node):
 
 
     def move_to_chip_start(self):
-        x, y, z = 0.17, -0.328, 0.40
+        
+        x = self.chip_start_x
+        y = self.chip_start_y
+        z = self.chip_start_z
+
         self.log_with_time("info", f"Moving to chip start: ({x:.3f}, {y:.3f}, {z:.3f})")
         ok = self.move_to_xy_align_board(x, y, z)
         self.log_with_time("info", f"Chip start move result: {ok}")
@@ -1159,6 +1244,7 @@ class TkinterROS(Node):
         tk.Button(newgrp, text="Collect", command=self.place_one_chip_in_connect4, width=8).pack(side=tk.LEFT, padx=4, pady=5)
         tk.Button(newgrp, text="Tower", command=self.stack_all_bricks, width=8).pack(side=tk.LEFT, padx=4, pady=5)
         tk.Button(newgrp, text="Refine", command=self.refine_pos, width=8).pack(side=tk.LEFT, padx=4, pady=5)
+        tk.Button(newgrp, text="disc. EPs", command=self.disconnect_endpoints, width=8).pack(side=tk.LEFT, padx=4, pady=5)
 
 
         chip_grp = tk.LabelFrame(self.tab_tools, text="Chip Controls")
@@ -1183,7 +1269,7 @@ class TkinterROS(Node):
 
         # Row 0 (continued): quick-set buttons
         step_buttons = tk.Frame(box)
-        step_buttons.grid(row=0, column=3, padx=(8,4), pady=2, sticky="w")
+        step_buttons.grid(row=1, column=3, padx=(8,4), pady=2, sticky="w")
 
         for val in [0.01, 0.005, 0.002]:
             tk.Button(step_buttons,
@@ -1203,15 +1289,37 @@ class TkinterROS(Node):
         self.drop_p2_entry.grid(row=2, column=1, columnspan=2, padx=4, pady=2, sticky="w")
 
         # Row 3: nudge buttons (aligned to board)
+        # Row 3: nudge buttons (aligned to board)
         nudges = tk.Frame(box)
         nudges.grid(row=3, column=0, columnspan=3, padx=4, pady=(6,2), sticky="w")
-        tk.Button(nudges, text="Up",    width=7, command=lambda: self.on_board_nudge("up")).pack(side=tk.LEFT, padx=2)
-        tk.Button(nudges, text="Down",  width=7, command=lambda: self.on_board_nudge("down")).pack(side=tk.LEFT, padx=2)
-        tk.Button(nudges, text="Left",  width=7, command=lambda: self.on_board_nudge("left")).pack(side=tk.LEFT, padx=2)
-        tk.Button(nudges, text="Right", width=7, command=lambda: self.on_board_nudge("right")).pack(side=tk.LEFT, padx=2)
-        tk.Button(nudges, text="Middle", width=7, command=lambda: self.on_board_middle()).pack(side=tk.LEFT, padx=2)
-        tk.Button(nudges, text="Next Column", width=12,command=self.on_next_board_column).pack(side=tk.LEFT, padx=8)
-        tk.Button(nudges, text="place one chip", width=12,command=self.place_one_chip_sequence).pack(side=tk.LEFT, padx=8)
+
+        # --- Row 0 of nudges ---
+        tk.Button(nudges, text="Up", width=7,
+                command=lambda: self.on_board_nudge("up")).grid(row=0, column=0, padx=2)
+        tk.Button(nudges, text="Down", width=7,
+                command=lambda: self.on_board_nudge("down")).grid(row=0, column=1, padx=2)
+        tk.Button(nudges, text="Left", width=7,
+                command=lambda: self.on_board_nudge("left")).grid(row=0, column=2, padx=2)
+        tk.Button(nudges, text="Right", width=7,
+                command=lambda: self.on_board_nudge("right")).grid(row=0, column=3, padx=2)
+        tk.Button(nudges, text="Middle", width=7,
+                command=self.on_board_middle).grid(row=0, column=4, padx=2)
+        tk.Button(nudges, text="Next Column", width=12,
+                command=self.on_next_board_column).grid(row=0, column=5, padx=8)
+
+        # --- Row 1 of nudges ---
+        tk.Button(nudges, text="CW", width=7,
+                command=lambda: self.nudge_joint6(-2.0)).grid(row=1, column=0, padx=2)
+        tk.Button(nudges, text="CCW", width=7,
+                command=lambda: self.nudge_joint6(+2.0)).grid(row=1, column=1, padx=2)
+
+        tk.Button(nudges, text="place one chip", width=12,
+                command=self.place_one_chip_sequence).grid(row=1, column=2, padx=2)
+
+        # --- Row 2: refine button ---
+        self.refine_btn = tk.Button(nudges,text="Refine Column\n&& Update Endpoints",command=self.on_refine_column_update_endpoints,
+            bg="#d0ffd0",width=22)
+        self.refine_btn.grid(row=2, column=0, columnspan=6, pady=6, sticky="w")
 
         # Row 4: set points from current EE XY
         setrow = tk.Frame(box)
@@ -1239,8 +1347,148 @@ class TkinterROS(Node):
         # Start periodic updates
         self.update_position_label()
 
+    def disconnect_endpoints(self):
+        self.editing_endpoint = None
+
+    def refine_current_column_center(self):
+        """
+        Refine the robot's XY so the EE moves to the true center of
+        the column directly underneath, using two refine_pos() iterations.
+        Returns: (cx, cy) in base frame.
+        """
+
+        # Call refine twice for better accuracy
+        for _ in range(2):
+            self._refine_pos()
+
+        # Retrieve the current EE pose (geometry_msgs/Pose)
+        pose = self.get_current_ee_pose()
+
+        if pose is None:
+            self.log_with_time("error", "refine_current_column_center: EE pose unavailable!")
+            return None, None
+
+        cx = pose.position.x
+        cy = pose.position.y
+
+        if cx is None or cy is None:
+            self.log_with_time("error", "refine_current_column_center: invalid EE XY!")
+            return None, None
+
+        return cx, cy
+
+
+
+    def on_refine_column_update_endpoints(self):
+        """
+        Refines the robot position to the true center of the current column,
+        then updates board endpoints accordingly.
+        Assumes the arm is already above some column and the gripper is open.
+        """
+        try:
+            # 1. Get EE pose
+            pose = self.get_current_ee_pose()
+            if pose is None:
+                self.log_with_time("error", "EE pose unavailable, cannot refine.")
+                return
+
+            # 2. Identify closest column from current XY
+            col = self.find_closest_column()
+            if col is None:
+                self.log_with_time("warn", "Cannot determine closest column.")
+                return
+
+            self.log_with_time("info", f"Refining at column {col}")
+
+            # 3. Refine twice (your requirement)
+            refined_x, refined_y = self.refine_current_column_center()
+
+            # 4. Update endpoints based on refined center
+            self.update_endpoints_after_refine(refined_center=(refined_x, refined_y),
+                                            column_index=col)
+
+            # 5. Recompute direction and force UI update
+            self._recompute_board_dir_xy()
+            
+            self._set_xy_entry(self.drop_p1_entry, self.drop_p1_xy)
+            self._set_xy_entry(self.drop_p2_entry, self.drop_p2_xy)
+
+            self.log_with_time("info",
+                f"Endpoints updated after refinement at column {col}.\n"
+                f"New P1: {self.drop_p1_xy}, P2: {self.drop_p2_xy}"
+            )
+
+        except Exception as e:
+            self.log_with_time("error", f"Refinement error: {e}")
+
+
+    def find_closest_column(self):
+        pose = self.get_current_ee_pose()
+        if pose is None:
+            return None
+
+        ee_x = pose.position.x
+        ee_y = pose.position.y
+
+        best_i = None
+        best_dist = float("inf")
+
+        for i in range(self.num_board_columns):
+            xy = self.compute_board_column_xy(i)
+            if xy is None:
+                continue
+
+            d = np.hypot(ee_x - xy[0], ee_y - xy[1])
+            if d < best_dist:
+                best_dist = d
+                best_i = i
+
+        return best_i
+
+
+    def compute_shift(self, col_idx, refined_xy):
+        expected = self.compute_board_column_xy(col_idx)
+        if expected is None:
+            return None
+
+        ex, ey = expected
+        rx, ry = refined_xy
+
+        dx = rx - ex
+        dy = ry - ey
+
+        self.log_with_time("info", f"Shift Δ = ({dx:.4f}, {dy:.4f})")
+        return (dx, dy)
+
+    def apply_shift_to_endpoints(self, shift):
+        if shift is None:
+            return
+
+        dx, dy = shift
+
+        # P1
+        if self.drop_p1_xy:
+            x1, y1 = self.drop_p1_xy
+            self.drop_p1_xy = (x1 + dx, y1 + dy)
+            self._set_xy_entry(self.drop_p1_entry, self.drop_p1_xy)
+
+        # P2
+        if self.drop_p2_xy:
+            x2, y2 = self.drop_p2_xy
+            self.drop_p2_xy = (x2 + dx, y2 + dy)
+            self._set_xy_entry(self.drop_p2_entry, self.drop_p2_xy)
+
+        self._recompute_board_dir_xy()
+        self._save_board_state()
+
+        self.log_with_time("info", "Endpoints shifted according to refined center")
+
+
+
     def on_next_board_column(self):
         """Cycle 0→6 and move to that column."""
+        self.editing_endpoint = None   # disable endpoint editing session
+
         self.current_column_idx = (self.current_column_idx + 1) % self.total_columns
         self.goto_board_column(self.current_column_idx)
 
@@ -1257,6 +1505,8 @@ class TkinterROS(Node):
         self.send_move_request(pose, is_cartesian=is_cartesian)
 
     def on_goto_point(self, idx: int):
+        self.editing_endpoint = idx
+
         """Move to one of the two stored drop points, always using stored values."""
         # Select the correct stored tuple
         xy = getattr(self, "drop_p1_xy" if idx == 1 else "drop_p2_xy", None)
@@ -1274,6 +1524,84 @@ class TkinterROS(Node):
 
         self.log_with_time('info', f"Going to stored point #{idx}: ({x:.3f}, {y:.3f})")
         self.move_to_xy_align_board(float(xy[0]), float(xy[1]), is_cartesian=False)
+
+    def update_endpoints_after_refine(self, refined_center, column_index):
+        """
+        After refining the true center of the current column, shift the drop-line endpoints.
+
+        - If the refined column is the FIRST column → move only drop_p1_xy to refined_center.
+        - If the refined column is the LAST column → move only drop_p2_xy to refined_center.
+        - Otherwise → shift BOTH endpoints by (dx, dy) so the refined center matches.
+
+        refined_center: (x, y)
+        column_index: integer index of the column that was refined
+        """
+
+        old_center = self.compute_board_column_xy(column_index)
+        if old_center is None:
+            self.log_with_time('warn', f"Cannot update endpoints: column {column_index} invalid.")
+            return
+
+        new_x, new_y = refined_center
+        old_x, old_y = old_center
+
+        dx = new_x - old_x
+        dy = new_y - old_y
+
+        num_cols = self.num_columns if hasattr(self, "num_columns") else 7
+
+        # ============================================================
+        # CASE 1: FIRST COLUMN → update only drop_p1_xy
+        # ============================================================
+        if column_index == 0:
+            self.drop_p1_xy = (new_x, new_y)
+            self._set_xy_entry(self.drop_p1_entry, self.drop_p1_xy)
+
+            # don't modify drop_p2_xy
+            self._recompute_board_dir_xy()
+            self._save_board_state()
+            self.log_with_time(
+                'info',
+                f"Refined FIRST column → updated drop_p1 only to ({new_x:.4f},{new_y:.4f})."
+            )
+            return
+
+        # ============================================================
+        # CASE 2: LAST COLUMN → update only drop_p2_xy
+        # ============================================================
+        if column_index == (num_cols - 1):
+            self.drop_p2_xy = (new_x, new_y)
+            self._set_xy_entry(self.drop_p2_entry, self.drop_p2_xy)
+
+            # don't modify drop_p1_xy
+            self._recompute_board_dir_xy()
+            self._save_board_state()
+            self.log_with_time(
+                'info',
+                f"Refined LAST column → updated drop_p2 only to ({new_x:.4f},{new_y:.4f})."
+            )
+            return
+
+        # ============================================================
+        # CASE 3: INNER COLUMN → shift both endpoints by (dx, dy)
+        # ============================================================
+        if self.drop_p1_xy is not None:
+            x1, y1 = self.drop_p1_xy
+            self.drop_p1_xy = (x1 + dx, y1 + dy)
+            self._set_xy_entry(self.drop_p1_entry, self.drop_p1_xy)
+
+        if self.drop_p2_xy is not None:
+            x2, y2 = self.drop_p2_xy
+            self.drop_p2_xy = (x2 + dx, y2 + dy)
+            self._set_xy_entry(self.drop_p2_entry, self.drop_p2_xy)
+
+        self._recompute_board_dir_xy()
+        self._save_board_state()
+
+        self.log_with_time(
+            'info',
+            f"Endpoints shifted → dx={dx:.4f}, dy={dy:.4f} for refined column {column_index}."
+        )
 
 
     def place_one_chip_sequence(self):
@@ -1305,9 +1633,28 @@ class TkinterROS(Node):
         self.open_gripper_srv()      # already exists :contentReference[oaicite:4]{index=4}
         self.log_with_time("info", "✅ Chip dropped!")
 
-        self.log_with_time("info", "=== PLACE ONE CHIP SEQUENCE DONE ===")
-        return True
+        time.sleep(0.3)  # allow camera to stabilize after gripper motion
 
+         # --- Determine closest column from EE pose ---
+        col = self.find_closest_column()
+        if col is None:
+            self.log_with_time('warn', "Could not determine closest column — skipping refinement.")
+            return
+
+        # --- Refine column center ---
+        refined_x, refined_y = self.refine_current_column_center()
+
+        if refined_x is None:
+            self.log_with_time('warn', "Refinement failed — skipping endpoint update.")
+            return
+
+        # --- Update endpoints to realign the column line ---
+        self.update_endpoints_after_refine((refined_x, refined_y), col)
+
+        self.log_with_time(
+            'info',
+            f"Refinement complete. Column {col} center=({refined_x:.3f},{refined_y:.3f}). Endpoints updated."
+        )
 
     def _get_closest_chip_to_ee(self):
         """
@@ -1341,17 +1688,32 @@ class TkinterROS(Node):
 
 
     def collect_chip_with_params(self, lift_z: float,
-                                hover_z: float = 0.30,
-                                pick_z1: float = 0.24,
-                                pick_z2: float = 0.17,
-                                pick_z3: float = 0.132,
-                                drop_xy=(0.15, -0.30),
+                                hover_z: float = None,
+                                pick_z1: float = None,
+                                pick_z2: float = None,
+                                pick_z3: float = None,
+                                drop_xy=None,
                                 perform_drop: bool = True,
                                 return_to_start: bool = True):
         """
         Pick the closest visible chip and lift to `lift_z`.
         Optionally drop it at `drop_xy` and/or return to the start pose.
         """
+        self.load_robot_params()
+        # Apply defaults from loaded JSON
+        if lift_z is None:
+            lift_z = self.lift_z
+        if hover_z is None:
+            hover_z = self.hover_z
+        if pick_z1 is None:
+            pick_z1 = self.pick_z1
+        if pick_z2 is None:
+            pick_z2 = self.pick_z2
+        if pick_z3 is None:
+            pick_z3 = self.pick_z3
+        if drop_xy is None:
+            drop_xy = self.drop_xy
+
         cur = self.get_current_ee_pose()
         if not cur:
             self.log_with_time('error', "Current EE pose unavailable.")
@@ -1403,10 +1765,10 @@ class TkinterROS(Node):
         self.close_gripper_srv()
 
 
-        self.set_speed_scale(float(0.5))
+        # self.set_speed_scale(float(0.1))
 
         self.move_to_height(float(lift_z), is_cartesian=True)
-        self.set_speed_scale(float(1.0))
+        # self.set_speed_scale(float(1.0))
         # --- Optional drop ---
         if perform_drop:
             self.send_move_request(face_down_pose(drop_xy[0], drop_xy[1], float(lift_z), yaw), is_cartesian=False)
@@ -1434,6 +1796,45 @@ class TkinterROS(Node):
             self.send_move_request(pose, is_cartesian=False)
 
     def refine_pos(self):
+        self._refine_pos()
+
+        if self.editing_endpoint is not None:
+
+            pose = self.get_current_ee_pose()   # <-- NEW
+
+            if pose is None:
+                return
+
+            # Extract XY depending on pose structure
+            if hasattr(pose, "position"):  
+                # geometry_msgs/Pose
+                ee_x = pose.position.x
+                ee_y = pose.position.y
+            else:
+                # tuple-like: (x, y, z, qx, qy, qz, qw)
+                ee_x = pose[0]
+                ee_y = pose[1]
+
+            if ee_x is not None and ee_y is not None:
+
+                if self.editing_endpoint == 1:
+                    self.drop_p1_xy = (ee_x, ee_y)
+                    self._set_xy_entry(self.drop_p1_entry, self.drop_p1_xy)
+
+                elif self.editing_endpoint == 2:
+                    self.drop_p2_xy = (ee_x, ee_y)
+                    self._set_xy_entry(self.drop_p2_entry, self.drop_p2_xy)
+
+                self._recompute_board_dir_xy()
+                self._save_board_state()
+
+                self.log_with_time(
+                    "info",
+                    f"Updated drop point #{self.editing_endpoint} to ({ee_x:.4f}, {ee_y:.4f}) after refinement."
+                )
+
+
+    def _refine_pos(self):
         self.refine_pose_with_ee_camera (0.0)
 
     def stack_all_bricks(
@@ -1631,35 +2032,12 @@ class TkinterROS(Node):
 
 
     def open_gripper_srv(self):
-        self.move_servo_to_angle(35.0)
-        
-        # req = Trigger.Request()
-        # res = self.call_service_blocking(self.open_gripper_client, req, timeout_sec=3.0)
-        # if res is None:
-        #     self.log_with_time('error', "open_gripper: no response / timeout")
-        #     self.gui_queue.put(lambda: self.status_label.config(text="Open gripper failed"))
-        #     return False
-        # self.log_with_time('info', f"open_gripper: {res.message}")
-        # self.gui_queue.put(lambda: self.status_label.config(
-        #     text="Gripper opened" if res.success else f"Open failed: {res.message}"))
-        # return bool(res.success)
-
+        self.load_robot_params()
+        self.move_servo_to_angle(self.GRIP_FORCE_OPEN)
 
     def close_gripper_srv(self):
-
+        self.load_robot_params()
         self.move_servo_to_angle(self.GRIP_FORCE_CLOSE)
-
-        # req = Trigger.Request()
-        # res = self.call_service_blocking(self.close_gripper_client, req, timeout_sec=3.0)
-        # if res is None:
-        #     self.log_with_time('error', "close_gripper: no response / timeout")
-        #     self.gui_queue.put(lambda: self.status_label.config(text="Close gripper failed"))
-        #     return False
-        # self.log_with_time('info', f"close_gripper: {res.message}")
-        # self.gui_queue.put(lambda: self.status_label.config(
-        #     text="Gripper closed" if res.success else f"Close failed: {res.message}"))
-        # return bool(res.success)
-
 
     def init_calibration_tab(self):
         """Initialize and populate the Calibration tab with ± buttons for each joint."""
