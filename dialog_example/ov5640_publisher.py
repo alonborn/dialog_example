@@ -509,11 +509,15 @@ class OV5640Publisher(Node):
 
             # 12) Per-detection publish (same as model)
             info_msg = Float32MultiArray()
-            info_msg.data = [dx_pub, dy_pub, float(angle_deg), float(est_height_mm)]
+            TYPE_ARUCO = 0
+            info_msg = Float32MultiArray()
+            info_msg.data = [TYPE_ARUCO, dx_pub, dy_pub, float(angle_deg), float(est_height_mm)]
             self.info_publisher.publish(info_msg)
 
             # 13) Accumulate batched (same as model)
-            all_infos.extend([dx_pub, dy_pub, float(angle_deg), float(est_height_mm), cx_m, cy_m])
+            TYPE_ARUCO = 0
+            all_infos.extend([TYPE_ARUCO, dx_pub, dy_pub, float(angle_deg), float(est_height_mm), cx_m, cy_m])
+
 
             # 14) Also publish corners (processed coords) for consumers that use them
             flat = [float(marker_id)]
@@ -536,15 +540,16 @@ class OV5640Publisher(Node):
 
         # Batched model-compatible infos
         if len(all_infos) > 0:
-            n = len(all_infos) // 6
             batched = Float32MultiArray()
+            n = len(all_infos) // 7
             batched.layout = MultiArrayLayout(
                 dim=[
-                    MultiArrayDimension(label='objects', size=n, stride=n*6),
-                    MultiArrayDimension(label='fields',  size=6, stride=6),
+                    MultiArrayDimension(label='objects', size=n, stride=n*7),
+                    MultiArrayDimension(label='fields', size=7, stride=7),
                 ],
                 data_offset=0,
             )
+
             batched.data = all_infos
             self.infos_publisher.publish(batched)
 
@@ -601,11 +606,10 @@ class OV5640Publisher(Node):
         dxR_mm = (xR - cx) * pixel_to_mm
         dyR_mm = (yR - cy) * pixel_to_mm
 
+        TYPE_BOARD = 2
         msg = Float32MultiArray()
-        msg.data = [dxL_mm, dyL_mm, dxR_mm, dyR_mm]
+        msg.data = [TYPE_BOARD, dxL_mm, dyL_mm, dxR_mm, dyR_mm]
         self.board_end_points_pub.publish(msg)
-
-
 
     def compute_board_end_points(self,
                                 pts4x2: np.ndarray,
@@ -790,7 +794,6 @@ class OV5640Publisher(Node):
                 task="obb",
                 verbose=False
             )[0]
-            cv2.imshow("Frame", frame)
             # MERGE BOTH MODELS
             results = self.merge_obb_results(results_chip, results_board)
 
@@ -995,11 +998,14 @@ class OV5640Publisher(Node):
                     est_height_mm = (focal_length_px * 23.0) / hypotenuse_px if hypotenuse_px > 0 else 0.0
 
                     # Publish info
+                    TYPE_CHIP = 1
                     info_msg = Float32MultiArray()
-                    info_msg.data = [-dx_base, -dy_base, float(angle_deg), float(est_height_mm)]
+                    info_msg.data = [TYPE_CHIP, -dx_base, -dy_base, float(angle_deg), float(est_height_mm)]
                     self.info_publisher.publish(info_msg)
-                    all_infos.extend([dx_pub, dy_pub, float(angle_deg), float(est_height_mm), cx_m, cy_m])
 
+
+                    TYPE_CHIP = 1
+                    all_infos.extend([TYPE_CHIP, dx_pub, dy_pub, float(angle_deg), float(est_height_mm), cx_m, cy_m])
 
                     # Overlays for distance & base-frame dx/dy
                     mid_x = int((center_x + cx) / 2)
@@ -1015,12 +1021,13 @@ class OV5640Publisher(Node):
                     )
                 # NEW: publish all detections in one shot (shape: N x 4)
                 if len(all_infos) > 0:
-                    n = len(all_infos) // 6  # not 4 anymore
+                    n = len(all_infos) // 7  # not 4 anymore
                     batched = Float32MultiArray()
+
                     batched.layout = MultiArrayLayout(
                         dim=[
-                            MultiArrayDimension(label='objects', size=n,  stride=n*6),
-                            MultiArrayDimension(label='fields',  size=6,  stride=6),
+                            MultiArrayDimension(label='objects', size=n, stride=n*7),
+                            MultiArrayDimension(label='fields', size=7, stride=7),
                         ],
                         data_offset=0,
                     )

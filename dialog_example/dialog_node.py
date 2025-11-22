@@ -210,9 +210,10 @@ class TkinterROS(Node):
         self.GRIP_FORCE_OPEN = 35
         self.GRIP_FORCE_CLOSE = 90
 
-        self.chip_start_x = 0.17
-        self.chip_start_y = -0.328
-        self.chip_start_z = 0.40
+
+        self.chip_start_x = 0.23
+        self.chip_start_y = -0.3
+        self.chip_start_z = 0.35
         self.board_column_z = 0.28
 
 
@@ -375,30 +376,6 @@ class TkinterROS(Node):
             self.log_with_time('warn', f"Could not save board state: {e}")
 
 
-    def place_one_chip_in_connect4(self):
-        """
-        Pick one chip (reuse collect_chip_with_params), lift to 0.35 m,
-        move to Connect-4 column 0 (yaw ⟂ board, face-down), and open gripper.
-        """
-        # Ensure endpoints exist to compute columns
-        if getattr(self, "drop_p1_xy", None) is None or getattr(self, "drop_p2_xy", None) is None:
-            self.log_with_time('warn', "[Connect4] Board endpoints not set; press 'Compute Drop Points' first.")
-            return False
-
-        # 1) Reuse your picker; skip drop & return here
-        ok = self.collect_chip_with_params(
-            lift_z=self.lift_z,
-            perform_drop=False,
-            return_to_start=False
-        )
-        if not ok:
-            self.log_with_time('warn', "[Connect4] Could not pick a chip.")
-            return False
-
-        return True
-
-
-
     def compute_board_column_xy(self, col_idx: int):
         """
         Return (x,y) of Connect-4 column center for col_idx in [0..6], using stored endpoints.
@@ -545,11 +522,11 @@ class TkinterROS(Node):
         These represent the 2 end points of the Connect-4 board relative to the ArUco marker.
         """
         data = list(msg.data)
-        if len(data) != 4:
+        if len(data) != 5:
             self.log_with_time('warn', f"board_end_points message unexpected length: {len(data)}")
             return
-
-        self.board_dx1_mm, self.board_dy1_mm, self.board_dx2_mm, self.board_dy2_mm = data
+        type = 2
+        type, self.board_dx1_mm, self.board_dy1_mm, self.board_dx2_mm, self.board_dy2_mm = data
 
         # self.log_with_time(
         #     'info',
@@ -978,6 +955,10 @@ class TkinterROS(Node):
     
 
     def brick_top_infos_callback(self, msg: Float32MultiArray):
+        """
+        Callback for receiving batched brick detections:
+        Each object is [type, dx_mm, dy_mm, angle_deg, est_height_mm, cx_m, cy_m]
+        """
         data = list(msg.data)
         n = len(data)
         self.latest_bricks = []
@@ -985,26 +966,24 @@ class TkinterROS(Node):
         if n == 0:
             return
 
-        # prefer 6-tuple per object if available (dx, dy, angle, height, cx, cy)
-        if n % 6 == 0:
-            stride = 6
-        elif n % 4 == 0:
-            stride = 4
-        else:
+        # Expect exactly 7 values per detected object
+        if n % 7 != 0:
             self.log_with_time('warn', f"brick_top_infos unexpected length: {n}")
             return
 
+        stride = 7
+
         for i in range(0, n, stride):
-            dx_mm   = float(data[i + 0])
-            dy_mm   = float(data[i + 1])
-            angle   = float(data[i + 2])
-            height  = float(data[i + 3])
-            cx_m = cy_m = None
-            if stride == 6:
-                cx_m = float(data[i + 4])
-                cy_m = float(data[i + 5])
+            obj_type = int(data[i + 0])
+            dx_mm    = float(data[i + 1])
+            dy_mm    = float(data[i + 2])
+            angle    = float(data[i + 3])
+            height   = float(data[i + 4])
+            cx_m     = float(data[i + 5])
+            cy_m     = float(data[i + 6])
 
             self.latest_bricks.append({
+                "type": obj_type,           
                 "dx_mm": dx_mm,
                 "dy_mm": dy_mm,
                 "angle_deg": angle,
@@ -1069,19 +1048,17 @@ class TkinterROS(Node):
         """
         Callback for receiving brick top info [dx_mm, dy_mm, angle_deg, est_height_mm].
         """
-        if len(msg.data) != 4:
+        if len(msg.data) != 5:
             self.log_with_time('warn' ,f"Received brick_top_info with unexpected length: {len(msg.data)}")
             return
 
-        self.top_dx_mm, self.top_dy_mm, self.top_angle_deg, self.top_est_height_mm = msg.data
-        # self.log_with_time('info', 
-        #     f"Brick offset: dx={dx_mm:.1f} mm, dy={dy_mm:.1f} mm, "
-        #     f"angle={angle_deg:.1f}°, height={est_height_mm:.1f} mm"
-        # )
+        obj_type, dx, dy, angle, height = msg.data
 
-        # Example: trigger an action when the brick is centered
-        # if abs(dx_mm) < 5 and abs(dy_mm) < 5:
-        #     self.log_with_time('info', "✅ Brick is centered within 5 mm!")
+        self.top_type = int(obj_type)         
+        self.top_dx_mm = float(dx)
+        self.top_dy_mm = float(dy)
+        self.top_angle_deg = float(angle)
+        self.top_est_height_mm = float(height)
 
 
     def move_to_chip_start(self):
@@ -1240,8 +1217,6 @@ class TkinterROS(Node):
 
         tk.Button(newgrp, text="Chip Start", command=self.move_to_chip_start, width=8).pack(side=tk.LEFT, padx=4, pady=5)
         tk.Button(newgrp, text="Start", command=self.start_collection, width=8).pack(side=tk.LEFT, padx=4, pady=5)
-        # tk.Button(newgrp, text="Collect", command=self.collect_bricks, width=8).pack(side=tk.LEFT, padx=4, pady=5)
-        tk.Button(newgrp, text="Collect", command=self.place_one_chip_in_connect4, width=8).pack(side=tk.LEFT, padx=4, pady=5)
         tk.Button(newgrp, text="Tower", command=self.stack_all_bricks, width=8).pack(side=tk.LEFT, padx=4, pady=5)
         tk.Button(newgrp, text="Refine", command=self.refine_pos, width=8).pack(side=tk.LEFT, padx=4, pady=5)
         tk.Button(newgrp, text="disc. EPs", command=self.disconnect_endpoints, width=8).pack(side=tk.LEFT, padx=4, pady=5)
@@ -1616,7 +1591,8 @@ class TkinterROS(Node):
 
         # 1) Move to chip start
         self.move_to_chip_start()   # already exists :contentReference[oaicite:1]{index=1}
-
+        self.latest_bricks = []  # clear previous bricks
+        time.sleep(0.15)
         # 2) Collect chip (same function called from the Collect Chip button)
 
 
@@ -1641,15 +1617,16 @@ class TkinterROS(Node):
             self.log_with_time('warn', "Could not determine closest column — skipping refinement.")
             return
 
-        # --- Refine column center ---
-        refined_x, refined_y = self.refine_current_column_center()
+        for i in range(2):
+            # --- Refine column center ---
+            refined_x, refined_y = self.refine_current_column_center()
 
-        if refined_x is None:
-            self.log_with_time('warn', "Refinement failed — skipping endpoint update.")
-            return
+            if refined_x is None:
+                self.log_with_time('warn', "Refinement failed — skipping endpoint update.")
+                return
 
-        # --- Update endpoints to realign the column line ---
-        self.update_endpoints_after_refine((refined_x, refined_y), col)
+            # --- Update endpoints to realign the column line ---
+            self.update_endpoints_after_refine((refined_x, refined_y), col)
 
         self.log_with_time(
             'info',
@@ -1661,8 +1638,11 @@ class TkinterROS(Node):
         Return (cx, cy) [meters] of the brick currently closest to the end effector,
         or None if none are available.
         """
-        bricks = list(getattr(self, "latest_bricks", []))
-        if not bricks:
+        all_bricks = list(getattr(self, "latest_bricks", []))
+
+        chips = [b for b in all_bricks if b.get("type") == 1]
+
+        if not chips:
             self.log_with_time('warn', "No chips available to collect.")
             return None
 
@@ -1677,7 +1657,7 @@ class TkinterROS(Node):
             return ((b["cx_m"] - cur.position.x) ** 2 +
                     (b["cy_m"] - cur.position.y) ** 2) ** 0.5
 
-        target = min(bricks, key=dist_to_ee)
+        target = min(chips, key=dist_to_ee)
         if target.get("cx_m") is None or target.get("cy_m") is None:
             self.log_with_time('warn', "Closest chip missing coordinates.")
             return None
@@ -1741,10 +1721,8 @@ class TkinterROS(Node):
         self.send_move_request(face_down_pose(cx, cy, float(hover_z), yaw), is_cartesian=False)
 
         # --- Iteratively refine position using updated chip locations ---
-        for _ in range(2):
-            latest_target = self._get_closest_chip_to_ee()
-            if not latest_target:
-                break
+        latest_target = self._get_closest_chip_to_ee()
+        if  latest_target is not None:
             cx, cy = latest_target
             self.refine_pose_with_ee_camera_dx_dy(cx, cy, float(pick_z1))
 
