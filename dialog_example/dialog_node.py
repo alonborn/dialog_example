@@ -55,6 +55,8 @@ from my_robot_interfaces.srv import MoveServoToAngle
 import math
 from my_robot_interfaces.srv import SetSpeedScale
 import os, json
+from std_msgs.msg import Int32MultiArray
+from my_robot_interfaces.srv import GetNextMove
 
 
 
@@ -81,7 +83,6 @@ class TkinterROS(Node):
         self.top_angle_deg = None
         self.top_est_height_mm = None
         self.active_drop_idx = None  # 1 or 2 after a goto
-
         self.last_joint_update_time = self.get_clock().now()
         self.marker_index = 0
         self.last_pos = ""
@@ -192,10 +193,20 @@ class TkinterROS(Node):
             self.image_callback,
             qos_profile_sensor_data
         )
-        self._load_board_state()  # populate entries/vars if a state file exists
+        self._load_board_pos_state()  # populate entries/vars if a state file exists
 
         # Add a timer to periodically show frames
         self.create_timer(0.03, self.display_frame)  # ~30 FPS
+        self.latest_board = None
+        self.total_chips = 0             # number of chips on the board
+        self.wait_for = -1
+        self.board_sub = self.create_subscription(
+            Int32MultiArray,
+            "/board/state",
+            self.board_state_callback,
+            10
+        )
+        self.ai_client = self.create_client(GetNextMove, "get_next_move")
 
 
     def load_robot_params(self):
@@ -284,8 +295,21 @@ class TkinterROS(Node):
         except Exception as e:
             self.log_with_time('error', f"Error calling NudgeJoint: {e}")
 
+    def board_state_callback(self, msg):
+        import numpy as np
 
-    def _load_board_state(self):
+        arr = np.array(msg.data, dtype=np.int32)
+
+        if arr.size != 42:
+            self.get_logger().warn(f"Invalid board size: {arr.size}")
+            return
+
+        self.latest_board = arr.reshape((6,7))
+        self.total_chips = int(np.count_nonzero(self.latest_board))
+
+        self.get_logger().info(f"Board updated. Chips: {self.total_chips}")
+
+    def _load_board_pos_state(self):
         """Load step and endpoints from JSON and reflect in UI + memory."""
         try:
             if not os.path.exists(self._state_path):
@@ -1226,6 +1250,9 @@ class TkinterROS(Node):
         chip_grp.pack(fill=tk.X, padx=8, pady=6)
         tk.Button(chip_grp, text="Collect Chip", command=self.collect_chip, width=8).pack(side=tk.LEFT, padx=4, pady=5)
 
+        next_btn = tk.Button(chip_grp, text="Next Move", width=15, command=self.on_next_move)
+        next_btn.pack(side=tk.LEFT, padx=4, pady=5)
+
 
         # --- Board / Drop line helpers ---
         box = tk.Frame(chip_grp)
@@ -1321,6 +1348,61 @@ class TkinterROS(Node):
 
         # Start periodic updates
         self.update_position_label()
+
+    def on_next_move(self):
+        if self.latest_board is None:
+            self.get_logger().warn("No board state available yet.")
+            return
+
+        if not self.ai_client.wait_for_service(timeout_sec=2.0):
+            self.get_logger().error("Connect4 AI service unavailable!")
+            return
+
+        # Prepare request
+        req = GetNextMove.Request()
+        req.board = self.latest_board.flatten().tolist()
+
+        # Decide which player you are
+        # P1=1, P2=2 — your robot is P2?
+        req.player = 2
+
+        future = self.ai_client.call_async(req)
+        future.add_done_callback(self.after_ai_move)
+
+    def after_ai_move(self, future):
+        try:
+            res = future.result()
+        except Exception as e:
+            self.get_logger().error(f"AI service failed: {e}")
+            return
+
+        col = res.column
+
+        if col < 0 or col > 6:
+            self.get_logger().error("AI returned invalid column.")
+            return
+
+        self.get_logger().info(f"AI selected column {col}")
+
+        # Now command the robot to place a piece in this column
+        # self.place_chip(col)
+
+
+    def place_chip(self, column):
+        """
+        Move the arm to the correct drop position for the chosen column.
+        """
+        # Example:
+        # self.move_to_pose_named(f"drop_col_{column}")
+
+        # or if you use coordinates:
+        if hasattr(self, "drop_positions"):
+            target_pose = self.drop_positions[column]
+            self.move_robot_to_pose(target_pose)
+
+        self.get_logger().info(f"Placing chip in column {column}")
+
+
 
     def disconnect_endpoints(self):
         self.editing_endpoint = None
@@ -3426,10 +3508,10 @@ def ros_spin_executor(executor): # New
 
 
 def main(): 
-    debugpy.listen(("localhost", 5678))  # Port for debugger to connect
-    print("Waiting for debugger to attach...")
-    debugpy.wait_for_client()
-    print("Debugger connected.")
+    # debugpy.listen(("localhost", 5678))  # Port for debugger to connect
+    # print("Waiting for debugger to attach...")
+    # debugpy.wait_for_client()
+    # print("Debugger connected.")
    
     rclpy.init()
 

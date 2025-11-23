@@ -88,12 +88,12 @@ def generate_launch_description():
         output='screen'
     )
 
-    connect4_ai_node = Node(
-    package="connect_4_gamer",
-    executable="connect_4_gamer",
-    name="connect4_ai_node",
-    output="screen",
-)
+    connect4_gamer = Node(
+        package="connect_4_gamer",
+        executable="connect_4_gamer",
+        name="connect4_ai_node",
+        output="screen",
+    )
 
 
 
@@ -105,7 +105,6 @@ def generate_launch_description():
         aruco_node,
         hand_eye_tf_publisher,
         arm_cam_image_publisher,
-        # connect4_detector,
-        connect4_ai_node,
-        # inferences_node
+        connect4_detector,
+        connect4_gamer,
     ])
