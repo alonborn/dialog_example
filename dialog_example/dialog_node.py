@@ -305,9 +305,11 @@ class TkinterROS(Node):
             return
 
         self.latest_board = arr.reshape((6,7))
+        self.total_chips_old = self.total_chips
         self.total_chips = int(np.count_nonzero(self.latest_board))
 
-        self.get_logger().info(f"Board updated. Chips: {self.total_chips}")
+        if self.total_chips != self.total_chips_old:
+            self.get_logger().info(f"Board updated. Chips: {self.total_chips}")
 
     def _load_board_pos_state(self):
         """Load step and endpoints from JSON and reflect in UI + memory."""
@@ -1250,7 +1252,7 @@ class TkinterROS(Node):
         chip_grp.pack(fill=tk.X, padx=8, pady=6)
         tk.Button(chip_grp, text="Collect Chip", command=self.collect_chip, width=8).pack(side=tk.LEFT, padx=4, pady=5)
 
-        next_btn = tk.Button(chip_grp, text="Next Move", width=15, command=self.on_next_move)
+        next_btn = tk.Button(chip_grp, text="Next Move", width=10, command=self.on_next_move)
         next_btn.pack(side=tk.LEFT, padx=4, pady=5)
 
 
@@ -3508,10 +3510,10 @@ def ros_spin_executor(executor): # New
 
 
 def main(): 
-    # debugpy.listen(("localhost", 5678))  # Port for debugger to connect
-    # print("Waiting for debugger to attach...")
-    # debugpy.wait_for_client()
-    # print("Debugger connected.")
+    debugpy.listen(("localhost", 5678))  # Port for debugger to connect
+    print("Waiting for debugger to attach...")
+    debugpy.wait_for_client()
+    print("Debugger connected.")
    
     rclpy.init()
 
