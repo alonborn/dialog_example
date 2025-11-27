@@ -1,25 +1,72 @@
 {
-    "chip_pick": {
-        "lift_z": 0.35,
-        "hover_z": 0.30,
-        "pick_z1": 0.24,
-        "pick_z2": 0.17,
-        "pick_z3": 0.127,
-        "drop_xy": [0.15, -0.30]
-    },
-
-    "gripper": {
-        "GRIP_FORCE_OPEN": 35,
-        "GRIP_FORCE_CLOSE": 108
-    },
-
-    "chip_start": {
-        "x": 0.23,
-        "y": -0.3,
-        "z": 0.35
-    },
-
-    "board": {
+  "chip_pick": {
+    "lift_z": 0.3,
+    "hover_z": 0.3,
+    "pick_z1": 0.24,
+    "pick_z2": 0.17,
+    "pick_z3": 0.125,
+    "prepare_to_pick_z": 0.21,
+    "drop_xy": [
+      0.15,
+      -0.3
+    ]
+  },
+  "gripper": {
+    "GRIP_FORCE_OPEN": 35,
+    "GRIP_FORCE_CLOSE": 108
+  },
+  "chip_start": {
+    "x": 0.31,
+    "y": -0.358,
+    "z": 0.35
+  },
+  "start_position": {
+    "x": 0.116,
+    "y": -0.344,
+    "z": 0.401
+  },
+  "chip_table_identification": {
+    "x": 0.353,
+    "y": -0.388,
+    "z": 0.349,
+    "chip_positions": [
+      {
+        "x": 0.368,
+        "y": -0.437
+      },
+      {
+        "x": 0.343,
+        "y": -0.324
+      },
+      {
+        "x": 0.304,
+        "y": -0.439
+      },
+      {
+        "x": 0.405,
+        "y": -0.346
+      }
+    ]
+  },
+  "board": {
     "column_z": 0.28
-}
+  },
+  "chip_positions": [
+    [
+      0.39,
+      -0.334
+    ],
+    [
+      0.297,
+      -0.411
+    ],
+    [
+      0.33,
+      -0.313
+    ],
+    [
+      0.36,
+      -0.431
+    ]
+  ]
 }

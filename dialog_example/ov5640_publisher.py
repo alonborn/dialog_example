@@ -1,6 +1,7 @@
 #!/home/alon/venv/bin/python
 
 import sys
+from types import SimpleNamespace
 print(f"[DEBUG] Running with Python interpreter: {sys.executable}")
 import debugpy
 import rclpy
@@ -62,7 +63,7 @@ class OV5640Publisher(Node):
         os.makedirs(self.capture_folder, exist_ok=True)
         self.capture_count = 0
 
-        self.model_chip = YOLO("/home/alon/Documents/Projects/rchip_table_train/runs/obb/train6/weights/best.pt")
+        self.model_chip = YOLO("/home/alon/Documents/Projects/rchip_table_train/runs/obb/train11/weights/best.pt")
         self.model_board = YOLO("/home/alon/Documents/Projects/board_top_train/runs/obb/train4/weights/best.pt")
 
         self.handle_camera_calibration()
@@ -657,7 +658,35 @@ class OV5640Publisher(Node):
         return (float(p_left[0]), float(p_left[1])), (float(p_right[0]), float(p_right[1]))
 
 
-    def merge_obb_results(self, r1, r2):
+    def merge_obb_results(self, r_chip, r_board):
+        merged = SimpleNamespace()
+        merged.obb = SimpleNamespace()
+
+        polys = []
+        confs = []
+        sources = []    # NEW: to track chip vs board
+
+        # --- chip model detections ---
+        if hasattr(r_chip, "obb"):
+            for poly, conf in zip(r_chip.obb.xyxyxyxy, r_chip.obb.conf):
+                polys.append(poly)
+                confs.append(conf)
+                sources.append("chip")
+
+        # --- board model detections ---
+        if hasattr(r_board, "obb"):
+            for poly, conf in zip(r_board.obb.xyxyxyxy, r_board.obb.conf):
+                polys.append(poly)
+                confs.append(conf)
+                sources.append("board")
+
+        merged.obb.xyxyxyxy = polys
+        merged.obb.conf = confs
+        merged.obb.source = sources   # <--- NEW
+        return merged
+
+
+    def merge_obb_results_old(self, r1, r2):
         """
         Merge two YOLO OBB results objects into a single synthetic result object.
         Polygons, classes, and confidences are concatenated safely.
@@ -711,10 +740,48 @@ class OV5640Publisher(Node):
         merged.obb.xyxyxyxy = polys_tensor
         merged.obb.cls = merged_cls
         merged.obb.conf = merged_conf
-
         return merged
 
+    def is_red_chip(self, frame, pts):
+        """
+        pts: (4,2) float polygon in the SAME coordinate system as 'frame'.
+        Returns True if region looks red (chip), False if it looks white (slot).
+        """
 
+        # Create mask from polygon
+        mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+        poly = pts.astype(np.int32)
+        cv2.fillPoly(mask, [poly], 255)
+
+        # Erode to avoid edge artifacts
+        kernel = np.ones((5,5), np.uint8)
+        mask = cv2.erode(mask, kernel, iterations=1)
+
+        # Extract HSV pixels
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+        pixels = hsv[mask == 255]
+        if pixels.size == 0:
+            return False
+
+        # Compute mean saturation (S) and value (V)
+        mean_S = pixels[:,1].mean()
+        mean_V = pixels[:,2].mean()
+
+        # Fraction of red pixels
+        H = pixels[:,0]
+        S = pixels[:,1]
+        red_mask = ((H < 15) | (H > 165)) & (S > 60)     # red-ish
+        red_fraction = red_mask.sum() / len(red_mask)
+
+        # ------- Decision ---------
+        # Most slots are white: high V, low S, low red_fraction.
+        if red_fraction > 0.10:
+            return True          # clearly red chip
+
+        if mean_S > 70:
+            return True          # saturated enough to be chip
+
+        return False  # looks white → reject
 
 
 
@@ -784,7 +851,7 @@ class OV5640Publisher(Node):
         # --- Inference (normal + fallback) ---
         try:
             # results = self.model.predict(frame, imgsz=640, conf=0.8, verbose=False)[0]
-            results_chip  = self.model_chip.predict(frame, imgsz=640, conf=0.8, verbose=False)[0]
+            results_chip  = self.model_chip.predict(frame, imgsz=640, conf=0.83, verbose=False)[0]
             # results_board = self.model_board.predict(frame, imgsz=640, conf=0.8, verbose=False)[0]
 
             results_board = self.model_board(
@@ -896,6 +963,17 @@ class OV5640Publisher(Node):
                         continue
 
                     points = boxes[i]
+                    det_source = results.obb.source[i] if hasattr(results.obb, "source") else "chip"  # safe default
+
+
+                    # --- NEW: Color post-filter to reject white slots ---
+                    if det_source == "chip":
+                        if not self.is_red_chip(frame, points):
+                            # Uncomment to debug:
+                            # cv2.putText(annotated_frame, "REJECT white slot", (int(points[0,0]), int(points[0,1])),
+                            #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
+                            continue
+
 
                     if points.shape != (4, 2) or np.isnan(points).any():
                         continue
@@ -1003,8 +1081,6 @@ class OV5640Publisher(Node):
                     info_msg.data = [TYPE_CHIP, -dx_base, -dy_base, float(angle_deg), float(est_height_mm)]
                     self.info_publisher.publish(info_msg)
 
-
-                    TYPE_CHIP = 1
                     all_infos.extend([TYPE_CHIP, dx_pub, dy_pub, float(angle_deg), float(est_height_mm), cx_m, cy_m])
 
                     # Overlays for distance & base-frame dx/dy
