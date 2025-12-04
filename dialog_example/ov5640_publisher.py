@@ -742,6 +742,39 @@ class OV5640Publisher(Node):
         merged.obb.conf = merged_conf
         return merged
 
+
+    def classify_hsv_region(self, frame, polygon):
+        """
+        Compute mean H and S inside the polygon.
+        Returns (mean_H, mean_S, class_label) where class_label is 'C' or 'H'.
+        """
+
+        # Convert to HSV once
+        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+        # Mask for this polygon
+        mask = np.zeros(frame.shape[:2], dtype=np.uint8)
+        cv2.fillPoly(mask, [polygon.astype(np.int32)], 255)
+
+        # Extract HSV values
+        region = hsv[mask == 255]
+        if len(region) == 0:
+            return (0, 0, "?")
+
+        mean_H = float(region[:, 0].mean())
+        mean_S = float(region[:, 1].mean())
+
+        # ---- Heuristic classification ----
+        # Chips are strong red → High S, H around red range (0 or 170–180)
+        # Holes are white → Low S
+        if mean_S > 80:        # strong saturation → chip
+            class_label = "C"
+        else:
+            class_label = "H"
+
+        return mean_H, mean_S, class_label
+
+
     def is_red_chip(self, frame, pts):
         """
         pts: (4,2) float polygon in the SAME coordinate system as 'frame'.
@@ -782,6 +815,29 @@ class OV5640Publisher(Node):
             return True          # saturated enough to be chip
 
         return False  # looks white → reject
+
+    def _normalize_conf(self, confs_raw):
+
+        # Case 1: torch tensor → convert to CPU numpy
+        if isinstance(confs_raw, torch.Tensor):
+            return confs_raw.detach().cpu().numpy().astype(float)
+
+        # Case 2: list/tuple → handle inside elements
+        if isinstance(confs_raw, (list, tuple)):
+            out = []
+            for c in confs_raw:
+                if isinstance(c, torch.Tensor):
+                    out.append(float(c.detach().cpu().item()))
+                else:
+                    out.append(float(c))
+            return np.array(out, dtype=float)
+
+        # Case 3: numpy array → just cast
+        if isinstance(confs_raw, np.ndarray):
+            return confs_raw.astype(float)
+
+        # Fallback
+        return np.array([], dtype=float)
 
 
 
@@ -874,9 +930,20 @@ class OV5640Publisher(Node):
         confs = np.array([])
 
         if self._has_obb(results):
-            # Normal path: take polygons as-is
-            boxes = [poly.cpu().numpy().reshape(4, 2) for poly in results.obb.xyxyxyxy]
-            confs = results.obb.conf.cpu().numpy()
+            # Normalize polygons (tensors → numpy)
+            polys = results.obb.xyxyxyxy
+            boxes = []
+
+            for poly in polys:
+                # torch tensor
+                if hasattr(poly, "cpu"):
+                    arr = poly.detach().cpu().numpy().reshape(4, 2)
+                else:
+                    arr = np.array(poly).reshape(4, 2)
+                boxes.append(arr)
+
+            # confs are plain floats in a Python list → turn into numpy array
+            confs = self._normalize_conf(results.obb.conf)
         else:
             # >>> NEW: Fallback—rotate by +20°, detect, back-rotate polygons; keep display steady
             # print(f"{self.counter} No OBBs found, applying fallback rotation")
@@ -912,7 +979,7 @@ class OV5640Publisher(Node):
                 results = results_rot
 
                 # Back-transform polygons to non-rotated display frame
-                confs = results_rot.obb.conf.cpu().numpy()
+                confs = self._normalize_conf(results_rot.obb.conf)
 
                 for poly in results_rot.obb.xyxyxyxy:
                     pts = poly.cpu().numpy().reshape(4, 2)
@@ -959,24 +1026,50 @@ class OV5640Publisher(Node):
                 all_infos = []  # NEW: will hold [dx_base, dy_base, angle_deg, est_height_mm] per detection
 
                 for i in range(n):
-                    if i < len(confs) and confs[i] is not None and confs[i] < conf_thr:
+                    # Extract polygon
+                    points = boxes[i].astype(np.float32)
+
+                    # --- Compute H, S, and classify (C/H) ---
+                    mean_H, mean_S, class_label = self.classify_hsv_region(frame, points)
+                    if class_label == "H":
                         continue
+                        # self.get_logger().info(f"Detection {i}: mean_H={mean_H:.1f}, mean_S={mean_S:.1f} → class {class_label}")
+                    # Draw polygon outline
+                    pts_i32 = points.astype(np.int32)
+                    cv2.polylines(
+                        annotated_frame,
+                        [pts_i32],
+                        isClosed=True,
+                        color=(0, 255, 0),
+                        thickness=2,
+                        lineType=cv2.LINE_AA
+                    )
 
-                    points = boxes[i]
-                    det_source = results.obb.source[i] if hasattr(results.obb, "source") else "chip"  # safe default
+                    # Draw corners
+                    for (px, py) in pts_i32:
+                        cv2.circle(annotated_frame, (int(px), int(py)), 3, (0, 0, 255), -1)
 
+                    # Detection center
+                    cx = float(points[:, 0].mean())
+                    cy = float(points[:, 1].mean())
+                    cv2.circle(annotated_frame, (int(cx), int(cy)), 4, (0, 255, 255), -1)
 
-                    # --- NEW: Color post-filter to reject white slots ---
-                    if det_source == "chip":
-                        if not self.is_red_chip(frame, points):
-                            # Uncomment to debug:
-                            # cv2.putText(annotated_frame, "REJECT white slot", (int(points[0,0]), int(points[0,1])),
-                            #             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2)
-                            continue
+                    # Draw C/H + H,S
+                    label_text = f"{class_label} H:{mean_H:.0f} S:{mean_S:.0f}"
+                    cv2.putText(
+                        annotated_frame,
+                        label_text,
+                        (int(cx) + 20, int(cy) - 20),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.6,
+                        (0, 0, 0),
+                        2,
+                        cv2.LINE_AA
+                    )
 
-
-                    if points.shape != (4, 2) or np.isnan(points).any():
-                        continue
+                    # IMPORTANT:
+                    # now continue EXACTLY with your existing code starting at:
+                    # "Estimate bounding box size from polygon"
 
 
                     # Estimate bounding box size from polygon

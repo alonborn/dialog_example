@@ -29,6 +29,7 @@ from rclpy.qos import qos_profile_sensor_data
 from geometry_msgs.msg import Point, Pose, PoseArray, PoseStamped
 from sensor_msgs.msg import Image, JointState
 from std_msgs.msg import Float32MultiArray, Int32MultiArray
+from visualization_msgs.msg import Marker, MarkerArray
 
 # ===== ROS2 SRVS =====
 from std_srvs.srv import Trigger, SetBool
@@ -41,6 +42,8 @@ from my_robot_interfaces.srv import (
     HasWon,
     SetRotatedForbiddenBox
 )
+from geometry_msgs.msg import Quaternion
+
 
 # ===== TF / TRANSFORMS =====
 import tf_transformations
@@ -86,7 +89,6 @@ class TkinterROS(Node):
         self.top_dx_mm = None
         self.top_dy_mm = None
         self.editing_chip = False
-        self.board_height = 0.02  # 20mm
         self.top_angle_deg = None
         self.top_est_height_mm = None
         self.active_drop_idx = None  # 1 or 2 after a goto
@@ -100,7 +102,7 @@ class TkinterROS(Node):
         self.calib_path = self.calib_dir / 'ar4_calibration.calib'
         # self.publisher = self.create_publisher(String, '/ar4_hardware_interface_node/homing_string', 10)
         self.cb_group = ReentrantCallbackGroup()
-        self.wait_before_refine_sec = 0.4
+        self.wait_before_refine_sec = 0.5
         self.cur_chip_index = 0
         # KEEP a reference on self:
 
@@ -151,9 +153,13 @@ class TkinterROS(Node):
         self.aruco_follower_enabled_client = self.create_client(SetBool, '/set_aruco_follower_enabled')
         self.ai_client = self.create_client(GetNextMove, "get_next_move")
         self.has_won_client = self.create_client(HasWon, "has_won")
-        self.board_box_client = self.create_client(SetRotatedForbiddenBox,'set_rotated_board_box')
+        self.board_box_client = self.create_client(SetRotatedForbiddenBox,'set_rotated_forbidden_box')
 
-
+        self.safe_points_pub = self.create_publisher(
+                    MarkerArray,
+                    "safe_points_markers",
+                    10
+                )
 
         self.latest_chip = (-1, -1)  # row, col of latest detected chip
 
@@ -185,12 +191,107 @@ class TkinterROS(Node):
         self.total_chips = 0             # number of chips on the board
         self.wait_for = -1
 
+
+    def publish_safe_points(self):
+        safe_points = self.compute_and_publish_all_safe_points()
+
+    def compute_and_publish_all_safe_points(self):
+        
+        safe_points = []
+        for col in range(6):
+            sp = self.compute_safe_column_pose(col)
+            safe_points.append(sp)
+
+        self.publish_safe_point_markers(safe_points)
+        return safe_points
+
+
+    def publish_safe_point_markers(self, safe_points):
+        """
+        Publish safe waypoint markers to RViz.
+        safe_points = list of dicts with:
+        {x, y, z, qx, qy, qz, qw}
+        """
+
+        marker_array = MarkerArray()
+        header_frame = "base_link"
+
+        for i, sp in enumerate(safe_points):
+
+            # -----------------------------
+            # Sphere marker (position only)
+            # -----------------------------
+            m = Marker()
+            m.header.frame_id = header_frame
+            m.header.stamp = self.get_clock().now().to_msg()
+            m.ns = "safe_point"
+            m.id = i
+            m.type = Marker.SPHERE
+            m.action = Marker.ADD
+
+            m.scale.x = 0.03
+            m.scale.y = 0.03
+            m.scale.z = 0.03
+
+            m.pose.position.x = float(sp["x"])
+            m.pose.position.y = float(sp["y"])
+            m.pose.position.z = float(sp["z"])
+
+            # Identity orientation for sphere
+            m.pose.orientation.w = 1.0
+
+            # Blue sphere
+            m.color.r = 0.0
+            m.color.g = 0.3
+            m.color.b = 1.0
+            m.color.a = 1.0
+
+            marker_array.markers.append(m)
+
+            # -----------------------------
+            # Arrow marker (orientation)
+            # -----------------------------
+            arrow = Marker()
+            arrow.header.frame_id = header_frame
+            arrow.header.stamp = m.header.stamp
+            arrow.ns = "safe_point_dir"
+            arrow.id = 100 + i
+            arrow.type = Marker.ARROW
+            arrow.action = Marker.ADD
+
+            arrow.scale.x = 0.05  # shaft length
+            arrow.scale.y = 0.01  # shaft diameter
+            arrow.scale.z = 0.01  # head diameter
+
+            arrow.pose.position.x = float(sp["x"])
+            arrow.pose.position.y = float(sp["y"])
+            arrow.pose.position.z = float(sp["z"])
+
+            # Use the quaternion from compute_safe_column_pose
+            arrow.pose.orientation.x = float(sp["qx"])
+            arrow.pose.orientation.y = float(sp["qy"])
+            arrow.pose.orientation.z = float(sp["qz"])
+            arrow.pose.orientation.w = float(sp["qw"])
+
+            # Green arrow
+            arrow.color.r = 0.0
+            arrow.color.g = 1.0
+            arrow.color.b = 0.0
+            arrow.color.a = 1.0
+
+            marker_array.markers.append(arrow)
+
+        # Publish to RViz
+        self.safe_points_pub.publish(marker_array)
+
+
+
     def send_rotated_board_box(self, depth=0.04):
         """
         Send the rotated board collision box to move_ar via service.
         Uses drop_p1_xy and drop_p2_xy as endpoints.
         """
-
+        self.load_robot_params()
         if not hasattr(self, "drop_p1_xy") or not hasattr(self, "drop_p2_xy"):
             self.log_with_time("warn", "Board endpoints not defined; cannot send board box.")
             return
@@ -199,6 +300,7 @@ class TkinterROS(Node):
         p2x, p2y = self.drop_p2_xy
 
         height = getattr(self, "board_height", None)
+        depth = self.board_width
         if height is None:
             self.log_with_time("warn", "board_height not set; cannot send board box.")
             return
@@ -228,35 +330,6 @@ class TkinterROS(Node):
                 self.log_with_time("error", f"Exception in board box service call: {e}")
 
         future.add_done_callback(_done_cb)
-
-
-    def send_rotated_forbidden_box(self):
-        if self.drop_p1_xy is None or self.drop_p2_xy is None:
-            self.log_with_time("warn", "Board endpoints not set.")
-            return
-
-        p1x, p1y = self.drop_p1_xy
-        p2x, p2y = self.drop_p2_xy
-
-        height = self.board_height
-        depth  = 0.20   # choose how far the forbidden zone sticks out
-
-        client = self.create_client(SetRotatedForbiddenBox, "set_rotated_forbidden_box")
-        if not client.wait_for_service(timeout_sec=1.0):
-            self.log_with_time("error", "Forbidden-box service unavailable.")
-            return
-
-        req = SetRotatedForbiddenBox.Request()
-        req.p1_x = p1x
-        req.p1_y = p1y
-        req.p2_x = p2x
-        req.p2_y = p2y
-        req.height = height
-        req.depth = depth
-
-        client.call_async(req)
-        self.log_with_time("info", "Sent rotated forbidden box to motion node.")
-
 
 
     def check_win_condition(self):
@@ -293,6 +366,9 @@ class TkinterROS(Node):
         #refresh latest bricks
         self.latest_bricks = []
         time.sleep(self.wait_before_refine_sec)
+
+    def on_set_box(self):
+        self.send_rotated_board_box()
         
     def on_next_chip_position(self):
         """Move the robot to the next chip position in the list."""
@@ -355,7 +431,9 @@ class TkinterROS(Node):
 
         # Height for board placement
         self.board_column_z = 0.28
-
+        self.board_height = 0.02
+        self.board_width = 0.04
+        self.board_hover_z = 0.3
         # Identification pose
         self.chip_ident_x = 0.353
         self.chip_ident_y = -0.388
@@ -411,6 +489,9 @@ class TkinterROS(Node):
         # =====================================================
         board = params.get("board", {})
         self.board_column_z = board.get("column_z", self.board_column_z)
+        self.board_height = board.get("board_height", self.board_height)
+        self.board_width = board.get("board_width", self.board_width)
+        self.board_hover_z = board.get("board_hover_z", self.board_hover_z)
 
         # =====================================================
         # E. Chip-table identification pose
@@ -435,92 +516,6 @@ class TkinterROS(Node):
         
 
         self.get_logger().info(f"Loaded robot parameters from {json_path}")
-
-
-    def add_board_forbidden_zone(self, height, depth, thickness=0.03):
-        """
-        Creates a collision box covering the front of the board using 
-        drop_p1_xy and drop_p2_xy as the endpoints of the board.
-        """
-
-        from moveit_msgs.msg import CollisionObject
-        from shape_msgs.msg import SolidPrimitive
-        from geometry_msgs.msg import Pose
-
-        # -----------------------------
-        # 1) Extract endpoints
-        # -----------------------------
-        x1, y1 = self.drop_p1_xy
-        x2, y2 = self.drop_p2_xy
-
-        # Board vector (P1→P2)
-        vx = x2 - x1
-        vy = y2 - y1
-        width = math.sqrt(vx*vx + vy*vy)
-
-        if width < 1e-6:
-            self.log_with_time("error", "Board endpoints are too close — cannot build forbidden zone.")
-            return False
-
-        # Normalize board direction
-        ux = vx / width
-        uy = vy / width
-
-        # -----------------------------
-        # 2) Board normal (perpendicular)
-        # -----------------------------
-        # (ux,uy) rotated 90 degrees CCW: normal = (-uy, ux)
-        nx = -uy
-        ny = ux
-
-        # -----------------------------
-        # 3) Box center = midpoint + offset along normal
-        # -----------------------------
-        mx = (x1 + x2) / 2.0
-        my = (y1 + y2) / 2.0
-
-        cx = mx + nx * (depth / 2.0)
-        cy = my + ny * (depth / 2.0)
-        cz = height / 2.0   # centered vertically
-
-        # -----------------------------
-        # 4) Orientation: align box x-axis to board direction
-        # -----------------------------
-        yaw = math.atan2(uy, ux)
-        q = tf_transformations.quaternion_from_euler(0, 0, yaw)
-
-        # -----------------------------
-        # 5) Build collision object
-        # -----------------------------
-        co = CollisionObject()
-        co.id = "board_forbidden_zone"
-        co.header.frame_id = "base_link"
-        co.operation = CollisionObject.ADD
-
-        box = SolidPrimitive()
-        box.type = SolidPrimitive.BOX
-        box.dimensions = [width, depth, height]   # X,Y,Z of box *in box local frame*
-
-        co.primitives.append(box)
-
-        pose = Pose()
-        pose.position.x = cx
-        pose.position.y = cy
-        pose.position.z = cz
-
-        pose.orientation.x = q[0]
-        pose.orientation.y = q[1]
-        pose.orientation.z = q[2]
-        pose.orientation.w = q[3]
-
-        co.primitive_poses.append(pose)
-
-        self.scene.add_object(co)
-        self.log_with_time("info",
-                           f"Added forbidden zone box at center ({cx:.3f},{cy:.3f},{cz:.3f})")
-
-        return True
-
 
     def load_chip_positions_from_json(self,json_path):
         """Load chip positions from JSON, return list of (x,y)."""
@@ -580,33 +575,102 @@ class TkinterROS(Node):
             self.log_with_time("error", f"Failed to save chip positions: {e}")
 
 
-    def nudge_joint6(self, delta_deg: float):
+    def nudge_ee_yaw(self, delta_deg: float, is_cartesian: bool = False) -> bool:
+        """
+        Nudges the End-Effector (EE) orientation (Joint 6 / Yaw) by a small delta amount
+        while maintaining the current EE position.
+
+        :param delta_deg: The change in yaw angle in DEGREES. Positive is CCW, negative is CW.
+        :param is_cartesian: Whether to use Cartesian path planning for execution.
+        :return: True if the motion request was successful, False otherwise.
+        """
         try:
-            cli = self.create_client(NudgeJoint, '/ar4_hardware_interface_node/nudge_joint')
-            if not cli.wait_for_service(timeout_sec=0.5):
-                self.log_with_time('warn', "NudgeJoint service not available")
-                return
+            # --- Parameter Conversion ---
+            # Convert the input degrees to radians for internal calculation
+            import numpy as np
+            delta_rad = np.radians(delta_deg)
 
-            req = NudgeJoint.Request()
-            req.joint_name = "joint_6"
-            req.delta_deg = float(delta_deg)
+            # ------------------------------
+            # 1) Current EE Pose
+            # ------------------------------
+            pose = self.get_current_ee_pose()
+            if pose is None:
+                self.log_with_time('error', "Cannot read current EE pose.")
+                return False
 
-            future = cli.call_async(req)
+            # ------------------------------
+            # 2) Extract Current RPY
+            # ------------------------------
+            q_curr = [
+                pose.orientation.x, pose.orientation.y,
+                pose.orientation.z, pose.orientation.w
+            ]
+            # Extracts Roll (R), Pitch (P), and Yaw (Y) from the current quaternion
+            # Assumes tf_transformations and _wrap_to_pi are available within the class scope
+            roll_curr, pitch_curr, yaw_curr = tf_transformations.euler_from_quaternion(q_curr)
+            yaw_curr = self._wrap_to_pi(yaw_curr) # Normalize to [-pi, pi]
 
-            def _cb(fut):
-                try:
-                    resp = fut.result()
-                    if resp.success:
-                        self.log_with_time('info', f"Joint 6 nudged by {delta_deg}°")
-                    else:
-                        self.log_with_time('warn', f"Nudge failed: {resp.message}")
-                except Exception as e:
-                    self.log_with_time('error', f"NudgeJoint exception: {e}")
+            self.log_with_time(
+                'info',
+                f"[NUDGE] Current EE RPY = "
+                f"({np.degrees(roll_curr):.2f}°, {np.degrees(pitch_curr):.2f}°, {np.degrees(yaw_curr):.2f}°)"
+            )
 
-            future.add_done_callback(_cb)
+            # ------------------------------
+            # 3) Calculate Target Yaw
+            # ------------------------------
+            yaw_target = self._wrap_to_pi(yaw_curr + delta_rad)
+
+            self.log_with_time(
+                'info',
+                f"[NUDGE] Target yaw = {np.degrees(yaw_target):.2f}° "
+                f"(Delta input: {delta_deg:.2f}°)"
+            )
+
+            # ------------------------------
+            # 4) Build Target Pose
+            # ------------------------------
+            from geometry_msgs.msg import Pose
+            
+            target = Pose()
+            # Keep the current position (x, y, z)
+            target.position = pose.position
+
+            # Keep current Roll and Pitch, apply new Yaw
+            qx, qy, qz, qw = tf_transformations.quaternion_from_euler(
+                roll_curr, pitch_curr, yaw_target
+            )
+
+            target.orientation.x = qx
+            target.orientation.y = qy
+            target.orientation.z = qz
+            target.orientation.w = qw
+
+            self.log_with_time(
+                'info',
+                f"[MOVE] Nudging EE Yaw to new orientation at current position "
+                f"({target.position.x:.3f}, {target.position.y:.3f}, {target.position.z:.3f})"
+            )
+
+            # ------------------------------
+            # 5) Execute motion
+            # ------------------------------
+            ok = self.send_move_request(
+                target,
+                is_cartesian=is_cartesian,
+                via_points=[] # Nudges are typically direct moves
+            )
+
+            self.log_with_time(
+                'info',
+                f"[MOVE] Final motion result: {ok}"
+            )
+
+            return ok
 
         except Exception as e:
-            self.log_with_time('error', f"Error calling NudgeJoint: {e}")
+            self.log_with_time('error', f"Error in nudge_ee_yaw: {e}")
+            return False
 
     def board_state_callback(self, msg):
         arr = np.array(msg.data, dtype=np.int32)
@@ -735,6 +799,67 @@ class TkinterROS(Node):
             self.log_with_time('warn', f"Could not save board state: {e}")
 
 
+
+    def compute_safe_column_pose(self, col_index):
+        """
+        Compute a safe waypoint for a given Connect-4 column.
+        The waypoint is offset perpendicular to the board, with the gripper facing downward.
+        """
+        p1_xy, p2_xy = self.drop_p1_xy, self.drop_p2_xy
+        offset = 0.05
+        z_height = self.board_hover_z
+
+        if not (0 <= col_index <= 5):
+            raise ValueError("col_index must be between 0 and 5")
+
+        x1, y1 = p1_xy
+        x2, y2 = p2_xy
+
+        dx = x2 - x1
+        dy = y2 - y1
+        length = math.sqrt(dx*dx + dy*dy)
+        if length < 1e-6:
+            raise ValueError("p1_xy and p2_xy cannot be the same point")
+
+        # Unit direction along board axis
+        ux = dx / length
+        uy = dy / length
+
+        # Perpendicular left vector
+        nx = -uy
+        ny = ux
+
+        # Column center
+        spacing = length / 5.0
+        col_center_x = x1 + ux * spacing * col_index
+        col_center_y = y1 + uy * spacing * col_index
+
+        # Safe point offset to the side
+        safe_x = col_center_x + nx * offset
+        safe_y = col_center_y + ny * offset
+        safe_z = z_height
+
+        # Yaw aligning gripper parallel to board axis
+        yaw = math.atan2(dy, dx)
+
+        # Facing down: roll=-pi, pitch=0
+        roll = -math.pi
+        pitch = 0.0
+
+        qx, qy, qz, qw = tf_transformations.quaternion_from_euler(roll, pitch, yaw)
+
+        return {
+            "x": safe_x,
+            "y": safe_y,
+            "z": safe_z,
+            "qx": qx,
+            "qy": qy,
+            "qz": qz,
+            "qw": qw
+        }
+
+
+
     def compute_board_column_xy(self, col_idx: int):
         """
         Return (x,y) of Connect-4 column center for col_idx in [0..6], using stored endpoints.
@@ -765,77 +890,167 @@ class TkinterROS(Node):
     def _wrap_to_pi(self, a: float) -> float:
         return (a + np.pi) % (2*np.pi) - np.pi
 
-    def move_to_xy_align_board(self, x: float, y: float, z: float = None, is_cartesian: bool = False):
+    def move_to_xy_align_board(self, x: float, y: float, z: float = None,
+                            is_cartesian: bool = False,
+                            via_points: list = None):
         """
-        Move to (x,y, z=current if None) with orientation guaranteed parallel to ground:
-        roll = -pi (face-down), pitch = 0, yaw = ⟂ to board (closest 180°-equivalent).
+        Move to (x, y, z=current if None) with orientation guaranteed parallel to ground:
+        roll = -pi (face-down), pitch = 0, yaw = ⟂ to board.
+        Optionally accepts via-points (list of Pose) which are forwarded to send_move_request().
         """
-        # 1) Board yaw (parallel)
+
+        if via_points is None:
+            via_points = []
+
+        # ------------------------------
+        # 1) Compute board yaw
+        # ------------------------------
         yaw_board = self._compute_board_yaw_rad()
         if yaw_board is None:
             return False
 
-        # 2) Desired yaw is perpendicular to board (+90°). Wrap to (-pi, pi]
-        yaw_perp = self._wrap_to_pi(yaw_board + np.pi/2)
+        self.log_with_time(
+            'info',
+            f"[YAW] Board yaw = {np.degrees(yaw_board):.2f}°"
+        )
 
-        # 3) Read current yaw ONLY for "closest" choice; ignore current roll/pitch entirely
+        # ------------------------------
+        # 2) Compute perpendicular yaw
+        # ------------------------------
+        yaw_perp = self._wrap_to_pi(yaw_board + np.pi/2)
+        self.log_with_time(
+            'info',
+            f"[YAW] Perpendicular yaw = {np.degrees(yaw_perp):.2f}°"
+        )
+
+        # ------------------------------
+        # 3) Current EE yaw
+        # ------------------------------
         pose = self.get_current_ee_pose()
         if pose is None:
             self.log_with_time('error', "Cannot read current EE pose.")
             return False
-        q_curr = [pose.orientation.x, pose.orientation.y, pose.orientation.z, pose.orientation.w]
+
+        q_curr = [
+            pose.orientation.x, pose.orientation.y,
+            pose.orientation.z, pose.orientation.w
+        ]
         _, _, yaw_curr = tf_transformations.euler_from_quaternion(q_curr)
         yaw_curr = self._wrap_to_pi(yaw_curr)
 
-        # 4) Tool is symmetric: choose closest 180°-equivalent yaw
-        cands = [yaw_perp,
-                self._wrap_to_pi(yaw_perp + np.pi),
-                self._wrap_to_pi(yaw_perp - np.pi)]
+        self.log_with_time(
+            'info',
+            f"[YAW] Current EE yaw = {np.degrees(yaw_curr):.2f}°"
+        )
+
+        # ------------------------------
+        # 4) Evaluate 3 yaw candidates
+        # ------------------------------
+        cands = [
+            yaw_perp,
+            self._wrap_to_pi(yaw_perp + np.pi),
+            self._wrap_to_pi(yaw_perp - np.pi),
+        ]
+        self.log_with_time(
+            'info',
+            f"[YAW] Candidates = "
+            f"{[f'{np.degrees(c):.2f}°' for c in cands]}"
+        )
+
+        # Choose closest candidate
         yaw_target = min(cands, key=lambda a: abs(self._wrap_to_pi(a - yaw_curr)))
 
-        # 5) Build target pose with roll=-pi, pitch=0 (always parallel to ground)
+        self.log_with_time(
+            'info',
+            f"[YAW] Selected target yaw = {np.degrees(yaw_target):.2f}°"
+        )
+
+        # ------------------------------
+        # 5) Build target pose
+        # ------------------------------
         target = Pose()
         target.position.x = float(x)
         target.position.y = float(y)
-        target.position.z = float(pose.position.z) if z is None else float(z)
+        target.position.z = (
+            float(pose.position.z) if z is None else float(z)
+        )
 
         roll = -np.pi
         pitch = 0.0
-        qx, qy, qz, qw = tf_transformations.quaternion_from_euler(roll, pitch, yaw_target)
+        qx, qy, qz, qw = tf_transformations.quaternion_from_euler(
+            roll, pitch, yaw_target
+        )
+
         target.orientation.x = qx
         target.orientation.y = qy
         target.orientation.z = qz
         target.orientation.w = qw
 
-        self.log_with_time('info',
-            f"EE yaw ⟂ board | yaw_curr={np.degrees(yaw_curr):.1f}°, "
-            f"yaw_target={np.degrees(yaw_target):.1f}° | face-down enforced")
-        self.log_with_time('info', f"Moving to ({x:.3f}, {y:.3f}, {target.position.z:.3f})...")
-        ok = self.send_move_request(target, is_cartesian=is_cartesian)
-        self.log_with_time('info', f"Move to ({x:.3f}, {y:.3f}, {target.position.z:.3f}) done: {ok}")
-        # 6) (Optional) post-move guard: re-enforce face-down if small drift creeps in
+        self.log_with_time(
+            'info',
+            f"[MOVE] Moving to ({x:.3f}, {y:.3f}, {target.position.z:.3f}) "
+            f"with yaw_target={np.degrees(yaw_target):.2f}°"
+        )
+
+        # ------------------------------
+        # 6) Execute motion (with via points)
+        # ------------------------------
+        ok = self.send_move_request(
+            target,
+            is_cartesian=is_cartesian,
+            via_points=via_points
+        )
+
+        self.log_with_time(
+            'info',
+            f"[MOVE] Final motion result: {ok}"
+        )
+
+        # ------------------------------
+        # 7) Post-move verification
+        # ------------------------------
         if ok:
-            self.log_with_time('info', 'Verifying post-move EE orientation...')
             final = self.get_current_ee_pose()
-            self.log_with_time('info', f"Post-move EE pose: pos=({final.position.x:.3f}, {final.position.y:.3f}, {final.position.z:.3f})")
             if final:
-                qf = [final.orientation.x, final.orientation.y, final.orientation.z, final.orientation.w]
+                qf = [
+                    final.orientation.x, final.orientation.y,
+                    final.orientation.z, final.orientation.w
+                ]
                 rf, pf, yf = tf_transformations.euler_from_quaternion(qf)
-                # If roll/pitch drifted, snap them back and keep the same yaw
-                if abs(rf + np.pi) > np.degrees(2e-2) or abs(pf) > np.degrees(2e-2):  # ~0.02 rad ≈ 1.1°
-                    qx, qy, qz, qw = tf_transformations.quaternion_from_euler(-np.pi, 0.0, yf)
+                yf = self._wrap_to_pi(yf)
+
+                self.log_with_time(
+                    'info',
+                    f"[POST] Final EE yaw = {np.degrees(yf):.2f}° "
+                    f"(roll={np.degrees(rf):.2f}°, pitch={np.degrees(pf):.2f}°)"
+                )
+
+                # Snap correction if needed
+                if abs(rf + np.pi) > np.degrees(2e-2) or abs(pf) > np.degrees(2e-2):
+                    self.log_with_time(
+                        'warn',
+                        f"[POST] Orientation drift detected → correcting. "
+                        f"rf={np.degrees(rf):.3f}°, pf={np.degrees(pf):.3f}°"
+                    )
+
+                    qx, qy, qz, qw = tf_transformations.quaternion_from_euler(
+                        -np.pi, 0.0, yf
+                    )
                     target2 = Pose()
                     target2.position = final.position
                     target2.orientation.x = qx
                     target2.orientation.y = qy
                     target2.orientation.z = qz
                     target2.orientation.w = qw
+
                     self.send_move_request(target2, is_cartesian=is_cartesian)
 
+                    self.log_with_time(
+                        'info',
+                        f"[POST] Correction applied. New yaw={np.degrees(yf):.2f}°"
+                    )
+
         return ok
-
-
-
 
     def _compute_board_yaw_rad(self):
         """
@@ -860,20 +1075,112 @@ class TkinterROS(Node):
         self.current_column_idx = (self.current_column_idx + 1) % self.total_columns
         self.goto_board_column(self.current_column_idx)
 
+
+    def compute_board_alignment_orientation(self):
+        """
+        Returns a quaternion that aligns the tool flat (roll=-pi, pitch=0)
+        and yaw perpendicular to the board (based on board yaw).
+        """
+        yaw_board = self._compute_board_yaw_rad()
+        if yaw_board is None:
+            self.log_with_time('error', "Cannot compute board yaw for orientation.")
+            return Quaternion()
+
+        # Desired yaw is perpendicular to board
+        yaw_perp = self._wrap_to_pi(yaw_board + np.pi/2)
+
+        # Standard face-down orientation: roll=-pi, pitch=0
+        roll = -np.pi
+        pitch = 0.0
+
+        qx, qy, qz, qw = tf_transformations.quaternion_from_euler(
+            roll, pitch, yaw_perp
+        )
+
+        q = Quaternion()
+        q.x = qx
+        q.y = qy
+        q.z = qz
+        q.w = qw
+        return q
+
+
     def goto_board_column(self, col_idx: int):
+        """
+        Move EE to the center of a board column with yaw parallel to board.
+        If current EE height is below the board height, insert a safe via-point.
+        """
         self.load_robot_params()
-        """Move EE to the center of a board column with yaw parallel to board."""
+
         xy = self.compute_board_column_xy(col_idx)
         if xy is None:
             return
-        x, y = xy 
-        self.log_with_time('info', f"Going to board column {col_idx}: ({x:.3f}, {y:.3f}) (yaw aligned)")
-        # Do not set active_drop_idx here; columns are not endpoints.
-        z=self.board_column_z
-        self.send_rotated_forbidden_box()
-        self.move_to_xy_align_board(x, y, z,is_cartesian=False)
 
+        x, y = xy
+        z = self.board_hover_z
+        board_h = self.board_height
 
+        self.log_with_time(
+            'info',
+            f"Going to board column {col_idx}: ({x:.3f}, {y:.3f}) (yaw aligned)"
+        )
+
+        # Refresh the rotated board collision box
+        self.send_rotated_board_box()
+
+        # ------------------------------------------------------------
+        # Read current EE Z
+        # ------------------------------------------------------------
+        try:
+            tf = self.tf_buffer.lookup_transform(
+                "base_link", "link_6", rclpy.time.Time()
+            )
+            current_z = tf.transform.translation.z
+        except Exception as e:
+            self.log_with_time('warn', f"TF lookup failed ({e}), skipping via point logic.")
+            current_z = 999.0
+
+        # ------------------------------------------------------------
+        # Compute face-down quaternion (used at final pose if needed)
+        # ------------------------------------------------------------
+        orientation_face_down = self.compute_board_alignment_orientation()
+
+        # ------------------------------------------------------------
+        # Build via points
+        # ------------------------------------------------------------
+        via_points = []
+
+        if current_z < board_h:
+            safe = self.compute_safe_column_pose(col_idx)
+
+            via = Pose()
+            via.position.x = safe["x"]
+            via.position.y = safe["y"]
+            via.position.z = safe["z"]
+
+            # Use the safe orientation (already roll=-pi, pitch=0, yaw aligned)
+            via.orientation.x = safe["qx"]
+            via.orientation.y = safe["qy"]
+            via.orientation.z = safe["qz"]
+            via.orientation.w = safe["qw"]
+
+            via_points.append(via)
+
+            self.log_with_time(
+                'info',
+                f"Current Z = {current_z:.3f} < board height {board_h:.3f}, "
+                f"added safe via-point at ({via.position.x:.3f}, "
+                f"{via.position.y:.3f}, {via.position.z:.3f})"
+            )
+
+        # ------------------------------------------------------------
+        # Move to final column XY, with optional via points
+        # ------------------------------------------------------------
+        self.move_to_xy_align_board(
+            x, y, z,
+            is_cartesian=False,
+            via_points=via_points
+        )
 
     def board_end_points_callback(self, msg: Float32MultiArray):
         """
@@ -1479,13 +1786,15 @@ class TkinterROS(Node):
 
     def move_to_chip_start(self):
         
-        x = self.chip_start_x
+
+        x = self.chip_start_x 
         y = self.chip_start_y
         z = self.chip_start_z
-
+        
         self.log_with_time("info", f"Moving to chip start: ({x:.3f}, {y:.3f}, {z:.3f})")
-        ok = self.move_to_xy_align_board(x, y, z)
+        ok = self.move_to_xy(x, y, z)
         self.log_with_time("info", f"Chip start move result: {ok}")
+        return ok
 
     def process_gui_queue(self):
         while not self.gui_queue.empty():
@@ -1658,20 +1967,24 @@ class TkinterROS(Node):
         top.pack(fill=tk.X, pady=(4, 8))
 
         tk.Button(top, text="Collect Chip",
-                command=self.collect_chip, width=14)\
+                command=self.collect_chip, width=9)\
             .pack(side=tk.LEFT, padx=4)
 
         tk.Button(top, text="Next Move",
-                command=self.on_next_move, width=14)\
+                command=self.on_next_move, width=9)\
             .pack(side=tk.LEFT, padx=4)
 
         tk.Button(top, text="Set Chip Positions",
-                command=self.on_set_chip_positions, width=16)\
+                command=self.on_set_chip_positions, width=12)\
             .pack(side=tk.LEFT, padx=4)
 
         tk.Button(top, text="Next Chip Position",
-                command=self.on_next_chip_position, width=18)\
+                command=self.on_next_chip_position, width=13)\
             .pack(side=tk.LEFT, padx=4)
+        
+        tk.Button(top, text="Set Box",
+                command=self.on_set_box, width=9)\
+            .pack(side=tk.LEFT, padx=4)        
 
         # ---------- Board drop points section ----------
         box = tk.LabelFrame(chip_grp, text="Drop Line Calibration")
@@ -1737,10 +2050,10 @@ class TkinterROS(Node):
 
         # Row 1
         tk.Button(nudges, text="CW", width=7,
-                command=lambda: self.nudge_joint6(-2.0)).grid(row=1, column=0, padx=2, pady=2)
+                command=lambda: self.nudge_ee_yaw(-2.0)).grid(row=1, column=0, padx=2, pady=2)
 
         tk.Button(nudges, text="CCW", width=7,
-                command=lambda: self.nudge_joint6(+2.0)).grid(row=1, column=1, padx=2, pady=2)
+                command=lambda: self.nudge_ee_yaw(+2.0)).grid(row=1, column=1, padx=2, pady=2)
 
         tk.Button(nudges, text="Pickup Chip", width=12,
                 command=self.pickup_chip).grid(row=1, column=2, padx=2, pady=2)
@@ -1789,12 +2102,12 @@ class TkinterROS(Node):
 
         self.log_with_time("info", "Setting chip positions...")
 
-        # 1) Move robot to identification viewpoint
-        x, y, z = self.chip_ident_x, self.chip_ident_y, self.chip_ident_z
-        ok = self.move_to_xy_align_board(x, y, z)
-        if not ok:
-            self.log_with_time("error", "Failed to move to identification pose.")
-            return
+        # # 1) Move robot to identification viewpoint
+        # x, y, z = self.chip_ident_x, self.chip_ident_y, self.chip_ident_z
+        # ok = self.move_to_xy_align_board(x, y, z)
+        # if not ok:
+        #     self.log_with_time("error", "Failed to move to identification pose.")
+        #     return
 
         time.sleep(self.wait_before_refine_sec)
 
@@ -1839,9 +2152,9 @@ class TkinterROS(Node):
 
     def on_next_move(self):
         self.load_robot_params()
-
+        self.send_rotated_board_box()
         if self.latest_board is None:
-            self.get_logger().warn("No board state available yet.")
+            self.get_logger().warn("No board state available yet!!!!!!!!!!!!!")
             return
 
         if not self.ai_client.wait_for_service(timeout_sec=2.0):
@@ -1885,8 +2198,8 @@ class TkinterROS(Node):
         """
         if self.current_state != STATE_COLLECTED_CHIP:
             self.move_to_chip_start()   # already exists :contentReference[oaicite:1]{index=1}
-
-            ok = self.collect_chip_with_params()
+            self.increment_chip_index()
+            ok = self.collect_chip()
             if not ok:
                 self.log_with_time("error", "Failed to collect chip before placing.")
                 return
@@ -1897,7 +2210,7 @@ class TkinterROS(Node):
 
         # self.move_to_chip_start()   # already exists :contentReference[oaicite:1]{index=1}
 
-        ok = self.collect_chip_with_params()
+        ok = self.collect_chip()
         if not ok:
             self.log_with_time("error", "Failed to collect chip before placing.")
             return        
@@ -2045,21 +2358,22 @@ class TkinterROS(Node):
     def on_next_board_column(self):
         """Cycle 0→6 and move to that column."""
         self.editing_endpoint = None   # disable endpoint editing session
-
+        self.send_rotated_board_box()
         self.current_column_idx = (self.current_column_idx + 1) % self.total_columns
         self.goto_board_column(self.current_column_idx)
 
-    def move_to_xy(self, x: float, y: float, is_cartesian: bool = False):
+    def move_to_xy(self, x: float, y: float, z: float = None, is_cartesian: bool = False):
         """Move EE to (x,y) keeping current Z and orientation."""
         cur = self.get_current_ee_pose()
         if cur is None:
             self.log_with_time('error', "Cannot read current end-effector pose.")
             return
+        target_z = z if z is not None else float(cur.position.z)
         pose = self.create_pose(
-            (float(x), float(y), float(cur.position.z)),
+            (float(x), float(y), float(target_z)),
             (cur.orientation.x, cur.orientation.y, cur.orientation.z, cur.orientation.w)
         )
-        self.send_move_request(pose, is_cartesian=is_cartesian)
+        return self.send_move_request(pose, is_cartesian=is_cartesian)
 
     def on_goto_point(self, idx: int):
         self.editing_endpoint = idx
@@ -2080,7 +2394,9 @@ class TkinterROS(Node):
             return
 
         self.log_with_time('info', f"Going to stored point #{idx}: ({x:.3f}, {y:.3f})")
-        self.move_to_xy_align_board(float(xy[0]), float(xy[1]), is_cartesian=False)
+        self.move_to_xy_align_board(float(xy[0]), float(xy[1]), self.board_hover_z, is_cartesian=False)
+        self.send_rotated_board_box()
+        self.publish_safe_points()
 
     def update_endpoints_after_refine(self, refined_center, column_index):
         """
@@ -2178,7 +2494,7 @@ class TkinterROS(Node):
         # 2) Collect chip (same function called from the Collect Chip button)
 
 
-        ok = self.collect_chip_with_params()
+        ok = self.collect_chip()
 
         if not ok:
             self.log_with_time("error", "Failed to collect chip")
@@ -2195,6 +2511,9 @@ class TkinterROS(Node):
         self.log_with_time("info", "✅ Chip dropped!")
 
         time.sleep(self.wait_before_refine_sec)  # allow camera to stabilize after gripper motion
+        if len(self.latest_bricks) >1:
+            self.log_with_time("warn", f"Multiple bricks detected after dropping chip, skipping alignment: {len(self.latest_bricks)}")
+            return
 
          # --- Determine closest column from EE pose ---
         col = self.find_closest_column()
@@ -2202,7 +2521,7 @@ class TkinterROS(Node):
             self.log_with_time('warn', "Could not determine closest column — skipping refinement.")
             return
 
-        for i in range(2):
+        for i in range(1):
             # --- Refine column center ---
             refined_x, refined_y = self.refine_current_column_center()
 
@@ -2218,6 +2537,18 @@ class TkinterROS(Node):
             f"Refinement complete. Column {col} center=({refined_x:.3f},{refined_y:.3f}). Endpoints updated."
         )
 
+    def increment_chip_index(self):
+        """Increment cur_chip_index, wrapping around if necessary."""
+        if not hasattr(self, "chip_positions") or len(self.chip_positions) == 0:
+            self.cur_chip_index = 0
+            return
+
+        self.cur_chip_index = (self.cur_chip_index + 1) % len(self.chip_positions)
+        self.log_with_time(
+            "info",
+            f"Current chip index set to {self.cur_chip_index}."
+        )
+        
     def _get_closest_chip_to_ee(self):
         """
         Return (cx, cy) [meters] of the brick currently closest to the end effector,
@@ -2251,15 +2582,15 @@ class TkinterROS(Node):
         self.log_with_time('info', f"Closest chip at ({cx:.3f}, {cy:.3f})")
         return cx, cy
 
-    def collect_chip_with_params(self):
+    def collect_chip(self):
+        
         """
         Try each chip_position until a chip is detected at that location.
         If detected → refine + pick (chip_index stays the same).
         If none detected in any location → return False.
         """
-
         self.load_robot_params()
-
+        self.send_rotated_board_box()
         # ---------------------------------------
         # Validate chip_positions
         # ---------------------------------------
@@ -2313,7 +2644,14 @@ class TkinterROS(Node):
             ok = self.send_move_request(pose, is_cartesian=False)
             if not ok:
                 self.log_with_time("error", f"Failed to move to chip position #{self.cur_chip_index}.")
-                return False
+                if self.move_to_chip_start() == True:
+                    ok = self.send_move_request(pose, is_cartesian=False)
+                    if not ok:
+                        self.log_with_time("error", f"Retry also failed to move to chip position #{self.cur_chip_index}.")
+                        return False
+                else:
+                    self.log_with_time("error", "Also failed to return to chip start position.")
+                    return False
             self.latest_bricks = []  # clear previous bricks
             # Give camera time after stopping
             time.sleep(self.wait_before_refine_sec)
@@ -2334,6 +2672,12 @@ class TkinterROS(Node):
 
                 # First refinement step (still above board)
                 self.refine_pose_with_ee_camera_dx_dy(cx, cy, prep_z)
+                time.sleep(self.wait_before_refine_sec)
+
+                latest_target = self._get_closest_chip_to_ee()
+                cx, cy = latest_target
+                self.refine_pose_with_ee_camera_dx_dy(cx, cy, prep_z)
+
 
                 # Recompute yaw after refine
                 cur = self.get_current_ee_pose()
@@ -2371,88 +2715,16 @@ class TkinterROS(Node):
                 f"No chip detected at index {self.cur_chip_index}. Trying next."
             )
 
-            self.cur_chip_index = (self.cur_chip_index + 1) % num_positions
+            self.increment_chip_index()
             attempts += 1
 
         # =====================================================
         # After checking all positions → no chips anywhere
         # =====================================================
+        self.move_to_chip_start()
         self.log_with_time("info", "No chips detected at ANY chip position.")
         return False
 
-
-
-    def collect_chip_with_params_old(self):
-        """
-        Pick the closest visible chip and lift to `lift_z`.
-        Optionally drop it at `drop_xy` and/or return to the start pose.
-        """
-        self.load_robot_params()
-
-        cur = self.get_current_ee_pose()
-        if not cur:
-            self.log_with_time('error', "Current EE pose unavailable.")
-            return False
-
-        first_target = self._get_closest_chip_to_ee()
-        if not first_target:
-            self.log_with_time('info', "No chips available to collect.")
-            return False
-
-        cx, cy = first_target
-        self.log_with_time('info', f"Starting collection for chip near ({cx:.3f}, {cy:.3f})")
-
-        # --- Helper for creating a face-down pose ---
-        _, _, yaw = tf_transformations.euler_from_quaternion([
-            cur.orientation.x, cur.orientation.y, cur.orientation.z, cur.orientation.w
-        ])
-        def face_down_pose(x, y, z, yaw_rad):
-            q = tf_transformations.quaternion_from_euler(-np.pi, 0.0, yaw_rad)
-            return self.create_pose((float(x), float(y), float(z)),
-                                    (q[0], q[1], q[2], q[3]))
-
-        # --- Move above target and open gripper ---
-        self.open_gripper_srv()
-        self.send_move_request(face_down_pose(cx, cy, float(self.hover_z), yaw), is_cartesian=False)
-
-        # --- Iteratively refine position using updated chip locations ---
-        time.sleep(self.wait_before_refine_sec) 
-        latest_target = self._get_closest_chip_to_ee()
-        if  latest_target is not None:
-            cx, cy = latest_target
-            self.refine_pose_with_ee_camera_dx_dy(cx, cy, float(self.pick_z1))
-
-        for _ in range(3):
-            time.sleep(self.wait_before_refine_sec)  # allow camera to stabilize
-            latest_target = self._get_closest_chip_to_ee()
-            if latest_target is not None:
-                cx, cy = latest_target
-                self.refine_pose_with_ee_camera_dx_dy(cx, cy, float(self.pick_z2))
-
-
-        # Final refinement closer to the board
-        time.sleep(self.wait_before_refine_sec)  # allow camera to stabilize
-        latest_target = self._get_closest_chip_to_ee()
-        if latest_target:
-            cx, cy = latest_target
-            self.refine_pose_with_ee_camera_dx_dy(cx, cy, float(self.pick_z3))
-
-        # --- Grab and lift ---
-        self.close_gripper_srv()
-
-        self.move_to_height(float(self.lift_z), is_cartesian=True)
-
-        self.log_with_time('info',
-            f"Chip collected, lifted to {float(self.lift_z):.3f} m"
-        )
-
-        self.current_state =  STATE_COLLECTED_CHIP
-        return True
-
-
-    def collect_chip(self):
-        self.collect_chip_with_params()
-    
     def start_collection(self):
         """
         Move to the start_position defined in robot_params.json.
@@ -2486,6 +2758,7 @@ class TkinterROS(Node):
 
 
     def refine_pos(self):
+        self.send_rotated_board_box()
         self._refine_pos()
 
         self.refine_board_endpoints()
@@ -2780,10 +3053,12 @@ class TkinterROS(Node):
 
     def open_gripper_srv(self):
         self.load_robot_params()
+        self.current_state = STATE_NONE
         self.move_servo_to_angle(self.GRIP_FORCE_OPEN)
 
     def close_gripper_srv(self):
         self.load_robot_params()
+        self.current_state = STATE_COLLECTED_CHIP
         self.move_servo_to_angle(self.GRIP_FORCE_CLOSE)
 
     def init_calibration_tab(self):
@@ -3929,11 +4204,9 @@ class TkinterROS(Node):
 
 
     def move_to(self, msg: Pose):
-
         self.send_move_request(pose=msg,is_cartesian=False)
 
-
-    def send_move_request(self, pose, is_cartesian=True):
+    def send_move_request(self, pose, is_cartesian=True, via_points=None) -> bool:
         self.arm_is_moving = True
         self.update_status_label()
         # pose_goal = PoseStamped() 
@@ -3955,8 +4228,17 @@ class TkinterROS(Node):
 
         response = self.call_service_blocking(self.move_arm_client, request,timeout_sec=4448.0)
         print("Got response:", response)
-        return response is not None
- 
+
+        if response is None:
+            print(f"[{now}] ❌ Motion Failed: No response from service for {motion_type} move to pos=({pose.position.x:.3f},{pose.position.y:.3f},{pose.position.z:.3f}) ori={pose.orientation}")
+            return False
+        is_ok = response.success
+        if is_ok:
+            print(f"[{now}] ✅ Motion Succeeded: {motion_type} move to pos=({pose.position.x:.3f},{pose.position.y:.3f},{pose.position.z:.3f}) ori={pose.orientation}")
+        else:
+            print(f"[{now}] ❌ Motion Failed: {motion_type} move to pos=({pose.position.x:.3f},{pose.position.y:.3f},{pose.position.z:.3f}) ori={pose.orientation} | Message: {response.message}")
+        return is_ok
+
     def create_pose(self, position, rotation):
         """
         Creates a Pose message from position and rotation values.
