@@ -83,9 +83,11 @@ class TkinterROS(Node):
         self.pose_in_camera = None
         self.arm_is_moving = False
         self.init_cal_poses()
+        self.won_player = None
         self.initial_marker_pose_base = None
         self.editing_endpoint = None   # can be None, 1, or 2
         self.num_board_columns = 7
+        self.ai_done_event = threading.Event()
         self.top_dx_mm = None
         self.top_dy_mm = None
         self.editing_chip = False
@@ -104,6 +106,8 @@ class TkinterROS(Node):
         self.cb_group = ReentrantCallbackGroup()
         self.wait_before_refine_sec = 0.5
         self.cur_chip_index = 0
+        self.red_count, self.white_count = 0, 0
+        self.wait_for_white, self.wait_for_red = 1, 1
         # KEEP a reference on self:
 
         self.brick_detections = []  # list of dicts for latest frame
@@ -190,6 +194,7 @@ class TkinterROS(Node):
         self.latest_board = None
         self.total_chips = 0             # number of chips on the board
         self.wait_for = -1
+        self.start_winner_timer()
 
 
     def publish_safe_points(self):
@@ -384,7 +389,6 @@ class TkinterROS(Node):
 
         self.editing_chip = True
         self.editing_endpoint = None
-
 
     def after_has_won(self, future, player):
         try:
@@ -672,6 +676,49 @@ class TkinterROS(Node):
             self.log_with_time('error', f"Error in nudge_ee_yaw: {e}")
             return False
 
+
+    def _check_winner(self, board):
+        """
+        Checks if P1 or P2 won.
+        board is a 6x7 numpy array after flipping.
+        Updates self.won_player and returns the winner (1 or 2 or None).
+        """
+
+        # Early exit
+        for player in (1, 2):
+            # Horizontal (→)
+            for r in range(6):
+                for c in range(7 - 3):
+                    if np.all(board[r, c:c+4] == player):
+                        self.won_player = player
+                        return player
+
+            # Vertical (↓)
+            for r in range(6 - 3):
+                for c in range(7):
+                    if np.all(board[r:r+4, c] == player):
+                        self.won_player = player
+                        return player
+
+            # Diagonal down-right (↘)
+            for r in range(6 - 3):
+                for c in range(7 - 3):
+                    if all(board[r+i, c+i] == player for i in range(4)):
+                        self.won_player = player
+                        return player
+
+            # Diagonal up-right (↗)
+            for r in range(3, 6):
+                for c in range(7 - 3):
+                    if all(board[r-i, c+i] == player for i in range(4)):
+                        self.won_player = player
+                        return player
+
+        # No winner
+        self.won_player = None
+        return None
+
+
     def board_state_callback(self, msg):
         arr = np.array(msg.data, dtype=np.int32)
 
@@ -707,7 +754,13 @@ class TkinterROS(Node):
             self.log_with_time("info", f"Board updated. Chips: {self.total_chips}")
             self.log_with_time("info", f"latest_chip: {self.latest_chip}")
 
+            # NEW: Count red & white chips
+            self.red_count = int(np.sum(current == 2))      # or white if reversed
+            self.white_count = int(np.sum(current == 1))
 
+            # Check winner only if board changed
+            self._check_winner(self.latest_board)
+        
     def _load_board_pos_state(self):
         """Load step and endpoints from JSON and reflect in UI + memory."""
         try:
@@ -1900,7 +1953,7 @@ class TkinterROS(Node):
         self.add_adjustment_frame()
 
         # ======== TOOLS TAB ========
-        tk.Label(self.tab_tools, text="Utilities", font=("Arial", 12, "bold")).pack(pady=(8, 4))
+        tk.Label(self.tab_tools, text="Utilities", font=("Ar    ial", 12, "bold")).pack(pady=(8, 4))
 
         # Gripper controls
         grip = tk.LabelFrame(self.tab_tools, text="Gripper")
@@ -1910,6 +1963,17 @@ class TkinterROS(Node):
             .pack(side=tk.LEFT, padx=4, pady=5)
         tk.Button(grip, text="Close Gripper", command=self.close_gripper_srv, width=12)\
             .pack(side=tk.LEFT, padx=4, pady=5)
+        
+        # --- WINNER LABEL ---
+        self.winner_label = tk.Label(
+            grip,
+            text="",
+            font=("Arial", 28, "bold"),
+            fg="red"
+        )
+
+        self.winner_label.pack(pady=20)
+
         # Z quick moves
         zgrp = tk.LabelFrame(self.tab_tools, text="Z Height (absolute)")
         zgrp.pack(fill=tk.X, padx=8, pady=6)
@@ -1974,6 +2038,10 @@ class TkinterROS(Node):
                 command=self.on_next_move, width=9)\
             .pack(side=tk.LEFT, padx=4)
 
+        tk.Button(top, text="Wait for Next Move",
+                command=self.on_next_move_and_wait, width=11)\
+            .pack(side=tk.LEFT, padx=4)
+
         tk.Button(top, text="Set Chip Positions",
                 command=self.on_set_chip_positions, width=12)\
             .pack(side=tk.LEFT, padx=4)
@@ -1983,8 +2051,13 @@ class TkinterROS(Node):
             .pack(side=tk.LEFT, padx=4)
         
         tk.Button(top, text="Set Box",
-                command=self.on_set_box, width=9)\
+                command=self.on_set_box, width=7)\
             .pack(side=tk.LEFT, padx=4)        
+
+        tk.Button(top, text="Game",
+                command=self.on_game, width=7)\
+            .pack(side=tk.LEFT, padx=4)        
+
 
         # ---------- Board drop points section ----------
         box = tk.LabelFrame(chip_grp, text="Drop Line Calibration")
@@ -2094,6 +2167,23 @@ class TkinterROS(Node):
         # Start periodic updates
         self.update_position_label()
 
+    def update_winner_ui(self, winner):
+        """
+        winner = 1, 2 or None
+        """
+        if winner is None:
+            self.winner_label.config(text="")  # clear the label
+            return
+
+        if winner == 1:
+            text = "USER WON!!!"
+        else:
+            text = "AI WON!!!"
+
+        self.winner_label.config(text=text)
+
+
+
     def on_set_chip_positions(self):
         """
         Move to identification pose, detect chips, compute base-frame positions,
@@ -2150,6 +2240,33 @@ class TkinterROS(Node):
 
         self.log_with_time("info", f"Stored chip positions ({len(found_positions)} chips).")
 
+    def on_game(self):
+        self.wait_for_white = self.white_count + 1
+        while (self.won_player is None):
+            self.on_next_move_and_wait()
+            
+        self._logger.info("-----------------")
+        self._logger.info("----Game over!---")
+        self._logger.info("-----------------")
+
+
+    def on_next_move_and_wait(self):
+        # 1. Wait for human chip
+        self.wait_for_chip_detection("white")
+
+        # 2. Prepare to wait for AI callback
+        self.ai_done_event.clear()
+
+        # 3. Trigger the async AI request
+        self.on_next_move()
+
+        # 4. Wait for AI callback to set the event
+        while not self.ai_done_event.is_set():
+            self.update_gui_once()
+            time.sleep(0.01)   # Prevents CPU spinning
+
+       
+
     def on_next_move(self):
         self.load_robot_params()
         self.send_rotated_board_box()
@@ -2192,6 +2309,29 @@ class TkinterROS(Node):
         self.gui_queue.put(lambda: self.place_chip(col))
 
 
+    def _update_winner_ui_safe(self, winner):
+        if winner is None:
+            self.winner_label.config(text="")
+            return
+
+        text = "USER WON!!!" if winner == 1 else "AI WON!!!"
+        self.winner_label.config(text=text, fg="red", font=("Arial", 32, "bold"))
+
+
+    def _winner_timer_cb(self):
+        """Timer runs inside ROS thread → enqueue UI-safe lambda."""
+        if self.gui_queue is None:
+            return
+
+        winner = self.won_player
+
+        # Pass a lambda to UI thread
+        self.gui_queue.put(lambda: self._update_winner_ui_safe(winner))
+
+    def start_winner_timer(self):
+        self.create_timer(0.5, self._winner_timer_cb)   # every 0.5 seconds
+
+
     def place_chip(self, column):
         """
         Move the arm to the correct drop position for the chosen column.
@@ -2213,7 +2353,8 @@ class TkinterROS(Node):
         ok = self.collect_chip()
         if not ok:
             self.log_with_time("error", "Failed to collect chip before placing.")
-            return        
+            return    
+        self.ai_done_event.set()  
 
 
     def disconnect_endpoints(self):
@@ -2504,9 +2645,44 @@ class TkinterROS(Node):
         # self.on_next_board_column()  # already exists :contentReference[oaicite:3]{index=3}
         # self.drop_chip_at_current_column()   
         
+    def wait_for_chip_detection(self, color: str):
+        """
+        Wait until a new chip of the requested color is detected.
+        color: "white" or "red"
+        """
+        # Select which counter & target to check
+        if color == "white":
+            get_count = lambda: self.white_count
+            get_target = lambda: self.wait_for_white
+        elif color == "red":
+            get_count = lambda: self.red_count
+            get_target = lambda: self.wait_for_red
+        else:
+            self.log_with_time("error", f"Unknown chip color: {color}")
+            return False
+
+        self.log_with_time("info", f"Waiting for {color} chip detection...")
+
+        start_time = time.time()
+        timeout_sec = 60.0
+
+        while True:
+            if get_count() == get_target():
+                self.log_with_time("info", f"✅ {color.capitalize()} chip detected!")
+                return True
+
+            if time.time() - start_time > timeout_sec:
+                self.log_with_time("error", f"Timeout waiting for {color} chip detection.")
+                return False
+
+            time.sleep(0.1)
+
 
     def drop_chip_at_current_column(self):
         # 4) Drop the chip (open gripper)
+
+        self.wait_for_white = self.white_count + 1
+
         self.open_gripper_srv()      # already exists :contentReference[oaicite:4]{index=4}
         self.log_with_time("info", "✅ Chip dropped!")
 
